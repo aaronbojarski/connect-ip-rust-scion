@@ -1,20 +1,15 @@
-//! This example demonstrates an HTTP client that requests files from a server.
-//!
-//! Checkout the `README.md` for guidance.
-
 use std::{
-    env, fs, io, net::{SocketAddr, ToSocketAddrs},  sync::Arc, time::{Duration, Instant}
+    env, fs, io, net::{SocketAddr, ToSocketAddrs},  sync::Arc
 };
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
+use connect_ip_rust_scion::tun;
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::pki_types::CertificateDer;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 use url::Url;
-
-use tun_rs::DeviceBuilder;
 
 const ALPN_QUIC_HTTP: &[&[u8]] = &[b"h3"];
 
@@ -49,7 +44,7 @@ fn main() {
 
 #[tokio::main]
 async fn run(options: Opt) -> Result<()> {
-    let endpoint = connect_to_server(options.bind).await?;
+    let endpoint = configure_endpoint(options.bind).await?;
     let url = options.url;
     let url_host = "10.248.100.11";
     let remote = (url_host, url.port().unwrap_or(4433))
@@ -60,12 +55,11 @@ async fn run(options: Opt) -> Result<()> {
     let host = options.host.as_deref().unwrap_or(url_host);
 
     info!("connecting to {host} at {remote}");
-    let start = Instant::now();
     let conn = endpoint
         .connect(remote, host)?
         .await
         .map_err(|e| anyhow!("failed to connect: {}", e))?;
-    info!("connected at {:?}", start.elapsed());
+    info!("connected");
 
     let (mut send, mut recv) = conn
         .open_bi()
@@ -76,56 +70,22 @@ async fn run(options: Opt) -> Result<()> {
         .await
         .map_err(|e| anyhow!("failed to send request: {}", e))?;
     send.finish().unwrap();
-    let response_start = Instant::now();
-    info!("request sent at {:?}", response_start - start);
+    info!("request sent");
     let resp = recv
         .read_to_end(usize::MAX)
         .await
         .map_err(|e| anyhow!("failed to read response: {}", e))?;
-    let duration = response_start.elapsed();
-    info!(
-        "response received in {:?} - {} KiB/s",
-        duration,
-        (&resp).len() as f32 / (duration_secs(&duration) * 1024.0)
-    );
+    info!("response received");
 
     // convert the received bytes to an IPv4 address
     let received_address = String::from_utf8(resp)
         .map_err(|e| anyhow!("failed to parse response as UTF-8: {}", e))?;
 
-    let (tx_to_tun, mut rx_in_tun) = mpsc::channel::<Vec<u8>>(100);
+    let (tx_to_tun, rx_in_tun) = mpsc::channel::<Vec<u8>>(100);
     let (tx_from_tun, mut rx_from_tun) = mpsc::channel::<Vec<u8>>(100);
     
-    tokio::spawn(async move {
-        let result: Result<()> = async {
-            let dev = DeviceBuilder::new()
-                .ipv4(received_address, 24, None)
-                .build_async()?;
-
-            let mut buf = vec![0; 65536];
-            loop {
-                tokio::select! {
-                    // Read from TUN device and send to main task
-                    len = dev.recv(&mut buf) => {
-                        let len = len?;
-                        let packet_data = buf[..len].to_vec();
-                        println!("TUN -> QUIC: {:?}", packet_data);
-                        tx_from_tun.send(packet_data).await
-                            .map_err(|_| anyhow!("failed to send packet from TUN"))?;
-                    }
-                    // Receive from main task and write to TUN device
-                    Some(packet) = rx_in_tun.recv() => {
-                        println!("QUIC -> TUN: {:?}", packet);
-                        dev.send(&packet).await.map_err(|_| anyhow!("failed to send packet to TUN"))?;
-                    }
-                }
-            }
-        }.await;
-        
-        if let Err(e) = result {
-            error!("TUN device task failed: {}", e);
-        }
-    });
+    let mut tun = tun::Tun::new("tun0", received_address.parse()?, 1500);
+    tun.start(tx_from_tun, rx_in_tun).await?;
 
     // Main loop: handle QUIC datagrams
     loop {
@@ -148,11 +108,9 @@ async fn run(options: Opt) -> Result<()> {
     // endpoint.wait_idle().await;
 
     // Ok(())
-
-
 }
 
-async fn connect_to_server(socket_addr: SocketAddr) -> Result<quinn::Endpoint> {
+async fn configure_endpoint(socket_addr: SocketAddr) -> Result<quinn::Endpoint> {
     let mut roots = rustls::RootCertStore::empty();
     let cwd = env::current_dir()?;
     match fs::read(cwd.join("cert.der")) {
@@ -179,8 +137,4 @@ async fn connect_to_server(socket_addr: SocketAddr) -> Result<quinn::Endpoint> {
     endpoint.set_default_client_config(client_config);
 
     Ok(endpoint)
-}
-
-fn duration_secs(x: &Duration) -> f32 {
-    x.as_secs() as f32 + x.subsec_nanos() as f32 * 1e-9
 }
