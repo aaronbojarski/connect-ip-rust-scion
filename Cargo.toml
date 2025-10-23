@@ -1,0 +1,20 @@
+[package]
+name = "connect-ip-rust-scion"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+clap = { version = "4", features = ["derive"] }
+directories-next = "2.0.0"
+pnet = "0.35.0"
+pnet_datalink = "0.35.0"
+quinn = "0.11.9"
+rcgen = "0.14.5"
+rustls = { version = "0.23.5", default-features = false, features = ["std"] }
+tokio = { version = "1.28.1", features = ["full"] }
+tracing = "0.1.41"
+tracing-futures = "0.2.5"
+tracing-subscriber = { version = "0.3.0", default-features = false, features = ["env-filter", "fmt", "ansi", "time", "local-time"] }
+tun-rs = { version = "2", features = ["async"] }
+url = "2.5.7"
