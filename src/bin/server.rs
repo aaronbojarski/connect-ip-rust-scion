@@ -1,11 +1,12 @@
+use std::net::Ipv4Addr;
 use std::{
     ascii, env, fs, io, net::SocketAddr, str, sync::Arc, collections::HashMap
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use pnet::packet::ipv4::Ipv4Packet;
 use clap::Parser;
-use pnet::packet::{ipv4::Ipv4Packet, Packet};
-use pnet_datalink::Channel;
+use connect_ip_rust_scion::tun;
 use quinn::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::sync::mpsc::{self, Sender, Receiver};
@@ -95,7 +96,7 @@ async fn run(options: Opt) -> Result<()> {
     // Spawn IP packet handler task
     let queue_set_clone = queue_set.clone();
     tokio::spawn(async move {
-        if let Err(e) = handle_ip_packets(queue_set_clone, outbound_rx, Some("proxy10".to_string())).await {
+        if let Err(e) = handle_ip_packets(queue_set_clone, outbound_rx).await {
             error!("IP packet handler failed: {}", e);
         }
     }.instrument(info_span!("ip_packet_handler")));
@@ -130,131 +131,66 @@ async fn run(options: Opt) -> Result<()> {
 
 async fn handle_ip_packets(
     queue_set: QueueSet,
-    mut outbound_rx: Receiver<Vec<u8>>,
-    interface_name: Option<String>
+    mut outbound_rx: Receiver<Vec<u8>>
 ) -> Result<()> {
     info!("starting IP packet handler");
-    
-    // Get the network interface
-    let interface = if let Some(name) = interface_name {
-        info!("looking for interface: {}", name);
-        pnet_datalink::interfaces()
-            .into_iter()
-            .find(|iface| iface.name == name)
-            .ok_or_else(|| anyhow!("interface '{}' not found", name))?
-    } else {
-        info!("no interface specified, using default");
-        pnet_datalink::interfaces()
-            .into_iter()
-            .find(|iface| !iface.is_loopback() && iface.is_up())
-            .ok_or_else(|| anyhow!("no suitable network interface found"))?
-    };
-    
-    info!("using interface: {} ({})", interface.name, 
-        interface.ips.iter()
-            .map(|ip| ip.to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    
-    // Create datalink channel bound to specific interface
-    let (mut tx, mut rx) = match pnet_datalink::channel(&interface, Default::default()) {
-        Ok(Channel::Ethernet(tx, rx)) => (tx, rx),
-        Ok(_) => return Err(anyhow!("unsupported channel type")),
-        Err(e) => {
-            error!("failed to create datalink channel: {}", e);
-            warn!("Make sure to run the server with sudo/root privileges");
-            return Err(anyhow!("failed to create datalink channel: {}", e));
-        }
-    };
 
-    info!("datalink channel created successfully on interface {}", interface.name);
-
-    // Spawn task to receive packets and distribute to connections
+    let (tx_to_tun, rx_in_tun) = mpsc::channel::<Vec<u8>>(100);
+    let (tx_from_tun, mut rx_from_tun) = mpsc::channel::<Vec<u8>>(100);
+    
+    let mut tun = tun::Tun::new("tun0", "10.248.1.7".parse::<Ipv4Addr>()?, 1500);
+    tun.start(tx_from_tun, rx_in_tun).await?;
+    
+    // Spawn task to receive packets from TUN and distribute to connections
     let queue_set_clone = queue_set.clone();
-    let inbound_handle = tokio::task::spawn_blocking(move || {
-        use pnet::packet::ethernet::{EthernetPacket, EtherTypes};
+    let inbound_handle = tokio::spawn(async move {
+        info!("started listening for packets from TUN interface");
         
-        info!("started listening for packets on interface");
-        
-        loop {
-            match rx.next() {
-                Ok(packet) => {
-                    if let Some(ethernet) = EthernetPacket::new(packet) {
-                        // Filter for IPv4 packets
-                        if ethernet.get_ethertype() == EtherTypes::Ipv4 {
-                            if let Some(ipv4) = Ipv4Packet::new(ethernet.payload()) {
-                                let packet_data = ipv4.packet().to_vec();
-                                info!("received IPv4 packet: {} bytes", packet_data.len());
-                                
-                                // Distribute to all connections
-                                let queue_set = queue_set_clone.clone();
-                                let handle = tokio::runtime::Handle::current();
-                                handle.spawn(async move {
-                                    let queues = queue_set.lock().await;
-                                    if queues.is_empty() {
-                                        warn!("no active connections to forward packet to");
-                                    }
-                                    for (conn_id, sender) in queues.iter() {
-                                        info!("forwarding packet to connection {}", conn_id);
-                                        if let Err(e) = sender.send(packet_data.clone()).await {
-                                            error!("failed to send packet to connection {}: {}", conn_id, e);
-                                        } else {
-                                            info!("forwarded packet to connection {}", conn_id);
-                                        }
-                                    }
-                                });
-                            }
+        while let Some(packet) = rx_from_tun.recv().await {
+            if let Some(ipv4) = Ipv4Packet::new(&packet) {
+                let src = ipv4.get_source();
+                let dest = ipv4.get_destination();
+                info!("received IP packet from TUN: {} -> {}, {} bytes", src, dest, packet.len());
+                
+                // Distribute to all connections
+                let queues = queue_set_clone.lock().await;
+                if queues.is_empty() {
+                    warn!("no active connections to forward packet to");
+                } else {
+                    for (conn_id, sender) in queues.iter() {
+                        info!("forwarding packet to connection {}", conn_id);
+                        if let Err(e) = sender.send(packet.clone()).await {
+                            error!("failed to send packet to connection {}: {}", conn_id, e);
+                        } else {
+                            info!("forwarded packet to connection {}", conn_id);
                         }
                     }
                 }
-                Err(e) => {
-                    error!("error receiving packet: {}", e);
-                    break;
-                }
+            } else {
+                warn!("received invalid IPv4 packet from TUN");
             }
         }
+        
+        info!("inbound packet handler exiting");
     });
 
-    // Handle outbound packets from connections
-    let outbound_handle = tokio::task::spawn_blocking(move || {
-        use pnet::packet::ethernet::{MutableEthernetPacket, EtherTypes};
-        use pnet::util::MacAddr;
-        
-        let handle = tokio::runtime::Handle::current();
-        
+    // Handle outbound packets from connections and send to TUN
+    let outbound_handle = tokio::spawn(async move {
         info!("started outbound packet handler");
         
-        while let Some(packet) = handle.block_on(outbound_rx.recv()) {
+        while let Some(packet) = outbound_rx.recv().await {
             info!("processing outbound IP packet: {} bytes", packet.len());
             
             if let Some(ipv4_packet) = Ipv4Packet::new(&packet) {
                 let dest = ipv4_packet.get_destination();
                 let src = ipv4_packet.get_source();
-                info!("sending IP packet: {} -> {}, {} bytes", src, dest, packet.len());
+                info!("sending IP packet to TUN: {} -> {}, {} bytes", src, dest, packet.len());
                 
-                // Create Ethernet frame (you'll need proper MAC addresses)
-                // This is a simplified version - you may need ARP resolution
-                let mut ethernet_buffer = vec![0u8; 14 + packet.len()];
-                let mut ethernet = MutableEthernetPacket::new(&mut ethernet_buffer).unwrap();
-                
-                // Set MAC addresses (these are placeholders - adjust as needed)
-                ethernet.set_destination(MacAddr::broadcast());
-                ethernet.set_source(MacAddr::zero());
-                ethernet.set_ethertype(EtherTypes::Ipv4);
-                ethernet.set_payload(&packet);
-                
-                match tx.send_to(ethernet.packet(), None) {
-                    Some(Ok(())) => {
-                        info!("successfully sent packet");
-                    }
-                    Some(Err(e)) => {
-                        error!("failed to send packet: {}", e);
-                    }
-                    None => {
-                        error!("failed to send packet: buffer full");
-                    }
+                if let Err(e) = tx_to_tun.send(packet).await {
+                    error!("failed to send packet to TUN: {}", e);
+                    break;
                 }
+                info!("successfully sent packet to TUN");
             } else {
                 warn!("invalid IPv4 packet, dropping");
             }
@@ -391,7 +327,7 @@ async fn handle_request(
     info!(content = %escaped);
     info!("handled request");
 
-    let resp = b"10.248.3.13";
+    let resp = b"10.248.2.180";
     send.write_all(resp)
         .await
         .map_err(|e| anyhow!("failed to send response: {}", e))?;

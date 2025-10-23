@@ -16,9 +16,9 @@ function net_up() {
 	sudo ip link set dev $nodex0 netns $nodexns
 	sudo ip link set dev $nodex1 netns $nodexns
 
-	sudo ip -n $ehxns address add $ehx_address/24 dev $ehx
+	sudo ip -n $ehxns address add $ehx_address/28 dev $ehx
 
-    sudo ip -n $nodexns address add $nodex0_address/24 dev $nodex0
+    sudo ip -n $nodexns address add $nodex0_address/28 dev $nodex0
 
 	sudo ip -n $ehxns link set dev $ehx up
 	sudo ip -n $ehxns link set dev lo up
@@ -75,7 +75,7 @@ function testnet_up() {
     sudo ip -n $proxy_ns address add $proxy11_address/24 dev $proxy11
 
     # add route to the address given by the connect-ip server
-    sudo ip -n eh1ns route add 10.248.3.0/24 via 10.248.2.10 dev eh1
+    sudo ip -n eh1ns route add 10.248.2.128/28 via 10.248.2.10 dev eh1
 
     # add routes between the two node namespaces
     #sudo ip -n $client_ns route add $proxy11_address/32 dev $client01

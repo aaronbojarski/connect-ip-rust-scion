@@ -34,6 +34,9 @@ impl Tun {
                     .ipv4(address, 24, None)
                     .build_async()?;
 
+                // TODO: make address assignment better
+                dev.add_address_v4("10.248.2.128", 25)?;
+
                 let mut buf = vec![0; 65536];
                 loop {
                     tokio::select! {
