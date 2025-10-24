@@ -1,10 +1,11 @@
 use std::{
-    env, fs, io, net::{SocketAddr, ToSocketAddrs},  sync::Arc
+    env, fs, future, io, net::{SocketAddr, ToSocketAddrs}, sync::Arc
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use clap::Parser;
 use connect_ip_rust_scion::tun;
+use h3::error::{ConnectionError, StreamError};
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::pki_types::CertificateDer;
 use tokio::sync::mpsc;
@@ -13,7 +14,6 @@ use url::Url;
 
 const ALPN_QUIC_HTTP: &[&[u8]] = &[b"h3"];
 
-/// HTTP/0.9 over QUIC client
 #[derive(Parser, Debug)]
 #[clap(name = "client")]
 struct Opt {
@@ -61,25 +61,61 @@ async fn run(options: Opt) -> Result<()> {
         .map_err(|e| anyhow!("failed to connect: {}", e))?;
     info!("connected");
 
-    let (mut send, mut recv) = conn
-        .open_bi()
-        .await
-        .map_err(|e| anyhow!("failed to open stream: {}", e))?;
-    let request = format!("GET {}\r\n", url.path());
-    send.write_all(request.as_bytes())
-        .await
-        .map_err(|e| anyhow!("failed to send request: {}", e))?;
-    send.finish().unwrap();
-    info!("request sent");
-    let resp = recv
-        .read_to_end(usize::MAX)
-        .await
-        .map_err(|e| anyhow!("failed to read response: {}", e))?;
-    info!("response received");
+
+    // Create a new HTTP/3 connection (h3 over QUIC)
+    let h3_conn = h3_quinn::Connection::new(conn.clone());
+    info!("h3 quinn connection created");
+    let (mut driver, mut send_request) = h3::client::new(h3_conn).await?;
+    info!("h3 client created");
+
+    let (req_res, drive_res) = tokio::select! {
+        req_result = async {
+            info!("sending request ...");
+            let req = http::Request::builder()
+                .method("CONNECT")
+                .uri(format!("{}:{}", host, url.port().unwrap_or(4433)))
+                .body(())
+                .map_err(|e| anyhow!("failed to build request: {}", e)).unwrap();
+
+            info!("request built");
+            
+            let mut stream = send_request.send_request(req).await?;
+            stream.finish().await?;
+            
+            info!("receiving response ...");
+            let resp = stream.recv_response().await?;
+            info!("response: {:?} {}", resp.version(), resp.status());
+            
+            Ok::<_, StreamError>(())
+        } => {
+            (req_result, Ok(()))
+        }
+        drive_result = future::poll_fn(|cx| driver.poll_close(cx)) => {
+            (Ok(()), Err(ConnectionError::from(drive_result)))
+        }
+    };
+
+    info!("H3 client created");
+
+    if let Err(err) = req_res {
+        if err.is_h3_no_error() {
+            info!("connection closed with H3_NO_ERROR");
+        } else {
+            error!("request failed: {:?}", err);
+        }
+        error!("request failed: {:?}", err);
+    }
+    if let Err(err) = drive_res {
+        if err.is_h3_no_error() {
+            info!("connection closed with H3_NO_ERROR");
+        } else {
+            error!("connection closed with error: {:?}", err);
+            return Err(err.into());
+        }
+    }
 
     // convert the received bytes to an IPv4 address
-    let received_address = String::from_utf8(resp)
-        .map_err(|e| anyhow!("failed to parse response as UTF-8: {}", e))?;
+    let received_address = "10.248.2.180";
 
     let (tx_to_tun, rx_in_tun) = mpsc::channel::<Vec<u8>>(100);
     let (tx_from_tun, mut rx_from_tun) = mpsc::channel::<Vec<u8>>(100);

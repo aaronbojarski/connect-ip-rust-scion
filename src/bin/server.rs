@@ -1,7 +1,5 @@
 use std::net::Ipv4Addr;
-use std::{
-    ascii, env, fs, io, net::SocketAddr, str, sync::Arc, collections::HashMap
-};
+use std::{env, fs, io, net::SocketAddr, sync::Arc, collections::HashMap};
 
 use anyhow::{Context, Result, anyhow, bail};
 use pnet::packet::ipv4::Ipv4Packet;
@@ -79,10 +77,8 @@ async fn run(options: Opt) -> Result<()> {
         .with_single_cert(certs, key)?;
     server_crypto.alpn_protocols = ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
 
-    let mut server_config =
+    let server_config =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
-    let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
-    transport_config.max_concurrent_uni_streams(0_u8.into());
 
     let endpoint = quinn::Endpoint::server(server_config, options.listen)?;
     info!("listening on {}", endpoint.local_addr()?);
@@ -233,7 +229,6 @@ async fn handle_connection(
     async {
         info!("established");
 
-        let (datagram_tx, mut datagram_rx) = mpsc::channel::<Vec<u8>>(100);
         let (inbound_tx, mut inbound_rx) = mpsc::channel::<Vec<u8>>(100);
 
         // Register this connection in the queue set
@@ -242,118 +237,121 @@ async fn handle_connection(
             queues.insert(connection_id, inbound_tx);
         }
 
-        // Each stream initiated by the client constitutes a new request.
-        loop {
-            let stream = connection.accept_bi().await;
-            let stream = match stream {
-                Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
-                    info!("connection closed");
-                    // Cleanup: remove from queue set
-                    let mut queues = queue_set.lock().await;
-                    queues.remove(&connection_id);
-                    return Ok(());
-                }
-                Err(e) => {
-                    let mut queues = queue_set.lock().await;
-                    queues.remove(&connection_id);
-                    return Err(e);
-                }
-                Ok(s) => s,
-            };
-            let fut = handle_request(stream);
-            tokio::spawn(
-                async move {
-                    if let Err(e) = fut.await {
-                        error!("failed: {reason}", reason = e.to_string());
-                    }
-                }
-                .instrument(info_span!("request")),
-            );
+        // Clone connection for datagrams before passing to h3
+        let conn_for_datagrams = connection.clone();
+        
+        // Create HTTP/3 connection
+        let mut h3_conn = h3::server::Connection::new(h3_quinn::Connection::new(connection))
+                        .await
+                        .unwrap();
+        info!("HTTP/3 connection established");
+        
+        // Handle the HTTP/3 request for address negotiation
+        if let Some(resolver) = h3_conn.accept().await.map_err(|e| anyhow!("h3 accept failed: {}", e))? {
+            let (req, mut stream) = resolver.resolve_request().await?;            
+            info!("received HTTP/3 request");
+
+            // TODO:
+            // 1. Parse and check request
+            // 2. Send around capsules until addresses are set
+            // 3. Start datagram handling
+            // 4. Keep stream open for further communication if needed
+
+            // Check the fields of the request
+            info!("Request method: {:?}", req.method());
+            info!("Request URI: {:?}", req.uri());
+            for (name, value) in req.headers() {
+                info!("Header: {:?}: {:?}", name, value);
+            }
+
+            // Send response with allocated IP address
+            let response = http::Response::builder()
+                .status(http::StatusCode::OK)
+                .body(())
+                .unwrap();
             
-            // After handling the request, start listening for datagrams
-            let conn_clone = connection.clone();
-            let datagram_tx_clone = datagram_tx.clone();
-            tokio::spawn(
-                async move {
-                    if let Err(e) = handle_datagrams(conn_clone, datagram_tx_clone).await {
-                        error!("datagram handler failed: {}", e);
-                    }
-                }.instrument(info_span!("datagram_handler")),
-            );
+            stream.send_response(response)
+                .await
+                .map_err(|e| anyhow!("failed to send response: {}", e))?;
+
+            //stream.recv_data().await.map_err(|e| anyhow!("failed to receive data: {}", e))?;
             
-            // Forward datagrams from connection to outbound queue
-            let outbound_tx_clone = outbound_tx.clone();
-            tokio::spawn(async move {
-                while let Some(packet) = datagram_rx.recv().await {
-                    info!("forwarding datagram to IP: {} bytes", packet.len());
-                    if let Err(e) = outbound_tx_clone.send(packet).await {
-                        error!("failed to forward packet: {}", e);
-                        break;
-                    }
-                }
-            });
+            stream.send_data(bytes::Bytes::from("10.248.2.180"))
+                .await
+                .map_err(|e| anyhow!("failed to send data: {}", e))?;
             
-            // Forward packets from inbound queue to connection datagrams
-            let conn_clone = connection.clone();
-            tokio::spawn(async move {
-                while let Some(packet) = inbound_rx.recv().await {
-                    info!("sending packet as datagram: {} bytes", packet.len());
-                    if let Err(e) = conn_clone.send_datagram(packet.into()) {
-                        error!("failed to send datagram: {}", e);
-                        break;
-                    }
-                }
-            });
-            
-            return Ok(());
+            info!("sent IP address allocation response");
+        } else {
+            info!("no HTTP/3 request received on connection");
+            return Ok(())
         }
-    }
-    .instrument(span)
-    .await?;
-    Ok(())
-}
-async fn handle_request(
-    (mut send, mut recv): (quinn::SendStream, quinn::RecvStream),
-) -> Result<()> {
-    let req = recv
-        .read_to_end(64 * 1024)
-        .await
-        .map_err(|e| anyhow!("failed reading request: {}", e))?;
-    let mut escaped = String::new();
-    for &x in &req[..] {
-        let part = ascii::escape_default(x).collect::<Vec<_>>();
-        escaped.push_str(str::from_utf8(&part).unwrap());
-    }
-    info!(content = %escaped);
-    info!("handled request");
+        
+        // Now use the cloned connection for datagrams
+        let (datagram_tx, mut datagram_rx) = mpsc::channel::<Vec<u8>>(100);
+        
+        // Spawn datagram receiver
+        let conn_clone = conn_for_datagrams.clone();
+        let recv_handle = tokio::spawn(
+            async move {
+                loop {
+                    match conn_clone.read_datagram().await {
+                        Ok(data) => {
+                            info!("received datagram: {} bytes", data.len());
+                            if datagram_tx.send(data.to_vec()).await.is_err() {
+                                error!("datagram queue closed");
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            error!("datagram read error: {}", e);
+                            break;
+                        }
+                    }
+                }
+            }.instrument(info_span!("datagram_receiver")),
+        );
 
-    let resp = b"10.248.2.180";
-    send.write_all(resp)
-        .await
-        .map_err(|e| anyhow!("failed to send response: {}", e))?;
-
-    // Gracefully terminate the stream
-    send.finish().unwrap();
-    info!("complete");
-    Ok(())
-}
-
-async fn handle_datagrams(connection: quinn::Connection, tx: Sender::<Vec<u8>>) -> Result<()> {
-    info!("starting datagram listener");
-    loop {
-        match connection.read_datagram().await {
-            Ok(data) => {
-                info!("received datagram: {} bytes", data.len());
-                if tx.send(data.to_vec()).await.is_err() {
-                    error!("failed to send datagram to queue");
+        // Forward datagrams from connection to outbound queue
+        let outbound_tx_clone = outbound_tx.clone();
+        let forward_handle = tokio::spawn(async move {
+            while let Some(packet) = datagram_rx.recv().await {
+                info!("forwarding datagram to IP: {} bytes", packet.len());
+                if let Err(e) = outbound_tx_clone.send(packet).await {
+                    error!("failed to forward packet: {}", e);
                     break;
                 }
             }
-            Err(e) => {
-                error!("datagram read error: {}", e);
-                return Err(anyhow!("datagram read failed: {}", e));
+        });
+        
+        // Forward packets from inbound queue to connection datagrams
+        let conn_clone = conn_for_datagrams.clone();
+        let send_handle = tokio::spawn(async move {
+            while let Some(packet) = inbound_rx.recv().await {
+                info!("sending packet as datagram: {} bytes", packet.len());
+                if let Err(e) = conn_clone.send_datagram(packet.into()) {
+                    error!("failed to send datagram: {}", e);
+                    break;
+                }
             }
-        }
+        });
+        
+        // Wait for connection to close
+        conn_for_datagrams.closed().await;
+        info!("connection closed");
+        
+        // Cleanup
+        let mut queues = queue_set.lock().await;
+        queues.remove(&connection_id);
+        drop(queues);
+
+        // Cancel spawned tasks
+        recv_handle.abort();
+        forward_handle.abort();
+        send_handle.abort();
+        
+        Ok::<(), anyhow::Error>(())
     }
+    .instrument(span)
+    .await?;
     Ok(())
 }
