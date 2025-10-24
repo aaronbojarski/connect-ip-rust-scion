@@ -1,14 +1,14 @@
 use std::net::Ipv4Addr;
-use std::{env, fs, io, net::SocketAddr, sync::Arc, collections::HashMap};
+use std::{collections::HashMap, env, fs, io, net::SocketAddr, sync::Arc};
 
 use anyhow::{Context, Result, anyhow, bail};
-use pnet::packet::ipv4::Ipv4Packet;
 use clap::Parser;
 use connect_ip_rust_scion::tun;
+use pnet::packet::ipv4::Ipv4Packet;
 use quinn::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use tokio::sync::mpsc::{self, Sender, Receiver};
 use tokio::sync::Mutex;
+use tokio::sync::mpsc::{self, Receiver, Sender};
 use tracing::{error, info, info_span, warn};
 use tracing_futures::Instrument as _;
 
@@ -85,17 +85,20 @@ async fn run(options: Opt) -> Result<()> {
 
     // Create queue set for distributing packets to connections
     let queue_set: QueueSet = Arc::new(Mutex::new(HashMap::new()));
-    
+
     // Create channel for sending packets from connections to the pnet socket
     let (outbound_tx, outbound_rx) = mpsc::channel::<Vec<u8>>(1000);
 
     // Spawn IP packet handler task
     let queue_set_clone = queue_set.clone();
-    tokio::spawn(async move {
-        if let Err(e) = handle_ip_packets(queue_set_clone, outbound_rx).await {
-            error!("IP packet handler failed: {}", e);
+    tokio::spawn(
+        async move {
+            if let Err(e) = handle_ip_packets(queue_set_clone, outbound_rx).await {
+                error!("IP packet handler failed: {}", e);
+            }
         }
-    }.instrument(info_span!("ip_packet_handler")));
+        .instrument(info_span!("ip_packet_handler")),
+    );
 
     let mut connection_id: ConnectionId = 0;
     while let Some(conn) = endpoint.accept().await {
@@ -109,10 +112,10 @@ async fn run(options: Opt) -> Result<()> {
             info!("accepting connection");
             let current_id = connection_id;
             connection_id += 1;
-            
+
             let queue_set_clone = queue_set.clone();
             let outbound_tx_clone = outbound_tx.clone();
-            
+
             let fut = handle_connection(conn, current_id, queue_set_clone, outbound_tx_clone);
             tokio::spawn(async move {
                 if let Err(e) = fut.await {
@@ -125,29 +128,31 @@ async fn run(options: Opt) -> Result<()> {
     Ok(())
 }
 
-async fn handle_ip_packets(
-    queue_set: QueueSet,
-    mut outbound_rx: Receiver<Vec<u8>>
-) -> Result<()> {
+async fn handle_ip_packets(queue_set: QueueSet, mut outbound_rx: Receiver<Vec<u8>>) -> Result<()> {
     info!("starting IP packet handler");
 
     let (tx_to_tun, rx_in_tun) = mpsc::channel::<Vec<u8>>(100);
     let (tx_from_tun, mut rx_from_tun) = mpsc::channel::<Vec<u8>>(100);
-    
+
     let mut tun = tun::Tun::new("tun0", "10.248.1.7".parse::<Ipv4Addr>()?, 1500);
     tun.start(tx_from_tun, rx_in_tun).await?;
-    
+
     // Spawn task to receive packets from TUN and distribute to connections
     let queue_set_clone = queue_set.clone();
     let inbound_handle = tokio::spawn(async move {
         info!("started listening for packets from TUN interface");
-        
+
         while let Some(packet) = rx_from_tun.recv().await {
             if let Some(ipv4) = Ipv4Packet::new(&packet) {
                 let src = ipv4.get_source();
                 let dest = ipv4.get_destination();
-                info!("received IP packet from TUN: {} -> {}, {} bytes", src, dest, packet.len());
-                
+                info!(
+                    "received IP packet from TUN: {} -> {}, {} bytes",
+                    src,
+                    dest,
+                    packet.len()
+                );
+
                 // Distribute to all connections
                 let queues = queue_set_clone.lock().await;
                 if queues.is_empty() {
@@ -166,22 +171,27 @@ async fn handle_ip_packets(
                 warn!("received invalid IPv4 packet from TUN");
             }
         }
-        
+
         info!("inbound packet handler exiting");
     });
 
     // Handle outbound packets from connections and send to TUN
     let outbound_handle = tokio::spawn(async move {
         info!("started outbound packet handler");
-        
+
         while let Some(packet) = outbound_rx.recv().await {
             info!("processing outbound IP packet: {} bytes", packet.len());
-            
+
             if let Some(ipv4_packet) = Ipv4Packet::new(&packet) {
                 let dest = ipv4_packet.get_destination();
                 let src = ipv4_packet.get_source();
-                info!("sending IP packet to TUN: {} -> {}, {} bytes", src, dest, packet.len());
-                
+                info!(
+                    "sending IP packet to TUN: {} -> {}, {} bytes",
+                    src,
+                    dest,
+                    packet.len()
+                );
+
                 if let Err(e) = tx_to_tun.send(packet).await {
                     error!("failed to send packet to TUN: {}", e);
                     break;
@@ -191,7 +201,7 @@ async fn handle_ip_packets(
                 warn!("invalid IPv4 packet, dropping");
             }
         }
-        
+
         info!("outbound packet handler exiting");
     });
 
@@ -212,7 +222,7 @@ async fn handle_connection(
     conn: quinn::Incoming,
     connection_id: ConnectionId,
     queue_set: QueueSet,
-    outbound_tx: Sender<Vec<u8>>
+    outbound_tx: Sender<Vec<u8>>,
 ) -> Result<()> {
     let connection = conn.await?;
     let span = info_span!(
@@ -239,16 +249,20 @@ async fn handle_connection(
 
         // Clone connection for datagrams before passing to h3
         let conn_for_datagrams = connection.clone();
-        
+
         // Create HTTP/3 connection
         let mut h3_conn = h3::server::Connection::new(h3_quinn::Connection::new(connection))
-                        .await
-                        .unwrap();
+            .await
+            .unwrap();
         info!("HTTP/3 connection established");
-        
+
         // Handle the HTTP/3 request for address negotiation
-        if let Some(resolver) = h3_conn.accept().await.map_err(|e| anyhow!("h3 accept failed: {}", e))? {
-            let (req, mut stream) = resolver.resolve_request().await?;            
+        if let Some(resolver) = h3_conn
+            .accept()
+            .await
+            .map_err(|e| anyhow!("h3 accept failed: {}", e))?
+        {
+            let (req, mut stream) = resolver.resolve_request().await?;
             info!("received HTTP/3 request");
 
             // TODO:
@@ -269,26 +283,28 @@ async fn handle_connection(
                 .status(http::StatusCode::OK)
                 .body(())
                 .unwrap();
-            
-            stream.send_response(response)
+
+            stream
+                .send_response(response)
                 .await
                 .map_err(|e| anyhow!("failed to send response: {}", e))?;
 
             //stream.recv_data().await.map_err(|e| anyhow!("failed to receive data: {}", e))?;
-            
-            stream.send_data(bytes::Bytes::from("10.248.2.180"))
+
+            stream
+                .send_data(bytes::Bytes::from("10.248.2.180"))
                 .await
                 .map_err(|e| anyhow!("failed to send data: {}", e))?;
-            
+
             info!("sent IP address allocation response");
         } else {
             info!("no HTTP/3 request received on connection");
-            return Ok(())
+            return Ok(());
         }
-        
+
         // Now use the cloned connection for datagrams
         let (datagram_tx, mut datagram_rx) = mpsc::channel::<Vec<u8>>(100);
-        
+
         // Spawn datagram receiver
         let conn_clone = conn_for_datagrams.clone();
         let recv_handle = tokio::spawn(
@@ -308,7 +324,8 @@ async fn handle_connection(
                         }
                     }
                 }
-            }.instrument(info_span!("datagram_receiver")),
+            }
+            .instrument(info_span!("datagram_receiver")),
         );
 
         // Forward datagrams from connection to outbound queue
@@ -322,7 +339,7 @@ async fn handle_connection(
                 }
             }
         });
-        
+
         // Forward packets from inbound queue to connection datagrams
         let conn_clone = conn_for_datagrams.clone();
         let send_handle = tokio::spawn(async move {
@@ -334,11 +351,11 @@ async fn handle_connection(
                 }
             }
         });
-        
+
         // Wait for connection to close
         conn_for_datagrams.closed().await;
         info!("connection closed");
-        
+
         // Cleanup
         let mut queues = queue_set.lock().await;
         queues.remove(&connection_id);
@@ -348,7 +365,7 @@ async fn handle_connection(
         recv_handle.abort();
         forward_handle.abort();
         send_handle.abort();
-        
+
         Ok::<(), anyhow::Error>(())
     }
     .instrument(span)

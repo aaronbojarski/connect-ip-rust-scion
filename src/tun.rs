@@ -1,6 +1,6 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::net::Ipv4Addr;
-use tokio::sync::mpsc::{Sender, Receiver};
+use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{error, info, info_span};
 use tracing_futures::Instrument as _;
 use tun_rs::DeviceBuilder;
@@ -56,12 +56,12 @@ impl Tun {
                     }
                 }
             }.await;
-            
+
             if let Err(e) = result {
                 error!("TUN device task failed: {}", e);
             }
         }.instrument(info_span!("tap_device_handler")));
-        
+
         Ok(())
     }
 }

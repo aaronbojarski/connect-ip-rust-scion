@@ -1,8 +1,10 @@
 use std::{
-    env, fs, future, io, net::{SocketAddr, ToSocketAddrs}, sync::Arc
+    env, fs, future, io,
+    net::{SocketAddr, ToSocketAddrs},
+    sync::Arc,
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use clap::Parser;
 use connect_ip_rust_scion::tun;
 use h3::error::{ConnectionError, StreamError};
@@ -61,7 +63,6 @@ async fn run(options: Opt) -> Result<()> {
         .map_err(|e| anyhow!("failed to connect: {}", e))?;
     info!("connected");
 
-
     // Create a new HTTP/3 connection (h3 over QUIC)
     let h3_conn = h3_quinn::Connection::new(conn.clone());
     info!("h3 quinn connection created");
@@ -78,14 +79,14 @@ async fn run(options: Opt) -> Result<()> {
                 .map_err(|e| anyhow!("failed to build request: {}", e)).unwrap();
 
             info!("request built");
-            
+
             let mut stream = send_request.send_request(req).await?;
             stream.finish().await?;
-            
+
             info!("receiving response ...");
             let resp = stream.recv_response().await?;
             info!("response: {:?} {}", resp.version(), resp.status());
-            
+
             Ok::<_, StreamError>(())
         } => {
             (req_result, Ok(()))
@@ -119,7 +120,7 @@ async fn run(options: Opt) -> Result<()> {
 
     let (tx_to_tun, rx_in_tun) = mpsc::channel::<Vec<u8>>(100);
     let (tx_from_tun, mut rx_from_tun) = mpsc::channel::<Vec<u8>>(100);
-    
+
     let mut tun = tun::Tun::new("tun0", received_address.parse()?, 1500);
     tun.start(tx_from_tun, rx_in_tun).await?;
 
