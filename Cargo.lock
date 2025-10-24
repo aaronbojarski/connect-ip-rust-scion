@@ -267,6 +267,7 @@ dependencies = [
  "pnet",
  "pnet_datalink",
  "quinn",
+ "quinn-proto",
  "rcgen",
  "rustls",
  "tokio",
