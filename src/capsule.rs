@@ -15,8 +15,43 @@ pub enum CapsuleType {
 #[derive(Clone)]
 pub struct Capsule {
     pub capsule_type: CapsuleType,
-    pub length: u64,
     pub payload: Vec<u8>,
+}
+
+impl Capsule {
+    pub fn parse(cursor: &mut Cursor<&Vec<u8>>) -> Result<Capsule, &'static str> {
+        let capsule_type: VarInt = VarInt::decode(cursor).unwrap();
+        let length: VarInt = VarInt::decode(cursor).unwrap();
+
+        if cursor.remaining() < length.into_inner() as usize {
+            return Err("Insufficient data for capsule payload");
+        }
+
+        let mut payload = vec![0u8; length.into_inner() as usize];
+        cursor.copy_to_slice(&mut payload);
+
+        let capsule_type = match capsule_type.into_inner() {
+            0x01 => CapsuleType::AddressAssign,
+            0x02 => CapsuleType::AddressRequest,
+            0x03 => CapsuleType::RouteAdvertisement,
+            _ => return Err("Unknown capsule type"),
+        };
+
+        Ok(Capsule {
+            capsule_type,
+            payload,
+        })
+    }
+
+    pub fn append(&self, buf: &mut Vec<u8>) {
+        VarInt::from_u64(self.capsule_type.clone() as u64)
+            .unwrap()
+            .encode(buf);
+        VarInt::from_u64(self.payload.len() as u64)
+            .unwrap()
+            .encode(buf);
+        buf.extend_from_slice(&self.payload);
+    }
 }
 
 #[derive(Clone)]
