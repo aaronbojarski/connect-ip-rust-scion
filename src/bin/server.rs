@@ -1,21 +1,16 @@
-use std::net::Ipv4Addr;
-use std::{collections::HashMap, env, fs, io, net::SocketAddr, sync::Arc};
+use std::collections::HashMap;
+use std::env;
+use std::net::{Ipv4Addr, SocketAddr};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::Result;
 use clap::Parser;
 use connect_ip_rust_scion::tun;
 use pnet::packet::ipv4::Ipv4Packet;
-use quinn::crypto::rustls::QuicServerConfig;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use tokio::sync::Mutex;
-use tokio::sync::mpsc::{self, Receiver, Sender};
-use tracing::{error, info, info_span, warn};
-use tracing_futures::Instrument as _;
+use ring::rand::SecureRandom;
+use tokio::sync::mpsc;
+use tracing::{debug, error, info};
 
-const ALPN_QUIC_HTTP: &[&[u8]] = &[b"h3"];
-
-type ConnectionId = usize;
-type QueueSet = Arc<Mutex<HashMap<ConnectionId, Sender<Vec<u8>>>>>;
+const MAX_DATAGRAM_SIZE: usize = 1350;
 
 #[derive(Parser, Debug)]
 #[clap(name = "server")]
@@ -23,9 +18,6 @@ struct Opt {
     /// Address to listen on
     #[clap(long = "listen", default_value = "127.0.0.1:4433")]
     listen: SocketAddr,
-    /// Maximum number of concurrent connections to allow
-    #[clap(long = "connection-limit")]
-    connection_limit: Option<usize>,
 }
 
 fn main() {
@@ -42,333 +34,260 @@ fn main() {
     ::std::process::exit(code);
 }
 
+pub struct UdpPacket {
+    pub data: Vec<u8>,
+    pub src: SocketAddr,
+    pub dst: SocketAddr,
+}
+
 #[tokio::main]
 async fn run(options: Opt) -> Result<()> {
-    let (certs, key) = {
+    // Load or generate certificates
+    let (cert_path, key_path) = {
         let cwd = env::current_dir()?;
-        let cert_path = cwd.join("cert.der");
-        let key_path = cwd.join("key.der");
-        let (cert, key) = match fs::read(&cert_path).and_then(|x| Ok((x, fs::read(&key_path)?))) {
-            Ok((cert, key)) => (
-                CertificateDer::from(cert),
-                PrivateKeyDer::try_from(key).map_err(anyhow::Error::msg)?,
-            ),
-            Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
-                info!("generating self-signed certificate");
-                let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-                let key = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
-                let cert = cert.cert.into();
-                fs::create_dir_all(cwd).context("failed to create certificate directory")?;
-                fs::write(&cert_path, &cert).context("failed to write certificate")?;
-                fs::write(&key_path, key.secret_pkcs8_der())
-                    .context("failed to write private key")?;
-                (cert, key.into())
-            }
-            Err(e) => {
-                bail!("failed to read certificate: {}", e);
-            }
-        };
+        let cert_path = cwd.join("cert.pem");
+        let key_path = cwd.join("key.pem");
 
-        (vec![cert], key)
+        (cert_path, key_path)
     };
 
-    let mut server_crypto = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?;
-    server_crypto.alpn_protocols = ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
+    let config = configure_quic(&cert_path, &key_path)?;
 
-    let server_config =
-        quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
+    let socket = tokio::net::UdpSocket::bind(options.listen).await?;
+    info!("listening on {}", socket.local_addr()?);
 
-    let endpoint = quinn::Endpoint::server(server_config, options.listen)?;
-    info!("listening on {}", endpoint.local_addr()?);
+    // Channels between TUN and QUIC
+    let (tx_quic_to_tun, rx_quic_to_tun) = mpsc::channel::<Vec<u8>>(1000);
+    let (tx_tun_to_quic, rx_tun_to_quic) = mpsc::channel::<Vec<u8>>(1000);
 
-    // Create queue set for distributing packets to connections
-    let queue_set: QueueSet = Arc::new(Mutex::new(HashMap::new()));
+    // Channels between UDP and QUIC
+    let (tx_udp_to_quic, rx_udp_to_quic) = mpsc::channel::<UdpPacket>(1000);
+    let (tx_quic_to_udp, mut rx_quic_to_udp) = mpsc::channel::<UdpPacket>(1000);
 
-    // Create channel for sending packets from connections to the pnet socket
-    let (outbound_tx, outbound_rx) = mpsc::channel::<Vec<u8>>(1000);
+    // Start TUN interface
+    let mut tun = tun::Tun::new("tun0", "10.248.1.7".parse::<Ipv4Addr>()?, 1500);
+    tun.start(tx_tun_to_quic, rx_quic_to_tun).await?;
 
-    // Spawn IP packet handler task
-    let queue_set_clone = queue_set.clone();
-    tokio::spawn(
-        async move {
-            if let Err(e) = handle_ip_packets(queue_set_clone, outbound_rx).await {
-                error!("IP packet handler failed: {}", e);
+    // Spawn QUIC connection handler task
+    tokio::spawn(handle_quic_connections(
+        config,
+        socket.local_addr()?,
+        rx_udp_to_quic,
+        tx_quic_to_udp.clone(),
+        rx_tun_to_quic,
+        tx_quic_to_tun,
+    ));
+
+    let mut buf = [0; 65535];
+
+    // Main loop: handle UDP socket
+    loop {
+        tokio::select! {
+            // Receive datagram from UDP socket and pass to QUIC
+            Ok(result) = socket.recv_from(&mut buf) => {
+                let (len, src) = result;
+                debug!("received {} bytes from {}", len, src);
+                tx_udp_to_quic.send(UdpPacket {
+                    data: buf[..len].to_vec(),
+                    src,
+                    dst: socket.local_addr()?,
+                }).await.unwrap();
+            }
+            // Send datagram from QUIC to UDP socket
+            Some(packet_data) = rx_quic_to_udp.recv() => {
+                let sent_len = socket.send_to(&packet_data.data, packet_data.dst).await?;
+                debug!("sent {} bytes to {}", sent_len, packet_data.dst);
             }
         }
-        .instrument(info_span!("ip_packet_handler")),
-    );
-
-    let mut connection_id: ConnectionId = 0;
-    while let Some(conn) = endpoint.accept().await {
-        if options
-            .connection_limit
-            .is_some_and(|n| endpoint.open_connections() >= n)
-        {
-            info!("refusing due to open connection limit");
-            conn.refuse();
-        } else {
-            info!("accepting connection");
-            let current_id = connection_id;
-            connection_id += 1;
-
-            let queue_set_clone = queue_set.clone();
-            let outbound_tx_clone = outbound_tx.clone();
-
-            let fut = handle_connection(conn, current_id, queue_set_clone, outbound_tx_clone);
-            tokio::spawn(async move {
-                if let Err(e) = fut.await {
-                    error!("connection failed: {reason}", reason = e.to_string())
-                }
-            });
-        }
     }
-
-    Ok(())
 }
 
-async fn handle_ip_packets(queue_set: QueueSet, mut outbound_rx: Receiver<Vec<u8>>) -> Result<()> {
-    info!("starting IP packet handler");
+fn configure_quic(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> Result<quiche::Config> {
+    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
 
-    let (tx_to_tun, rx_in_tun) = mpsc::channel::<Vec<u8>>(100);
-    let (tx_from_tun, mut rx_from_tun) = mpsc::channel::<Vec<u8>>(100);
+    info!("Loading cert from {:?}", cert_path);
+    info!("Loading key from {:?}", key_path);
+    config.load_cert_chain_from_pem_file(cert_path.to_str().unwrap())?;
+    config.load_priv_key_from_pem_file(key_path.to_str().unwrap())?;
 
-    let mut tun = tun::Tun::new("tun0", "10.248.1.7".parse::<Ipv4Addr>()?, 1500);
-    tun.start(tx_from_tun, rx_in_tun).await?;
+    config.set_application_protos(&[b"h3"])?;
 
-    // Spawn task to receive packets from TUN and distribute to connections
-    let queue_set_clone = queue_set.clone();
-    let inbound_handle = tokio::spawn(async move {
-        info!("started listening for packets from TUN interface");
+    config.set_max_idle_timeout(5000);
+    config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
+    config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
+    config.set_initial_max_data(10_000_000);
+    config.set_initial_max_stream_data_bidi_local(1_000_000);
+    config.set_initial_max_stream_data_bidi_remote(1_000_000);
+    config.set_initial_max_stream_data_uni(1_000_000);
+    config.set_initial_max_streams_bidi(100);
+    config.set_initial_max_streams_uni(100);
+    config.set_disable_active_migration(true);
+    config.enable_dgram(true, 30000, 30000);
 
-        while let Some(packet) = rx_from_tun.recv().await {
-            if let Some(ipv4) = Ipv4Packet::new(&packet) {
-                let src = ipv4.get_source();
-                let dest = ipv4.get_destination();
-                info!(
-                    "received IP packet from TUN: {} -> {}, {} bytes",
-                    src,
-                    dest,
-                    packet.len()
-                );
+    Ok(config)
+}
 
-                // Distribute to all connections
-                let queues = queue_set_clone.lock().await;
-                if queues.is_empty() {
-                    warn!("no active connections to forward packet to");
-                } else {
-                    for (conn_id, sender) in queues.iter() {
-                        info!("forwarding packet to connection {}", conn_id);
-                        if let Err(e) = sender.send(packet.clone()).await {
-                            error!("failed to send packet to connection {}: {}", conn_id, e);
-                        } else {
-                            info!("forwarded packet to connection {}", conn_id);
+async fn handle_quic_connections(
+    mut config: quiche::Config,
+    local_addr: SocketAddr,
+    mut rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
+    tx_quic_to_udp: mpsc::Sender<UdpPacket>,
+    mut rx_tun_to_quic: mpsc::Receiver<Vec<u8>>,
+    tx_quic_to_tun: mpsc::Sender<Vec<u8>>,
+) -> Result<()> {
+    let mut buf = [0; MAX_DATAGRAM_SIZE];
+    let mut connections: HashMap<quiche::ConnectionId<'static>, quiche::Connection> =
+        HashMap::new();
+
+    loop {
+        tokio::select! {
+            // Handle incoming UDP packets (QUIC protocol packets)
+            Some(packet) = rx_udp_to_quic.recv() => {
+                let recv_info = quiche::RecvInfo {
+                    from: packet.src,
+                    to: packet.dst,
+                };
+
+                // Parse the QUIC packet header
+                let mut packet_data = packet.data.clone();
+                let hdr = match quiche::Header::from_slice(&mut packet_data, quiche::MAX_CONN_ID_LEN) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        debug!("failed to parse header: {:?}", e);
+                        continue;
+                    }
+                };
+
+                // Check if this is a new connection
+                let conn = if !connections.contains_key(&hdr.dcid) {
+                    if hdr.ty != quiche::Type::Initial {
+                        debug!("packet is not Initial");
+                        continue;
+                    }
+
+                    // Generate connection IDs
+                    let mut scid = [0; quiche::MAX_CONN_ID_LEN];
+                    ring::rand::SystemRandom::new().fill(&mut scid).unwrap();
+                    let scid = quiche::ConnectionId::from_ref(&scid);
+
+                    // Accept the connection
+                    let conn = match quiche::accept(&scid, None, local_addr, packet.src, &mut config) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            error!("failed to accept connection: {:?}", e);
+                            continue;
                         }
+                    };
+
+                    info!("new connection from {} with scid {:?}", packet.src, scid);
+
+                    connections.insert(scid.clone().into_owned(), conn);
+                    connections.get_mut(&scid.into_owned()).unwrap()
+                } else {
+                    connections.get_mut(&hdr.dcid).unwrap()
+                };
+
+                // Process the packet
+                match conn.recv(&mut packet.data.clone(), recv_info) {
+                    Ok(_) => {
+                        debug!("processed {} bytes", packet.data.len());
+                    }
+                    Err(e) => {
+                        debug!("recv failed: {:?}", e);
                     }
                 }
-            } else {
-                warn!("received invalid IPv4 packet from TUN");
-            }
-        }
 
-        info!("inbound packet handler exiting");
-    });
+                // Handle HTTP/3 if connection is established
+                if conn.is_established() && !conn.is_in_early_data() {
+                    // TODO: Handle HTTP/3 requests for address allocation
+                    // For now, we'll just handle datagrams
 
-    // Handle outbound packets from connections and send to TUN
-    let outbound_handle = tokio::spawn(async move {
-        info!("started outbound packet handler");
+                    // Receive datagrams from QUIC and forward to TUN
+                    while let Ok(len) = conn.dgram_recv(&mut buf) {
+                        debug!("received {} bytes from QUIC datagram", len);
 
-        while let Some(packet) = outbound_rx.recv().await {
-            info!("processing outbound IP packet: {} bytes", packet.len());
-
-            if let Some(ipv4_packet) = Ipv4Packet::new(&packet) {
-                let dest = ipv4_packet.get_destination();
-                let src = ipv4_packet.get_source();
-                info!(
-                    "sending IP packet to TUN: {} -> {}, {} bytes",
-                    src,
-                    dest,
-                    packet.len()
-                );
-
-                if let Err(e) = tx_to_tun.send(packet).await {
-                    error!("failed to send packet to TUN: {}", e);
-                    break;
-                }
-                info!("successfully sent packet to TUN");
-            } else {
-                warn!("invalid IPv4 packet, dropping");
-            }
-        }
-
-        info!("outbound packet handler exiting");
-    });
-
-    // Wait for either task to complete
-    tokio::select! {
-        result = inbound_handle => {
-            error!("inbound packet handler exited: {:?}", result);
-        }
-        result = outbound_handle => {
-            error!("outbound packet handler exited: {:?}", result);
-        }
-    }
-
-    Ok(())
-}
-
-async fn handle_connection(
-    conn: quinn::Incoming,
-    connection_id: ConnectionId,
-    queue_set: QueueSet,
-    outbound_tx: Sender<Vec<u8>>,
-) -> Result<()> {
-    let connection = conn.await?;
-    let span = info_span!(
-        "connection",
-        id = connection_id,
-        remote = %connection.remote_address(),
-        protocol = %connection
-            .handshake_data()
-            .unwrap()
-            .downcast::<quinn::crypto::rustls::HandshakeData>().unwrap()
-            .protocol
-            .map_or_else(|| "<none>".into(), |x| String::from_utf8_lossy(&x).into_owned())
-    );
-    async {
-        info!("established");
-
-        let (inbound_tx, mut inbound_rx) = mpsc::channel::<Vec<u8>>(100);
-
-        // Register this connection in the queue set
-        {
-            let mut queues = queue_set.lock().await;
-            queues.insert(connection_id, inbound_tx);
-        }
-
-        // Clone connection for datagrams before passing to h3
-        let conn_for_datagrams = connection.clone();
-
-        // Create HTTP/3 connection
-        let mut h3_conn = h3::server::Connection::new(h3_quinn::Connection::new(connection))
-            .await
-            .unwrap();
-        info!("HTTP/3 connection established");
-
-        // Handle the HTTP/3 request for address negotiation
-        if let Some(resolver) = h3_conn
-            .accept()
-            .await
-            .map_err(|e| anyhow!("h3 accept failed: {}", e))?
-        {
-            let (req, mut stream) = resolver.resolve_request().await?;
-            info!("received HTTP/3 request");
-
-            // TODO:
-            // 1. Parse and check request
-            // 2. Send around capsules until addresses are set
-            // 3. Start datagram handling
-            // 4. Keep stream open for further communication if needed
-
-            // Check the fields of the request
-            info!("Request method: {:?}", req.method());
-            info!("Request URI: {:?}", req.uri());
-            for (name, value) in req.headers() {
-                info!("Header: {:?}: {:?}", name, value);
-            }
-
-            // Send response with allocated IP address
-            let response = http::Response::builder()
-                .status(http::StatusCode::OK)
-                .body(())
-                .unwrap();
-
-            stream
-                .send_response(response)
-                .await
-                .map_err(|e| anyhow!("failed to send response: {}", e))?;
-
-            //stream.recv_data().await.map_err(|e| anyhow!("failed to receive data: {}", e))?;
-
-            stream
-                .send_data(bytes::Bytes::from("10.248.2.180"))
-                .await
-                .map_err(|e| anyhow!("failed to send data: {}", e))?;
-
-            info!("sent IP address allocation response");
-        } else {
-            info!("no HTTP/3 request received on connection");
-            return Ok(());
-        }
-
-        // Now use the cloned connection for datagrams
-        let (datagram_tx, mut datagram_rx) = mpsc::channel::<Vec<u8>>(100);
-
-        // Spawn datagram receiver
-        let conn_clone = conn_for_datagrams.clone();
-        let recv_handle = tokio::spawn(
-            async move {
-                loop {
-                    match conn_clone.read_datagram().await {
-                        Ok(data) => {
-                            info!("received datagram: {} bytes", data.len());
-                            if datagram_tx.send(data.to_vec()).await.is_err() {
-                                error!("datagram queue closed");
-                                break;
-                            }
+                        if let Some(ipv4) = Ipv4Packet::new(&buf[..len]) {
+                            let src = ipv4.get_source();
+                            let dest = ipv4.get_destination();
+                            info!("forwarding IP packet to TUN: {} -> {}, {} bytes", src, dest, len);
                         }
+
+                        tx_quic_to_tun.send(buf[..len].to_vec()).await?;
+                    }
+                }
+
+                // Send any pending QUIC packets
+                loop {
+                    let (write, send_info) = match conn.send(&mut buf) {
+                        Ok(v) => v,
+                        Err(quiche::Error::Done) => break,
                         Err(e) => {
-                            error!("datagram read error: {}", e);
+                            debug!("send failed: {:?}", e);
                             break;
                         }
+                    };
+
+                    tx_quic_to_udp.send(UdpPacket {
+                        data: buf[..write].to_vec(),
+                        src: send_info.from,
+                        dst: send_info.to,
+                    }).await?;
+                }
+
+                // Clean up closed connections
+                connections.retain(|_, conn| !conn.is_closed());
+            }
+
+            // Handle outgoing IP packets from TUN
+            Some(ip_packet) = rx_tun_to_quic.recv() => {
+                if let Some(ipv4) = Ipv4Packet::new(&ip_packet) {
+                    let src = ipv4.get_source();
+                    let dest = ipv4.get_destination();
+                    info!("received IP packet from TUN: {} -> {}, {} bytes", src, dest, ip_packet.len());
+                }
+
+                // Forward to all established connections
+                let mut packets_to_send = Vec::new();
+
+                for (conn_id, conn) in connections.iter_mut() {
+                    if conn.is_established() {
+                        match conn.dgram_send(&ip_packet) {
+                            Ok(_) => {
+                                debug!("sent {} bytes as QUIC datagram to {:?}", ip_packet.len(), conn_id);
+
+                                // Collect packets to send
+                                loop {
+                                    let (write, send_info) = match conn.send(&mut buf) {
+                                        Ok(v) => v,
+                                        Err(quiche::Error::Done) => break,
+                                        Err(e) => {
+                                            debug!("send failed: {:?}", e);
+                                            break;
+                                        }
+                                    };
+
+                                    packets_to_send.push(UdpPacket {
+                                        data: buf[..write].to_vec(),
+                                        src: send_info.from,
+                                        dst: send_info.to,
+                                    });
+                                }
+                            }
+                            Err(e) => {
+                                debug!("dgram_send failed: {:?}", e);
+                            }
+                        }
                     }
                 }
-            }
-            .instrument(info_span!("datagram_receiver")),
-        );
 
-        // Forward datagrams from connection to outbound queue
-        let outbound_tx_clone = outbound_tx.clone();
-        let forward_handle = tokio::spawn(async move {
-            while let Some(packet) = datagram_rx.recv().await {
-                info!("forwarding datagram to IP: {} bytes", packet.len());
-                if let Err(e) = outbound_tx_clone.send(packet).await {
-                    error!("failed to forward packet: {}", e);
-                    break;
+                // Send all collected packets
+                for packet in packets_to_send {
+                    tx_quic_to_udp.send(packet).await?;
                 }
             }
-        });
-
-        // Forward packets from inbound queue to connection datagrams
-        let conn_clone = conn_for_datagrams.clone();
-        let send_handle = tokio::spawn(async move {
-            while let Some(packet) = inbound_rx.recv().await {
-                info!("sending packet as datagram: {} bytes", packet.len());
-                if let Err(e) = conn_clone.send_datagram(packet.into()) {
-                    error!("failed to send datagram: {}", e);
-                    break;
-                }
-            }
-        });
-
-        // Wait for connection to close
-        conn_for_datagrams.closed().await;
-        info!("connection closed");
-
-        // Cleanup
-        let mut queues = queue_set.lock().await;
-        queues.remove(&connection_id);
-        drop(queues);
-
-        // Cancel spawned tasks
-        recv_handle.abort();
-        forward_handle.abort();
-        send_handle.abort();
-
-        Ok::<(), anyhow::Error>(())
+        }
     }
-    .instrument(span)
-    .await?;
-    Ok(())
 }

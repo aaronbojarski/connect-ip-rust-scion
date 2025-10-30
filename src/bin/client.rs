@@ -1,20 +1,14 @@
-use std::{
-    env, fs, future, io,
-    net::{SocketAddr, ToSocketAddrs},
-    sync::Arc,
-};
+use std::net::{SocketAddr, ToSocketAddrs};
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use connect_ip_rust_scion::tun;
-use h3::error::{ConnectionError, StreamError};
-use quinn::crypto::rustls::QuicClientConfig;
-use rustls::pki_types::CertificateDer;
+use ring::rand::{SecureRandom, SystemRandom};
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{debug, info};
 use url::Url;
 
-const ALPN_QUIC_HTTP: &[&[u8]] = &[b"h3"];
+const MAX_DATAGRAM_SIZE: usize = 1350;
 
 #[derive(Parser, Debug)]
 #[clap(name = "client")]
@@ -44,9 +38,17 @@ fn main() {
     ::std::process::exit(code);
 }
 
+pub struct UdpPacket {
+    pub data: Vec<u8>,
+    pub src: SocketAddr,
+    pub dst: SocketAddr,
+}
+
 #[tokio::main]
 async fn run(options: Opt) -> Result<()> {
-    let endpoint = configure_endpoint(options.bind).await?;
+    let mut buf = [0; 65535];
+
+    let config = configure_quic().unwrap();
     let url = options.url;
     let url_host = "10.248.100.11";
     let remote = (url_host, url.port().unwrap_or(4433))
@@ -54,124 +56,214 @@ async fn run(options: Opt) -> Result<()> {
         .next()
         .ok_or_else(|| anyhow!("couldn't resolve to an address"))?;
 
-    let host = options.host.as_deref().unwrap_or(url_host);
+    let socket = tokio::net::UdpSocket::bind(options.bind).await?;
 
-    info!("connecting to {host} at {remote}");
-    let conn = endpoint
-        .connect(remote, host)?
-        .await
-        .map_err(|e| anyhow!("failed to connect: {}", e))?;
-    info!("connected");
-
-    // Create a new HTTP/3 connection (h3 over QUIC)
-    let h3_conn = h3_quinn::Connection::new(conn.clone());
-    info!("h3 quinn connection created");
-    let (mut driver, mut send_request) = h3::client::new(h3_conn).await?;
-    info!("h3 client created");
-
-    let (req_res, drive_res) = tokio::select! {
-        req_result = async {
-            info!("sending request ...");
-            let req = http::Request::builder()
-                .method("CONNECT")
-                .uri(format!("{}:{}", host, url.port().unwrap_or(4433)))
-                .body(())
-                .map_err(|e| anyhow!("failed to build request: {}", e)).unwrap();
-
-            info!("request built");
-
-            let mut stream = send_request.send_request(req).await?;
-            stream.finish().await?;
-
-            info!("receiving response ...");
-            let resp = stream.recv_response().await?;
-            info!("response: {:?} {}", resp.version(), resp.status());
-
-            Ok::<_, StreamError>(())
-        } => {
-            (req_result, Ok(()))
-        }
-        drive_result = future::poll_fn(|cx| driver.poll_close(cx)) => {
-            (Ok(()), Err(ConnectionError::from(drive_result)))
-        }
-    };
-
-    info!("H3 client created");
-
-    if let Err(err) = req_res {
-        if err.is_h3_no_error() {
-            info!("connection closed with H3_NO_ERROR");
-        } else {
-            error!("request failed: {:?}", err);
-        }
-        error!("request failed: {:?}", err);
-    }
-    if let Err(err) = drive_res {
-        if err.is_h3_no_error() {
-            info!("connection closed with H3_NO_ERROR");
-        } else {
-            error!("connection closed with error: {:?}", err);
-            return Err(err.into());
-        }
-    }
+    // Get local address.
+    let local_addr = socket.local_addr().unwrap();
 
     // convert the received bytes to an IPv4 address
     let received_address = "10.248.2.180";
 
-    let (tx_to_tun, rx_in_tun) = mpsc::channel::<Vec<u8>>(100);
-    let (tx_from_tun, mut rx_from_tun) = mpsc::channel::<Vec<u8>>(100);
+    // Channels between TUN and QUIC tasks. Contents are IP packets.
+    let (tx_quic_to_tun, rx_quic_to_tun) = mpsc::channel::<Vec<u8>>(1000);
+    let (tx_tun_to_quic, rx_tun_to_quic) = mpsc::channel::<Vec<u8>>(1000);
 
-    let mut tun = tun::Tun::new("tun0", received_address.parse()?, 1500);
-    tun.start(tx_from_tun, rx_in_tun).await?;
+    // Channels between UDP and QUIC tasks. Contents are UDP datagrams (usually encrypted QUIC packets) with source address.
+    let (tx_udp_to_quic, rx_udp_to_quic) = mpsc::channel::<UdpPacket>(1000);
+    let (tx_quic_to_udp, mut rx_quic_to_udp) = mpsc::channel::<UdpPacket>(1000);
 
-    // Main loop: handle QUIC datagrams
+    let mut tun = tun::Tun::new("tun0", received_address.parse().unwrap(), 1500);
+    tun.start(tx_tun_to_quic, rx_quic_to_tun).await.unwrap();
+
+    // Spawn QUIC connection handler task
+    tokio::spawn(handle_quic_connection(
+        config,
+        "localhost".to_string(),
+        local_addr,
+        remote,
+        rx_udp_to_quic,
+        tx_quic_to_udp.clone(),
+        rx_tun_to_quic,
+        tx_quic_to_tun,
+    ));
+
+    // Open Questions:
+    // - Should there be a separate task per connection (more relevant on server side)?
+    // - How to handle connection timeouts and retries?
+
+    // Main loop: handle UDP socket
     loop {
         tokio::select! {
-            // Receive datagram from QUIC and forward to TUN
-            Ok(packet_data) = conn.read_datagram() => {
-                tx_to_tun.send(packet_data.to_vec()).await?;
+            // Receive datagram from UDP socket and pass to QUIC
+            Ok(result) = socket.recv_from(&mut buf) => {
+                let (len, src) = result;
+                debug!("received {} bytes from {}", len, src);
+                tx_udp_to_quic.send(UdpPacket {
+                    data: buf[..len].to_vec(),
+                    src,
+                    dst: local_addr,
+                }).await.unwrap();
             }
-            // Receive packet from TUN and send via QUIC
-            Some(packet_data) = rx_from_tun.recv() => {
-                conn.send_datagram(packet_data.into())?;
+            // Send datagram from QUIC to UDP socket
+            Some(packet_data) = rx_quic_to_udp.recv() => {
+                let sent_len = socket.send_to(&packet_data.data, packet_data.dst).await?;
+                debug!("sent {} bytes to {}", sent_len, packet_data.dst);
             }
         }
     }
 
     // TODO: Graceful shutdown
-    // conn.close(0u32.into(), b"done");
-
-    // Give the server a fair chance to receive the close packet
-    // endpoint.wait_idle().await;
-
     // Ok(())
 }
 
-async fn configure_endpoint(socket_addr: SocketAddr) -> Result<quinn::Endpoint> {
-    let mut roots = rustls::RootCertStore::empty();
-    let cwd = env::current_dir()?;
-    match fs::read(cwd.join("cert.der")) {
-        Ok(cert) => {
-            roots.add(CertificateDer::from(cert))?;
+fn configure_quic() -> Result<quiche::Config> {
+    // Create the configuration for the QUIC connection.
+    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+
+    // *CAUTION*: this should not be set to `false` in production!!!
+    config.verify_peer(false);
+
+    config.set_application_protos(&[b"h3"]).unwrap();
+
+    config.set_max_idle_timeout(5000);
+    config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
+    config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
+    config.set_initial_max_data(10_000_000);
+    config.set_initial_max_stream_data_bidi_local(1_000_000);
+    config.set_initial_max_stream_data_bidi_remote(1_000_000);
+    config.set_initial_max_streams_bidi(100);
+    config.set_initial_max_streams_uni(100);
+    config.set_disable_active_migration(true);
+    config.enable_dgram(true, 30000, 30000);
+
+    Ok(config)
+}
+
+async fn handle_quic_connection(
+    mut config: quiche::Config,
+    server_name: String,
+    local_addr: SocketAddr,
+    remote: SocketAddr,
+    mut rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
+    tx_quic_to_udp: mpsc::Sender<UdpPacket>,
+    mut rx_tun_to_quic: mpsc::Receiver<Vec<u8>>,
+    tx_quic_to_tun: mpsc::Sender<Vec<u8>>,
+) -> Result<()> {
+    let mut buf = [0; MAX_DATAGRAM_SIZE];
+
+    // Generate a random source connection ID for the connection.
+    let mut scid = [0; quiche::MAX_CONN_ID_LEN];
+    SystemRandom::new().fill(&mut scid[..]).unwrap();
+    let scid = quiche::ConnectionId::from_ref(&scid);
+
+    // Create a QUIC connection and initiate handshake.
+    let mut conn = quiche::connect(Some(&server_name), &scid, local_addr, remote, &mut config)?;
+
+    info!(
+        "connecting to {:} from {:} with scid {:?}",
+        remote, local_addr, scid
+    );
+
+    // Send initial packet
+    let (write, send_info) = conn.send(&mut buf).expect("initial send failed");
+    tx_quic_to_udp
+        .send(UdpPacket {
+            data: buf[..write].to_vec(),
+            src: send_info.from,
+            dst: send_info.to,
+        })
+        .await?;
+
+    let mut recv_info = quiche::RecvInfo {
+        from: remote,
+        to: local_addr,
+    };
+
+    loop {
+        tokio::select! {
+            // Handle incoming UDP packets (QUIC protocol packets)
+            Some(packet) = rx_udp_to_quic.recv() => {
+                recv_info.from = packet.src;
+                recv_info.to = packet.dst;
+
+                match conn.recv(&mut packet.data.clone(), recv_info) {
+                    Ok(_) => {
+                        debug!("processed {} bytes from QUIC packet", packet.data.len());
+                    }
+                    Err(e) => {
+                        debug!("recv failed: {:?}", e);
+                    }
+                }
+
+                // Check if connection is established
+                if conn.is_established() {
+                    // Receive datagrams from QUIC and forward to TUN
+                    while let Ok(len) = conn.dgram_recv(&mut buf) {
+                        debug!("received {} bytes from QUIC datagram", len);
+                        tx_quic_to_tun.send(buf[..len].to_vec()).await?;
+                    }
+                }
+
+                // Send any pending QUIC packets
+                loop {
+                    let (write, send_info) = match conn.send(&mut buf) {
+                        Ok(v) => v,
+                        Err(quiche::Error::Done) => break,
+                        Err(e) => {
+                            debug!("send failed: {:?}", e);
+                            break;
+                        }
+                    };
+
+                    tx_quic_to_udp.send(UdpPacket {
+                        data: buf[..write].to_vec(),
+                        src: send_info.from,
+                        dst: send_info.to,
+                    }).await?;
+                }
+            }
+
+            // Handle outgoing IP packets from TUN
+            Some(ip_packet) = rx_tun_to_quic.recv() => {
+                if conn.is_established() {
+                    match conn.dgram_send(&ip_packet) {
+                        Ok(_) => {
+                            debug!("sent {} bytes as QUIC datagram", ip_packet.len());
+
+                            // Send the resulting QUIC packets
+                            loop {
+                                let (write, send_info) = match conn.send(&mut buf) {
+                                    Ok(v) => v,
+                                    Err(quiche::Error::Done) => break,
+                                    Err(e) => {
+                                        debug!("send failed: {:?}", e);
+                                        break;
+                                    }
+                                };
+
+                                tx_quic_to_udp.send(UdpPacket {
+                                    data: buf[..write].to_vec(),
+                                    src: send_info.from,
+                                    dst: send_info.to,
+                                }).await?;
+                            }
+                        }
+                        Err(e) => {
+                            debug!("dgram_send failed: {:?}", e);
+                        }
+                    }
+                } else {
+                    debug!("connection not established yet, dropping packet");
+                }
+            }
         }
-        Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
-            info!("local server certificate not found");
-        }
-        Err(e) => {
-            error!("failed to open local server certificate: {}", e);
+
+        // Check if connection is closed
+        if conn.is_closed() {
+            info!("connection closed");
+            break;
         }
     }
 
-    let mut client_crypto = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-
-    client_crypto.alpn_protocols = ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
-
-    let client_config =
-        quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto)?));
-    let mut endpoint = quinn::Endpoint::client(socket_addr)?;
-    endpoint.set_default_client_config(client_config);
-
-    Ok(endpoint)
+    Ok(())
 }

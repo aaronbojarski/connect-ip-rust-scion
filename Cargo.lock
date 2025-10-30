@@ -262,6 +262,7 @@ dependencies = [
  "pnet_datalink",
  "quiche",
  "rcgen",
+ "ring",
  "rustls",
  "tokio",
  "tracing",
