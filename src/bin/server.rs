@@ -21,7 +21,9 @@ struct Opt {
 }
 
 fn main() {
-    tracing_subscriber::fmt().init();
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .init();
     let opt = Opt::parse();
     let code = {
         if let Err(e) = run(opt) {
@@ -40,6 +42,11 @@ pub struct UdpPacket {
     pub dst: SocketAddr,
 }
 
+pub struct ClientConnection {
+    pub remote_addr: SocketAddr,
+    pub tx_to_connection: mpsc::Sender<UdpPacket>,
+}
+
 #[tokio::main]
 async fn run(options: Opt) -> Result<()> {
     // Load or generate certificates
@@ -51,48 +58,132 @@ async fn run(options: Opt) -> Result<()> {
         (cert_path, key_path)
     };
 
-    let config = configure_quic(&cert_path, &key_path)?;
+    let mut config = configure_quic(&cert_path, &key_path)?;
 
     let socket = tokio::net::UdpSocket::bind(options.listen).await?;
-    info!("listening on {}", socket.local_addr()?);
+    let local_addr = socket.local_addr()?;
+    info!("listening on {}", local_addr);
 
-    // Channels between TUN and QUIC
-    let (tx_quic_to_tun, rx_quic_to_tun) = mpsc::channel::<Vec<u8>>(1000);
-    let (tx_tun_to_quic, rx_tun_to_quic) = mpsc::channel::<Vec<u8>>(1000);
-
-    // Channels between UDP and QUIC
-    let (tx_udp_to_quic, rx_udp_to_quic) = mpsc::channel::<UdpPacket>(1000);
+    // Channel for sending UDP packets
     let (tx_quic_to_udp, mut rx_quic_to_udp) = mpsc::channel::<UdpPacket>(1000);
 
-    // Start TUN interface
-    let mut tun = tun::Tun::new("tun0", "10.248.1.7".parse::<Ipv4Addr>()?, 1500);
-    tun.start(tx_tun_to_quic, rx_quic_to_tun).await?;
-
-    // Spawn QUIC connection handler task
-    tokio::spawn(handle_quic_connections(
-        config,
-        socket.local_addr()?,
-        rx_udp_to_quic,
-        tx_quic_to_udp.clone(),
-        rx_tun_to_quic,
-        tx_quic_to_tun,
-    ));
+    // Track active connections
+    let mut connections: HashMap<quiche::ConnectionId<'static>, ClientConnection> = HashMap::new();
 
     let mut buf = [0; 65535];
+    let mut next_tun_ip = 7u8; // Start from 10.248.1.7
 
     // Main loop: handle UDP socket
     loop {
         tokio::select! {
-            // Receive datagram from UDP socket and pass to QUIC
-            Ok(result) = socket.recv_from(&mut buf) => {
-                let (len, src) = result;
+            // Receive datagram from UDP socket
+            Ok((len, src)) = socket.recv_from(&mut buf) => {
                 debug!("received {} bytes from {}", len, src);
-                tx_udp_to_quic.send(UdpPacket {
-                    data: buf[..len].to_vec(),
-                    src,
-                    dst: socket.local_addr()?,
-                }).await.unwrap();
+
+                let packet_data = buf[..len].to_vec();
+
+                // Parse the QUIC packet header to identify connection
+                let mut packet_slice = packet_data.clone();
+                let hdr = match quiche::Header::from_slice(&mut packet_slice, quiche::MAX_CONN_ID_LEN) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        debug!("failed to parse header: {:?}", e);
+                        continue;
+                    }
+                };
+
+                // Check if this is an existing connection
+                if let Some(client_conn) = connections.get(&hdr.dcid) {
+                    // Forward to existing connection task
+                    let _ = client_conn.tx_to_connection.send(UdpPacket {
+                        data: packet_data,
+                        src,
+                        dst: local_addr,
+                    }).await;
+                } else if hdr.ty == quiche::Type::Initial {
+                    // New connection - create connection ID
+                    let mut scid = [0; quiche::MAX_CONN_ID_LEN];
+                    ring::rand::SystemRandom::new().fill(&mut scid).unwrap();
+                    let scid = quiche::ConnectionId::from_ref(&scid);
+
+                    info!("new connection from {} with scid {:?}", src, scid);
+
+                    // Create QUIC connection
+                    let mut conn = match quiche::accept(&scid, None, local_addr, src, &mut config) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            error!("failed to create connection: {:?}", e);
+                            continue;
+                        }
+                    };
+
+                    // Process the initial packet
+                    let recv_info = quiche::RecvInfo {
+                        from: src,
+                        to: local_addr,
+                    };
+
+                    match conn.recv(&mut packet_data.clone(), recv_info) {
+                        Ok(_) => {
+                            debug!("processed initial packet {} bytes", packet_data.len());
+                        }
+                        Err(e) => {
+                            error!("failed to process initial packet: {:?}", e);
+                            continue;
+                        }
+                    }
+
+                    // Send any response packets
+                    loop {
+                        let (write, send_info) = match conn.send(&mut buf) {
+                            Ok(v) => v,
+                            Err(quiche::Error::Done) => break,
+                            Err(e) => {
+                                debug!("send failed: {:?}", e);
+                                break;
+                            }
+                        };
+
+                        let sent_len = socket.send_to(&buf[..write], send_info.to).await?;
+                        debug!("sent {} bytes to {}", sent_len, send_info.to);
+                    }
+
+                    // Create channel for this connection
+                    let (tx_to_connection, rx_from_main) = mpsc::channel::<UdpPacket>(1000);
+
+                    // Allocate TUN IP for this client
+                    let tun_ip = Ipv4Addr::new(10, 248, 1, next_tun_ip);
+                    let tun_name = format!("tun{}", next_tun_ip);
+                    next_tun_ip += 1;
+
+                    // Store connection info
+                    let client_conn = ClientConnection {
+                        remote_addr: src,
+                        tx_to_connection: tx_to_connection.clone(),
+                    };
+                    connections.insert(scid.clone().into_owned(), client_conn);
+
+                    // Spawn task for this connection
+                    let tx_quic_to_udp_clone = tx_quic_to_udp.clone();
+                    let scid_owned = scid.into_owned();
+
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_client_connection(
+                            scid_owned.clone(),
+                            conn,
+                            rx_from_main,
+                            tx_quic_to_udp_clone,
+                            tun_name,
+                            tun_ip,
+                        ).await {
+                            error!("connection {:?} error: {:?}", scid_owned, e);
+                        }
+                    });
+                } else {
+                    debug!("packet for unknown connection with dcid {:?}", hdr.dcid);
+                }
             }
+
             // Send datagram from QUIC to UDP socket
             Some(packet_data) = rx_quic_to_udp.recv() => {
                 let sent_len = socket.send_to(&packet_data.data, packet_data.dst).await?;
@@ -115,7 +206,7 @@ fn configure_quic(
 
     config.set_application_protos(&[b"h3"])?;
 
-    config.set_max_idle_timeout(5000);
+    config.set_max_idle_timeout(10000);
     config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
     config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
     config.set_initial_max_data(10_000_000);
@@ -130,96 +221,38 @@ fn configure_quic(
     Ok(config)
 }
 
-async fn handle_quic_connections(
-    mut config: quiche::Config,
-    local_addr: SocketAddr,
-    mut rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
+async fn handle_client_connection(
+    scid: quiche::ConnectionId<'static>,
+    mut conn: quiche::Connection,
+    mut rx_udp_packets: mpsc::Receiver<UdpPacket>,
     tx_quic_to_udp: mpsc::Sender<UdpPacket>,
-    mut rx_tun_to_quic: mpsc::Receiver<Vec<u8>>,
-    tx_quic_to_tun: mpsc::Sender<Vec<u8>>,
+    tun_name: String,
+    tun_ip: Ipv4Addr,
 ) -> Result<()> {
+    info!(
+        "starting connection handler for {:?} with TUN {} ({})",
+        scid, tun_name, tun_ip
+    );
+
+    // Create TUN interface for this connection
+    let (tx_quic_to_tun, rx_quic_to_tun) = mpsc::channel::<Vec<u8>>(1000);
+    let (tx_tun_to_quic, mut rx_tun_to_quic) = mpsc::channel::<Vec<u8>>(1000);
+
+    let mut tun = tun::Tun::new(&tun_name, tun_ip, 1500);
+    tun.start(tx_tun_to_quic, rx_quic_to_tun).await?;
+
     let mut buf = [0; MAX_DATAGRAM_SIZE];
-    let mut connections: HashMap<quiche::ConnectionId<'static>, quiche::Connection> =
-        HashMap::new();
+    let mut keepalive_interval = tokio::time::interval(std::time::Duration::from_secs(5));
 
     loop {
+        let timeout = conn.timeout().unwrap_or(std::time::Duration::from_secs(60));
+
         tokio::select! {
-            // Handle incoming UDP packets (QUIC protocol packets)
-            Some(packet) = rx_udp_to_quic.recv() => {
-                let recv_info = quiche::RecvInfo {
-                    from: packet.src,
-                    to: packet.dst,
-                };
+            // Handle connection timeout
+            _ = tokio::time::sleep(timeout) => {
+                conn.on_timeout();
 
-                // Parse the QUIC packet header
-                let mut packet_data = packet.data.clone();
-                let hdr = match quiche::Header::from_slice(&mut packet_data, quiche::MAX_CONN_ID_LEN) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        debug!("failed to parse header: {:?}", e);
-                        continue;
-                    }
-                };
-
-                // Check if this is a new connection
-                let conn = if !connections.contains_key(&hdr.dcid) {
-                    if hdr.ty != quiche::Type::Initial {
-                        debug!("packet is not Initial");
-                        continue;
-                    }
-
-                    // Generate connection IDs
-                    let mut scid = [0; quiche::MAX_CONN_ID_LEN];
-                    ring::rand::SystemRandom::new().fill(&mut scid).unwrap();
-                    let scid = quiche::ConnectionId::from_ref(&scid);
-
-                    // Accept the connection
-                    let conn = match quiche::accept(&scid, None, local_addr, packet.src, &mut config) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            error!("failed to accept connection: {:?}", e);
-                            continue;
-                        }
-                    };
-
-                    info!("new connection from {} with scid {:?}", packet.src, scid);
-
-                    connections.insert(scid.clone().into_owned(), conn);
-                    connections.get_mut(&scid.into_owned()).unwrap()
-                } else {
-                    connections.get_mut(&hdr.dcid).unwrap()
-                };
-
-                // Process the packet
-                match conn.recv(&mut packet.data.clone(), recv_info) {
-                    Ok(_) => {
-                        debug!("processed {} bytes", packet.data.len());
-                    }
-                    Err(e) => {
-                        debug!("recv failed: {:?}", e);
-                    }
-                }
-
-                // Handle HTTP/3 if connection is established
-                if conn.is_established() && !conn.is_in_early_data() {
-                    // TODO: Handle HTTP/3 requests for address allocation
-                    // For now, we'll just handle datagrams
-
-                    // Receive datagrams from QUIC and forward to TUN
-                    while let Ok(len) = conn.dgram_recv(&mut buf) {
-                        debug!("received {} bytes from QUIC datagram", len);
-
-                        if let Some(ipv4) = Ipv4Packet::new(&buf[..len]) {
-                            let src = ipv4.get_source();
-                            let dest = ipv4.get_destination();
-                            info!("forwarding IP packet to TUN: {} -> {}, {} bytes", src, dest, len);
-                        }
-
-                        tx_quic_to_tun.send(buf[..len].to_vec()).await?;
-                    }
-                }
-
-                // Send any pending QUIC packets
+                // Send any packets generated by timeout
                 loop {
                     let (write, send_info) = match conn.send(&mut buf) {
                         Ok(v) => v,
@@ -237,8 +270,49 @@ async fn handle_quic_connections(
                     }).await?;
                 }
 
-                // Clean up closed connections
-                connections.retain(|_, conn| !conn.is_closed());
+                if conn.is_closed() {
+                    info!("connection {:?} closed", scid);
+                    break;
+                }
+            }
+
+            // Handle incoming UDP packets (QUIC protocol packets)
+            Some(packet) = rx_udp_packets.recv() => {
+                let recv_info = quiche::RecvInfo {
+                    from: packet.src,
+                    to: packet.dst,
+                };
+
+                // Process the packet
+                match conn.recv(&mut packet.data.clone(), recv_info) {
+                    Ok(_) => {
+                        debug!("processed {} bytes", packet.data.len());
+                    }
+                    Err(e) => {
+                        debug!("recv failed: {:?}", e);
+                        if conn.is_closed() {
+                            info!("connection {:?} closed after recv error", scid);
+                            break;
+                        }
+                        continue;
+                    }
+                }
+
+                // Handle datagrams if connection is established
+                if conn.is_established() && !conn.is_in_early_data() {
+                    // Receive datagrams from QUIC and forward to TUN
+                    while let Ok(len) = conn.dgram_recv(&mut buf) {
+                        debug!("received {} bytes from QUIC datagram", len);
+
+                        if let Some(ipv4) = Ipv4Packet::new(&buf[..len]) {
+                            let src = ipv4.get_source();
+                            let dest = ipv4.get_destination();
+                            info!("forwarding IP packet to TUN: {} -> {}, {} bytes", src, dest, len);
+                        }
+
+                        tx_quic_to_tun.send(buf[..len].to_vec()).await?;
+                    }
+                }
             }
 
             // Handle outgoing IP packets from TUN
@@ -249,45 +323,51 @@ async fn handle_quic_connections(
                     info!("received IP packet from TUN: {} -> {}, {} bytes", src, dest, ip_packet.len());
                 }
 
-                // Forward to all established connections
-                let mut packets_to_send = Vec::new();
+                if conn.is_established() {
+                    match conn.dgram_send(&ip_packet) {
+                        Ok(_) => {
+                            debug!("sent {} bytes as QUIC datagram", ip_packet.len());
 
-                for (conn_id, conn) in connections.iter_mut() {
-                    if conn.is_established() {
-                        match conn.dgram_send(&ip_packet) {
-                            Ok(_) => {
-                                debug!("sent {} bytes as QUIC datagram to {:?}", ip_packet.len(), conn_id);
-
-                                // Collect packets to send
-                                loop {
-                                    let (write, send_info) = match conn.send(&mut buf) {
-                                        Ok(v) => v,
-                                        Err(quiche::Error::Done) => break,
-                                        Err(e) => {
-                                            debug!("send failed: {:?}", e);
-                                            break;
-                                        }
-                                    };
-
-                                    packets_to_send.push(UdpPacket {
-                                        data: buf[..write].to_vec(),
-                                        src: send_info.from,
-                                        dst: send_info.to,
-                                    });
-                                }
-                            }
-                            Err(e) => {
-                                debug!("dgram_send failed: {:?}", e);
-                            }
+                        }
+                        Err(e) => {
+                            debug!("dgram_send failed: {:?}", e);
                         }
                     }
+                } else {
+                    debug!("connection not established yet, dropping packet");
                 }
+            }
 
-                // Send all collected packets
-                for packet in packets_to_send {
-                    tx_quic_to_udp.send(packet).await?;
+            // Periodic keepalive
+            _ = keepalive_interval.tick() => {
+                if conn.is_established() {
+                    conn.send_ack_eliciting().unwrap();
+                    debug!("sending keepalive for connection {:?}", scid);
                 }
             }
         }
+
+        // Send any pending QUIC packets
+        loop {
+            let (write, send_info) = match conn.send(&mut buf) {
+                Ok(v) => v,
+                Err(quiche::Error::Done) => break,
+                Err(e) => {
+                    debug!("send failed: {:?}", e);
+                    break;
+                }
+            };
+
+            tx_quic_to_udp
+                .send(UdpPacket {
+                    data: buf[..write].to_vec(),
+                    src: send_info.from,
+                    dst: send_info.to,
+                })
+                .await?;
+        }
     }
+
+    info!("connection {:?} handler exiting", scid);
+    Ok(())
 }

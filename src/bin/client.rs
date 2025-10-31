@@ -25,7 +25,9 @@ struct Opt {
 }
 
 fn main() {
-    tracing_subscriber::fmt().init();
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .init();
     let opt = Opt::parse();
     let code = {
         if let Err(e) = run(opt) {
@@ -82,7 +84,7 @@ async fn run(options: Opt) -> Result<()> {
         local_addr,
         remote,
         rx_udp_to_quic,
-        tx_quic_to_udp.clone(),
+        tx_quic_to_udp,
         rx_tun_to_quic,
         tx_quic_to_tun,
     ));
@@ -125,7 +127,7 @@ fn configure_quic() -> Result<quiche::Config> {
 
     config.set_application_protos(&[b"h3"]).unwrap();
 
-    config.set_max_idle_timeout(5000);
+    config.set_max_idle_timeout(10000);
     config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
     config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
     config.set_initial_max_data(10_000_000);
@@ -174,17 +176,28 @@ async fn handle_quic_connection(
         })
         .await?;
 
-    let mut recv_info = quiche::RecvInfo {
-        from: remote,
-        to: local_addr,
-    };
+    let mut keepalive_interval = tokio::time::interval(std::time::Duration::from_secs(5));
 
     loop {
+        let timeout = conn.timeout();
         tokio::select! {
+            // Handle connection timeout
+            _ = tokio::time::sleep(timeout.unwrap_or(std::time::Duration::from_secs(24 * 60 * 60))) => {
+                debug!("connection timeout");
+                conn.on_timeout();
+            }
+
+            _ = keepalive_interval.tick() => {
+                conn.send_ack_eliciting().unwrap();
+                debug!("keepalive tick. time until timeout: {:?}", conn.timeout());
+            }
+
             // Handle incoming UDP packets (QUIC protocol packets)
             Some(packet) = rx_udp_to_quic.recv() => {
-                recv_info.from = packet.src;
-                recv_info.to = packet.dst;
+                let recv_info = quiche::RecvInfo {
+                    from: packet.src,
+                    to: packet.dst,
+                };
 
                 match conn.recv(&mut packet.data.clone(), recv_info) {
                     Ok(_) => {
@@ -194,33 +207,6 @@ async fn handle_quic_connection(
                         debug!("recv failed: {:?}", e);
                     }
                 }
-
-                // Check if connection is established
-                if conn.is_established() {
-                    // Receive datagrams from QUIC and forward to TUN
-                    while let Ok(len) = conn.dgram_recv(&mut buf) {
-                        debug!("received {} bytes from QUIC datagram", len);
-                        tx_quic_to_tun.send(buf[..len].to_vec()).await?;
-                    }
-                }
-
-                // Send any pending QUIC packets
-                loop {
-                    let (write, send_info) = match conn.send(&mut buf) {
-                        Ok(v) => v,
-                        Err(quiche::Error::Done) => break,
-                        Err(e) => {
-                            debug!("send failed: {:?}", e);
-                            break;
-                        }
-                    };
-
-                    tx_quic_to_udp.send(UdpPacket {
-                        data: buf[..write].to_vec(),
-                        src: send_info.from,
-                        dst: send_info.to,
-                    }).await?;
-                }
             }
 
             // Handle outgoing IP packets from TUN
@@ -229,24 +215,6 @@ async fn handle_quic_connection(
                     match conn.dgram_send(&ip_packet) {
                         Ok(_) => {
                             debug!("sent {} bytes as QUIC datagram", ip_packet.len());
-
-                            // Send the resulting QUIC packets
-                            loop {
-                                let (write, send_info) = match conn.send(&mut buf) {
-                                    Ok(v) => v,
-                                    Err(quiche::Error::Done) => break,
-                                    Err(e) => {
-                                        debug!("send failed: {:?}", e);
-                                        break;
-                                    }
-                                };
-
-                                tx_quic_to_udp.send(UdpPacket {
-                                    data: buf[..write].to_vec(),
-                                    src: send_info.from,
-                                    dst: send_info.to,
-                                }).await?;
-                            }
                         }
                         Err(e) => {
                             debug!("dgram_send failed: {:?}", e);
@@ -260,8 +228,37 @@ async fn handle_quic_connection(
 
         // Check if connection is closed
         if conn.is_closed() {
-            info!("connection closed");
+            info!("connection closed, {:?}", conn.stats());
             break;
+        }
+
+        // Check if connection is established
+        if conn.is_established() {
+            // Receive datagrams from QUIC and forward to TUN
+            while let Ok(len) = conn.dgram_recv(&mut buf) {
+                debug!("received {} bytes from QUIC datagram", len);
+                tx_quic_to_tun.send(buf[..len].to_vec()).await?;
+            }
+        }
+
+        // Send any pending QUIC packets
+        loop {
+            let (write, send_info) = match conn.send(&mut buf) {
+                Ok(v) => v,
+                Err(quiche::Error::Done) => break,
+                Err(e) => {
+                    debug!("send failed: {:?}", e);
+                    break;
+                }
+            };
+
+            tx_quic_to_udp
+                .send(UdpPacket {
+                    data: buf[..write].to_vec(),
+                    src: send_info.from,
+                    dst: send_info.to,
+                })
+                .await?;
         }
     }
 
