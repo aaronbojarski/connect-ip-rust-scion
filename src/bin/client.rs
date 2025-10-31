@@ -5,6 +5,7 @@ use clap::Parser;
 use connect_ip_rust_scion::tun;
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 use url::Url;
 
@@ -74,11 +75,16 @@ async fn run(options: Opt) -> Result<()> {
     let (tx_udp_to_quic, rx_udp_to_quic) = mpsc::channel::<UdpPacket>(1000);
     let (tx_quic_to_udp, mut rx_quic_to_udp) = mpsc::channel::<UdpPacket>(1000);
 
+    // Create cancellation token for TUN interface
+    let cancel_token = CancellationToken::new();
+
     let mut tun = tun::Tun::new("tun0", received_address.parse().unwrap(), 1500);
-    tun.start(tx_tun_to_quic, rx_quic_to_tun).await.unwrap();
+    let tun_handle = tun
+        .start(tx_tun_to_quic, rx_quic_to_tun, cancel_token.clone())
+        .await?;
 
     // Spawn QUIC connection handler task
-    tokio::spawn(handle_quic_connection(
+    let mut quic_handle = tokio::spawn(handle_quic_connection(
         config,
         "localhost".to_string(),
         local_addr,
@@ -89,33 +95,56 @@ async fn run(options: Opt) -> Result<()> {
         tx_quic_to_tun,
     ));
 
-    // Open Questions:
-    // - Should there be a separate task per connection (more relevant on server side)?
-    // - How to handle connection timeouts and retries?
-
     // Main loop: handle UDP socket
-    loop {
+    let result = loop {
         tokio::select! {
             // Receive datagram from UDP socket and pass to QUIC
             Ok(result) = socket.recv_from(&mut buf) => {
                 let (len, src) = result;
                 debug!("received {} bytes from {}", len, src);
-                tx_udp_to_quic.send(UdpPacket {
+                if tx_udp_to_quic.send(UdpPacket {
                     data: buf[..len].to_vec(),
                     src,
                     dst: local_addr,
-                }).await.unwrap();
+                }).await.is_err() {
+                    info!("QUIC task closed, shutting down");
+                    break Ok(());
+                }
             }
             // Send datagram from QUIC to UDP socket
             Some(packet_data) = rx_quic_to_udp.recv() => {
                 let sent_len = socket.send_to(&packet_data.data, packet_data.dst).await?;
                 debug!("sent {} bytes to {}", sent_len, packet_data.dst);
             }
+            // QUIC connection handler exited
+            quic_result = &mut quic_handle => {
+                match quic_result {
+                    Ok(Ok(())) => {
+                        info!("QUIC connection closed normally");
+                        break Ok(());
+                    }
+                    Ok(Err(e)) => {
+                        info!("QUIC connection error: {}", e);
+                        break Err(e);
+                    }
+                    Err(e) => {
+                        info!("QUIC task panicked: {}", e);
+                        break Err(anyhow!("QUIC task panicked: {}", e));
+                    }
+                }
+            }
         }
-    }
+    };
 
-    // TODO: Graceful shutdown
-    // Ok(())
+    // Graceful shutdown
+    info!("shutting down TUN interface");
+    cancel_token.cancel();
+
+    // Wait for TUN task to finish with timeout
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), tun_handle).await;
+
+    info!("client shutdown complete");
+    result
 }
 
 fn configure_quic() -> Result<quiche::Config> {
@@ -188,8 +217,10 @@ async fn handle_quic_connection(
             }
 
             _ = keepalive_interval.tick() => {
-                conn.send_ack_eliciting().unwrap();
-                debug!("keepalive tick. time until timeout: {:?}", conn.timeout());
+                if conn.is_established() {
+                    conn.send_ack_eliciting().unwrap();
+                    debug!("keepalive tick. time until timeout: {:?}", conn.timeout());
+                }
             }
 
             // Handle incoming UDP packets (QUIC protocol packets)
@@ -205,6 +236,10 @@ async fn handle_quic_connection(
                     }
                     Err(e) => {
                         debug!("recv failed: {:?}", e);
+                        if conn.is_closed() {
+                            info!("connection closed after recv error");
+                            break;
+                        }
                     }
                 }
             }
@@ -237,7 +272,10 @@ async fn handle_quic_connection(
             // Receive datagrams from QUIC and forward to TUN
             while let Ok(len) = conn.dgram_recv(&mut buf) {
                 debug!("received {} bytes from QUIC datagram", len);
-                tx_quic_to_tun.send(buf[..len].to_vec()).await?;
+                if tx_quic_to_tun.send(buf[..len].to_vec()).await.is_err() {
+                    info!("TUN channel closed, stopping datagram forwarding");
+                    break;
+                }
             }
         }
 
@@ -252,15 +290,21 @@ async fn handle_quic_connection(
                 }
             };
 
-            tx_quic_to_udp
+            if tx_quic_to_udp
                 .send(UdpPacket {
                     data: buf[..write].to_vec(),
                     src: send_info.from,
                     dst: send_info.to,
                 })
-                .await?;
+                .await
+                .is_err()
+            {
+                info!("UDP channel closed, cannot send packets");
+                break;
+            }
         }
     }
 
+    info!("QUIC connection handler exiting");
     Ok(())
 }
