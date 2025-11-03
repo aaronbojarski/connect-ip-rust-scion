@@ -9,15 +9,9 @@ use url::Url;
 
 use quiche::h3::NameValue;
 
-use crate::tun;
+use crate::net::{UdpPacket, tun};
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
-
-pub struct UdpPacket {
-    pub data: Vec<u8>,
-    pub src: SocketAddr,
-    pub dst: SocketAddr,
-}
 
 #[tokio::main]
 pub async fn run(url: Url, bind: SocketAddr) -> Result<()> {
