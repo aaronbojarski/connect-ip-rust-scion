@@ -1,19 +1,12 @@
 use clap::Parser;
 use std::net::SocketAddr;
-use url::Url;
 
 #[derive(Parser, Debug)]
-#[clap(name = "client")]
+#[clap(name = "proxy", about = "A CONNECT-IP proxy server")]
 struct Opt {
-    url: Url,
-
-    /// Override hostname used for certificate verification
-    #[clap(long = "host")]
-    host: Option<String>,
-
-    /// Address to bind on
-    #[clap(long = "bind", default_value = "0.0.0.0:0")]
-    bind: SocketAddr,
+    /// Address to listen on
+    #[clap(long = "listen", default_value = "127.0.0.1:4433")]
+    listen: SocketAddr,
 }
 
 fn main() {
@@ -22,7 +15,7 @@ fn main() {
         .init();
     let opt = Opt::parse();
     let code = {
-        if let Err(e) = connect_ip_rust_scion::client::run(opt.url, opt.bind) {
+        if let Err(e) = connect_ip_rust_scion::proxy::run(opt.listen) {
             eprintln!("ERROR: {e}");
             1
         } else {

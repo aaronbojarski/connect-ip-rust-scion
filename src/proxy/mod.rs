@@ -1,11 +1,11 @@
+pub mod client_connection;
+
 use std::collections::HashMap;
 use std::env;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use anyhow::Result;
-use clap::Parser;
-use connect_ip_rust_scion::tun;
 use pnet::packet::ipv4::Ipv4Packet;
 use ring::rand::SecureRandom;
 use tokio::sync::Mutex;
@@ -13,31 +13,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
+use crate::tun;
+
 const MAX_DATAGRAM_SIZE: usize = 1350;
-
-#[derive(Parser, Debug)]
-#[clap(name = "server")]
-struct Opt {
-    /// Address to listen on
-    #[clap(long = "listen", default_value = "127.0.0.1:4433")]
-    listen: SocketAddr,
-}
-
-fn main() {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .init();
-    let opt = Opt::parse();
-    let code = {
-        if let Err(e) = run(opt) {
-            eprintln!("ERROR: {e}");
-            1
-        } else {
-            0
-        }
-    };
-    ::std::process::exit(code);
-}
 
 pub struct UdpPacket {
     pub data: Vec<u8>,
@@ -51,7 +29,7 @@ pub struct ClientConnection {
 }
 
 #[tokio::main]
-async fn run(options: Opt) -> Result<()> {
+pub async fn run(listen: SocketAddr) -> Result<()> {
     // Load or generate certificates
     let (cert_path, key_path) = {
         let cwd = env::current_dir()?;
@@ -63,7 +41,7 @@ async fn run(options: Opt) -> Result<()> {
 
     let mut config = configure_quic(&cert_path, &key_path)?;
 
-    let socket = tokio::net::UdpSocket::bind(options.listen).await?;
+    let socket = tokio::net::UdpSocket::bind(listen).await?;
     let local_addr = socket.local_addr()?;
     info!("listening on {}", local_addr);
 
@@ -254,6 +232,9 @@ async fn handle_client_connection(
         .start(tx_tun_to_quic, rx_quic_to_tun, cancel_token.clone())
         .await?;
 
+    let h3_config = quiche::h3::Config::new().unwrap();
+    let mut http3_conn = None;
+
     let mut buf = [0; MAX_DATAGRAM_SIZE];
     let mut keepalive_interval = tokio::time::interval(std::time::Duration::from_secs(5));
 
@@ -295,6 +276,91 @@ async fn handle_client_connection(
                         continue;
                     }
                 }
+
+                 if (conn.is_in_early_data() || conn.is_established()) &&
+                    http3_conn.is_none()
+                {
+                    debug!(
+                        "{} QUIC handshake completed, now trying HTTP/3",
+                        conn.trace_id()
+                    );
+
+                    let h3_conn = match quiche::h3::Connection::with_transport(
+                        &mut conn,
+                        &h3_config,
+                    ) {
+                        Ok(v) => v,
+
+                        Err(e) => {
+                            error!("failed to create HTTP/3 connection: {e}");
+                            continue;
+                        },
+                    };
+
+                    // TODO: sanity check h3 connection before adding to map
+                    http3_conn = Some(h3_conn);
+                }
+
+                /*
+                if http3_conn.is_some() {
+                    // Handle writable streams.
+                    for stream_id in conn.writable() {
+                        handle_writable(client, stream_id);
+                    }
+
+                    // Process HTTP/3 events.
+                    loop {
+                        let http3_conn = http3_conn.as_mut().unwrap();
+
+                        match http3_conn.poll(&mut conn) {
+                            Ok((
+                                stream_id,
+                                quiche::h3::Event::Headers { list, .. },
+                            )) => {
+                                handle_request(
+                                    client,
+                                    stream_id,
+                                    &list,
+                                    "examples/root",
+                                );
+                            },
+
+                            Ok((stream_id, quiche::h3::Event::Data)) => {
+                                info!(
+                                    "{} got data on stream id {}",
+                                    conn.trace_id(),
+                                    stream_id
+                                );
+                            },
+
+                            Ok((_stream_id, quiche::h3::Event::Finished)) => (),
+
+                            Ok((_stream_id, quiche::h3::Event::Reset { .. })) => (),
+
+                            Ok((
+                                _prioritized_element_id,
+                                quiche::h3::Event::PriorityUpdate,
+                            )) => (),
+
+                            Ok((_goaway_id, quiche::h3::Event::GoAway)) => (),
+
+                            Err(quiche::h3::Error::Done) => {
+                                break;
+                            },
+
+                            Err(e) => {
+                                error!(
+                                    "{} HTTP/3 error {:?}",
+                                    conn.trace_id(),
+                                    e
+                                );
+
+                                break;
+                            },
+                        }
+                    }
+                }
+                */
 
                 // Handle datagrams if connection is established
                 if conn.is_established() && !conn.is_in_early_data() {
