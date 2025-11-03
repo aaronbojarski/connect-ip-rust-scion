@@ -1,14 +1,15 @@
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 
 use anyhow::{Result, anyhow};
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, trace};
 use url::Url;
 
 use quiche::h3::NameValue;
 
+use crate::connect_ip::capsule::{AddressRequestCapsule, Capsule, CapsuleType, RequestedAddress};
 use crate::net::{UdpPacket, tun};
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
@@ -67,7 +68,6 @@ pub async fn run(url: Url, bind: SocketAddr) -> Result<()> {
             // Receive datagram from UDP socket and pass to QUIC
             Ok(result) = socket.recv_from(&mut buf) => {
                 let (len, src) = result;
-                debug!("received {} bytes from {}", len, src);
                 if tx_udp_to_quic.send(UdpPacket {
                     data: buf[..len].to_vec(),
                     src,
@@ -80,7 +80,7 @@ pub async fn run(url: Url, bind: SocketAddr) -> Result<()> {
             // Send datagram from QUIC to UDP socket
             Some(packet_data) = rx_quic_to_udp.recv() => {
                 let sent_len = socket.send_to(&packet_data.data, packet_data.dst).await?;
-                debug!("sent {} bytes to {}", sent_len, packet_data.dst);
+                trace!("sent {} bytes to {}", sent_len, packet_data.dst);
             }
             // QUIC connection handler exited
             quic_result = &mut quic_handle => {
@@ -201,7 +201,7 @@ async fn handle_quic_connection(
             _ = keepalive_interval.tick() => {
                 if conn.is_established() {
                     conn.send_ack_eliciting().unwrap();
-                    debug!("keepalive tick. time until timeout: {:?}", conn.timeout());
+                    trace!("keepalive tick. time until timeout: {:?}", conn.timeout());
                 }
             }
 
@@ -214,7 +214,7 @@ async fn handle_quic_connection(
 
                 match conn.recv(&mut packet.data.clone(), recv_info) {
                     Ok(_) => {
-                        debug!("processed {} bytes from QUIC packet", packet.data.len());
+                        trace!("processed {} bytes from QUIC packet", packet.data.len());
                     }
                     Err(e) => {
                         debug!("recv failed: {:?}", e);
@@ -263,7 +263,7 @@ async fn handle_quic_connection(
             if !req_sent {
                 info!("sending HTTP request {req:?}");
 
-                h3_conn.send_request(&mut conn, &req, true).unwrap();
+                h3_conn.send_request(&mut conn, &req, false).unwrap();
 
                 req_sent = true;
             }
@@ -279,25 +279,65 @@ async fn handle_quic_connection(
                             hdrs_to_strings(&list),
                             stream_id
                         );
+
+                        // Handle response headers and start capsule protocol
+                        let mut capsule_protocol = None;
+                        let mut status = None;
+                        for hdr in &list {
+                            match hdr.name() {
+                                b":status" => status = Some(hdr.value()),
+                                b"capsule-protocol" => capsule_protocol = Some(hdr.value()),
+                                _ => (),
+                            }
+                        }
+
+                        match (status, capsule_protocol) {
+                            (Some(b"200"), Some(b"?1")) => (),
+                            _ => {
+                                error!("unexpected response from server, closing connection");
+                                conn.close(true, 0x100, b"unexpected response").unwrap();
+                            }
+                        };
+
+                        // Send Address Request capsule
+                        let addr_req = AddressRequestCapsule {
+                            addresses: vec![RequestedAddress {
+                                request_id: 1,
+                                address: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+                                prefix_len: 32,
+                            }],
+                        };
+                        let mut buf = vec![0u8; 1000];
+                        let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
+                        addr_req.append(&mut octets_mut).unwrap();
+                        let payload_len = octets_mut.off();
+                        let capsule = Capsule {
+                            capsule_type: CapsuleType::AddressAssign,
+                            payload: buf[..payload_len].to_vec(),
+                        };
+                        let mut buf = vec![0u8; 100];
+                        let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
+                        capsule.append(&mut octets_mut).unwrap();
+                        let payload_len = octets_mut.off();
+                        http3_conn
+                            .send_body(&mut conn, stream_id, &buf[..payload_len], false)
+                            .unwrap();
                     }
 
                     Ok((stream_id, quiche::h3::Event::Data)) => {
                         while let Ok(read) = http3_conn.recv_body(&mut conn, stream_id, &mut buf) {
                             debug!("got {read} bytes of response data on stream {stream_id}");
-
-                            print!("{}", unsafe { std::str::from_utf8_unchecked(&buf[..read]) });
+                            // Handle capsule protocol data
                         }
                     }
 
                     Ok((_stream_id, quiche::h3::Event::Finished)) => {
-                        info!("response received, closing...");
-
+                        info!("stream finished, closing connection");
                         conn.close(true, 0x100, b"kthxbye").unwrap();
                     }
 
                     Ok((_stream_id, quiche::h3::Event::Reset(e))) => {
                         error!("request was reset by peer with {e}, closing...");
-
                         conn.close(true, 0x100, b"kthxbye").unwrap();
                     }
 
@@ -324,7 +364,7 @@ async fn handle_quic_connection(
         if conn.is_established() && tunnel_established {
             // Receive datagrams from QUIC and forward to TUN
             while let Ok(len) = conn.dgram_recv(&mut buf) {
-                debug!("received {} bytes from QUIC datagram", len);
+                trace!("received {} bytes from QUIC datagram", len);
                 if tx_quic_to_tun.send(buf[..len].to_vec()).await.is_err() {
                     info!("TUN channel closed, stopping datagram forwarding");
                     break;

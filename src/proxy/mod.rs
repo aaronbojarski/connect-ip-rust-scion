@@ -8,7 +8,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, trace};
 
 use crate::net::UdpPacket;
 use crate::proxy::client_connection::ClientConnection;
@@ -47,8 +47,6 @@ pub async fn run(listen: SocketAddr) -> Result<()> {
         tokio::select! {
             // Receive datagram from UDP socket
             Ok((len, src)) = socket.recv_from(&mut buf) => {
-                debug!("received {} bytes from {}", len, src);
-
                 let packet_data = buf[..len].to_vec();
 
                 // Parse the QUIC packet header to identify connection
@@ -113,8 +111,7 @@ pub async fn run(listen: SocketAddr) -> Result<()> {
                             }
                         };
 
-                        let sent_len = socket.send_to(&buf[..write], send_info.to).await?;
-                        debug!("sent {} bytes to {}", sent_len, send_info.to);
+                        socket.send_to(&buf[..write], send_info.to).await?;
                     }
 
                     // Create channel for this connection
@@ -153,10 +150,10 @@ pub async fn run(listen: SocketAddr) -> Result<()> {
                 }
             }
 
-            // Send datagram from QUIC to UDP socket
+            // Send QUIC packets over UDP socket
             Some(packet_data) = rx_quic_to_udp.recv() => {
                 let sent_len = socket.send_to(&packet_data.data, packet_data.dst).await?;
-                debug!("sent {} bytes to {}", sent_len, packet_data.dst);
+                trace!("sent {} bytes to {}", sent_len, packet_data.dst);
             }
         }
     }
