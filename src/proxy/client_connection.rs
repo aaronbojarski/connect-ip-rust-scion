@@ -1,5 +1,7 @@
 use anyhow::Result;
 use pnet::packet::ipv4::Ipv4Packet;
+use quiche::h3::NameValue;
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::net::SocketAddr;
 use tokio::sync::mpsc;
@@ -9,6 +11,14 @@ use tracing::{debug, error, info};
 use crate::net::{UdpPacket, tun};
 use crate::proxy::MAX_DATAGRAM_SIZE;
 
+struct PartialResponse {
+    headers: Option<Vec<quiche::h3::Header>>,
+
+    body: Vec<u8>,
+
+    written: usize,
+}
+
 pub struct ClientConnection {
     pub conn: quiche::Connection,
     pub scid: quiche::ConnectionId<'static>,
@@ -16,6 +26,7 @@ pub struct ClientConnection {
     pub remote_addr: SocketAddr,
     pub rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
     pub tx_quic_to_udp: mpsc::Sender<UdpPacket>,
+    partial_responses: HashMap<u64, PartialResponse>,
 }
 
 impl ClientConnection {
@@ -33,6 +44,7 @@ impl ClientConnection {
             remote_addr,
             rx_udp_to_quic,
             tx_quic_to_udp,
+            partial_responses: HashMap::new(),
         }
     }
 
@@ -132,24 +144,23 @@ impl ClientConnection {
                         debug!("HTTP/3 connection established");
                     }
 
-                    /*
-                    if http3_conn.is_some() {
+
+                    if self.h3_conn.is_some() {
                         // Handle writable streams.
-                        for stream_id in conn.writable() {
-                            handle_writable(client, stream_id);
+                        for stream_id in self.conn.writable() {
+                            self.handle_writable(stream_id);
                         }
 
                         // Process HTTP/3 events.
                         loop {
-                            let http3_conn = http3_conn.as_mut().unwrap();
+                            let http3_conn = self.h3_conn.as_mut().unwrap();
 
-                            match http3_conn.poll(&mut conn) {
+                            match http3_conn.poll(&mut self.conn) {
                                 Ok((
                                     stream_id,
                                     quiche::h3::Event::Headers { list, .. },
                                 )) => {
-                                    handle_request(
-                                        client,
+                                    self.handle_request(
                                         stream_id,
                                         &list,
                                         "examples/root",
@@ -159,7 +170,7 @@ impl ClientConnection {
                                 Ok((stream_id, quiche::h3::Event::Data)) => {
                                     info!(
                                         "{} got data on stream id {}",
-                                        conn.trace_id(),
+                                        self.conn.trace_id(),
                                         stream_id
                                     );
                                 },
@@ -180,18 +191,13 @@ impl ClientConnection {
                                 },
 
                                 Err(e) => {
-                                    error!(
-                                        "{} HTTP/3 error {:?}",
-                                        conn.trace_id(),
-                                        e
-                                    );
-
+                                    error!("{} HTTP/3 error {:?}", self.conn.trace_id(), e);
                                     break;
                                 },
                             }
                         }
                     }
-                    */
+
 
                     // Handle datagrams if connection is established
                     if self.conn.is_established() && !self.conn.is_in_early_data() {
@@ -271,4 +277,175 @@ impl ClientConnection {
 
         Ok(())
     }
+
+    /// Handles incoming HTTP/3 requests.
+    fn handle_request(&mut self, stream_id: u64, headers: &[quiche::h3::Header], root: &str) {
+        info!(
+            "{} got request {:?} on stream id {}",
+            self.conn.trace_id(),
+            hdrs_to_strings(headers),
+            stream_id
+        );
+
+        // Check if HTTP/3 connection exists before proceeding
+        if self.h3_conn.is_none() {
+            error!(
+                "{} no HTTP/3 connection for request on stream {}",
+                self.conn.trace_id(),
+                stream_id
+            );
+            return;
+        }
+
+        let (headers, body) = self.build_response(root, headers);
+
+        let http3_conn = self.h3_conn.as_mut().unwrap();
+
+        match http3_conn.send_response(&mut self.conn, stream_id, &headers, false) {
+            Ok(v) => v,
+
+            Err(quiche::h3::Error::StreamBlocked) => {
+                let response = PartialResponse {
+                    headers: Some(headers),
+                    body,
+                    written: 0,
+                };
+
+                self.partial_responses.insert(stream_id, response);
+                return;
+            }
+
+            Err(e) => {
+                error!("{} stream send failed {:?}", self.conn.trace_id(), e);
+                return;
+            }
+        }
+
+        let written = match http3_conn.send_body(&mut self.conn, stream_id, &body, true) {
+            Ok(v) => v,
+
+            Err(quiche::h3::Error::Done) => 0,
+
+            Err(e) => {
+                error!("{} stream send failed {:?}", self.conn.trace_id(), e);
+                return;
+            }
+        };
+
+        if written < body.len() {
+            let response = PartialResponse {
+                headers: None,
+                body,
+                written,
+            };
+
+            self.partial_responses.insert(stream_id, response);
+        }
+    }
+
+    /// Builds an HTTP/3 response given a request.
+    fn build_response(
+        &mut self,
+        root: &str,
+        request: &[quiche::h3::Header],
+    ) -> (Vec<quiche::h3::Header>, Vec<u8>) {
+        let mut method = None;
+        let mut protocol = None;
+
+        // Look for the request's path and method.
+        for hdr in request {
+            match hdr.name() {
+                b":protocol" => protocol = Some(hdr.value()),
+
+                b":method" => method = Some(hdr.value()),
+
+                _ => (),
+            }
+        }
+
+        let (status, body) = match (method, protocol) {
+            (Some(b"CONNECT"), Some(b"connect-ip")) => (200, Vec::new()),
+            _ => (405, Vec::new()),
+        };
+
+        let headers = vec![
+            quiche::h3::Header::new(b":status", status.to_string().as_bytes()),
+            quiche::h3::Header::new(b"capsule-protocol", "?1".as_bytes()),
+        ];
+
+        (headers, body)
+    }
+
+    /// Handles newly writable streams.
+    fn handle_writable(&mut self, stream_id: u64) {
+        let http3_conn = match &mut self.h3_conn {
+            Some(v) => v,
+
+            None => {
+                error!(
+                    "{} no HTTP/3 connection for writable stream {}",
+                    self.conn.trace_id(),
+                    stream_id
+                );
+                return;
+            }
+        };
+
+        debug!("{} stream {} is writable", self.conn.trace_id(), stream_id);
+
+        if !self.partial_responses.contains_key(&stream_id) {
+            return;
+        }
+
+        let resp = self.partial_responses.get_mut(&stream_id).unwrap();
+
+        if let Some(ref headers) = resp.headers {
+            match http3_conn.send_response(&mut self.conn, stream_id, headers, false) {
+                Ok(_) => (),
+
+                Err(quiche::h3::Error::StreamBlocked) => {
+                    return;
+                }
+
+                Err(e) => {
+                    error!("{} stream send failed {:?}", self.conn.trace_id(), e);
+                    return;
+                }
+            }
+        }
+
+        resp.headers = None;
+
+        let body = &resp.body[resp.written..];
+
+        let written = match http3_conn.send_body(&mut self.conn, stream_id, body, true) {
+            Ok(v) => v,
+
+            Err(quiche::h3::Error::Done) => 0,
+
+            Err(e) => {
+                self.partial_responses.remove(&stream_id);
+
+                error!("{} stream send failed {:?}", self.conn.trace_id(), e);
+                return;
+            }
+        };
+
+        resp.written += written;
+
+        if resp.written == resp.body.len() {
+            self.partial_responses.remove(&stream_id);
+        }
+    }
+}
+
+pub fn hdrs_to_strings(hdrs: &[quiche::h3::Header]) -> Vec<(String, String)> {
+    hdrs.iter()
+        .map(|h| {
+            let name = String::from_utf8_lossy(h.name()).to_string();
+            let value = String::from_utf8_lossy(h.value()).to_string();
+
+            (name, value)
+        })
+        .collect()
 }
