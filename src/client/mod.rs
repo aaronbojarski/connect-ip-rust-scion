@@ -126,14 +126,15 @@ fn configure_quic() -> Result<quiche::Config> {
     // *CAUTION*: this should not be set to `false` in production!!!
     config.verify_peer(false);
 
-    config.set_application_protos(&[b"h3"]).unwrap();
+    config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
 
-    config.set_max_idle_timeout(10000);
+    config.set_max_idle_timeout(5000);
     config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
     config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
     config.set_initial_max_data(10_000_000);
     config.set_initial_max_stream_data_bidi_local(1_000_000);
     config.set_initial_max_stream_data_bidi_remote(1_000_000);
+    config.set_initial_max_stream_data_uni(1_000_000);
     config.set_initial_max_streams_bidi(100);
     config.set_initial_max_streams_uni(100);
     config.set_disable_active_migration(true);
@@ -159,7 +160,8 @@ async fn handle_quic_connection(
     SystemRandom::new().fill(&mut scid[..]).unwrap();
     let scid = quiche::ConnectionId::from_ref(&scid);
 
-    let h3_config = quiche::h3::Config::new().unwrap();
+    let mut h3_config = quiche::h3::Config::new().unwrap();
+    h3_config.enable_extended_connect(true);
     let mut http3_conn = None;
     let req = vec![
         quiche::h3::Header::new(b":method", b"CONNECT"),

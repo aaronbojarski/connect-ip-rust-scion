@@ -190,8 +190,7 @@ fn configure_quic(
     config.load_cert_chain_from_pem_file(cert_path.to_str().unwrap())?;
     config.load_priv_key_from_pem_file(key_path.to_str().unwrap())?;
 
-    config.set_application_protos(&[b"h3"])?;
-
+    config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
     config.set_max_idle_timeout(10000);
     config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
     config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
@@ -202,6 +201,7 @@ fn configure_quic(
     config.set_initial_max_streams_bidi(100);
     config.set_initial_max_streams_uni(100);
     config.set_disable_active_migration(true);
+    config.enable_early_data();
     config.enable_dgram(true, 30000, 30000);
 
     Ok(config)
@@ -232,7 +232,8 @@ async fn handle_client_connection(
         .start(tx_tun_to_quic, rx_quic_to_tun, cancel_token.clone())
         .await?;
 
-    let h3_config = quiche::h3::Config::new().unwrap();
+    let mut h3_config = quiche::h3::Config::new().unwrap();
+    h3_config.enable_extended_connect(true);
     let mut http3_conn = None;
 
     let mut buf = [0; MAX_DATAGRAM_SIZE];
@@ -299,6 +300,8 @@ async fn handle_client_connection(
 
                     // TODO: sanity check h3 connection before adding to map
                     http3_conn = Some(h3_conn);
+
+                    debug!("HTTP/3 connection established");
                 }
 
                 /*
