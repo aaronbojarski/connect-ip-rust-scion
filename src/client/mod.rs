@@ -18,7 +18,6 @@ const MAX_DATAGRAM_SIZE: usize = 1350;
 pub async fn run(url: Url, bind: SocketAddr) -> Result<()> {
     let mut buf = [0; 65535];
 
-    let config = configure_quic().unwrap();
     let url = url;
     let url_host = "10.248.100.11";
     let remote = (url_host, url.port().unwrap_or(4433))
@@ -45,14 +44,14 @@ pub async fn run(url: Url, bind: SocketAddr) -> Result<()> {
     // Create cancellation token for TUN interface
     let cancel_token = CancellationToken::new();
 
-    let mut tun = tun::Tun::new("tun0", received_address.parse().unwrap(), 1500);
-    let tun_handle = tun
-        .start(tx_tun_to_quic, rx_quic_to_tun, cancel_token.clone())
-        .await?;
+    let mut tun = tun::Tun::new("tun0", tx_tun_to_quic, 1350)?;
+    tun.addresses.push(tun::AddressRange {
+        base: IpAddr::V4(received_address.parse::<Ipv4Addr>()?),
+        prefix_len: 24,
+    });
+    tun.start(rx_quic_to_tun, cancel_token.clone()).await?;
 
-    // Spawn QUIC connection handler task
-    let mut quic_handle = tokio::spawn(handle_quic_connection(
-        config,
+    let mut connection = Connection::new(
         "localhost".to_string(),
         local_addr,
         remote,
@@ -60,7 +59,10 @@ pub async fn run(url: Url, bind: SocketAddr) -> Result<()> {
         tx_quic_to_udp,
         rx_tun_to_quic,
         tx_quic_to_tun,
-    ));
+    )?;
+
+    // Spawn QUIC connection handler task
+    let mut quic_handle = tokio::spawn(async move { connection.start_connection_handling().await });
 
     // Main loop: handle UDP socket
     let result = loop {
@@ -107,299 +109,325 @@ pub async fn run(url: Url, bind: SocketAddr) -> Result<()> {
     cancel_token.cancel();
 
     // Wait for TUN task to finish with timeout
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), tun_handle).await;
+    if let Some(tun_handle) = tun.handle.take() {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), tun_handle).await;
+    }
 
     info!("client shutdown complete");
     result
 }
 
-fn configure_quic() -> Result<quiche::Config> {
-    // Create the configuration for the QUIC connection.
-    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
-
-    // *CAUTION*: this should not be set to `false` in production!!!
-    config.verify_peer(false);
-
-    config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
-
-    config.set_max_idle_timeout(5000);
-    config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
-    config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
-    config.set_initial_max_data(10_000_000);
-    config.set_initial_max_stream_data_bidi_local(1_000_000);
-    config.set_initial_max_stream_data_bidi_remote(1_000_000);
-    config.set_initial_max_stream_data_uni(1_000_000);
-    config.set_initial_max_streams_bidi(100);
-    config.set_initial_max_streams_uni(100);
-    config.set_disable_active_migration(true);
-    config.enable_dgram(true, 30000, 30000);
-
-    Ok(config)
+struct Connection {
+    conn: quiche::Connection,
+    h3_conn: Option<quiche::h3::Connection>,
+    rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
+    tx_quic_to_udp: mpsc::Sender<UdpPacket>,
+    rx_tun_to_quic: mpsc::Receiver<Vec<u8>>,
+    tx_quic_to_tun: mpsc::Sender<Vec<u8>>,
 }
 
-async fn handle_quic_connection(
-    mut config: quiche::Config,
-    server_name: String,
-    local_addr: SocketAddr,
-    remote: SocketAddr,
-    mut rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
-    tx_quic_to_udp: mpsc::Sender<UdpPacket>,
-    mut rx_tun_to_quic: mpsc::Receiver<Vec<u8>>,
-    tx_quic_to_tun: mpsc::Sender<Vec<u8>>,
-) -> Result<()> {
-    let mut buf = [0; MAX_DATAGRAM_SIZE];
+impl Connection {
+    pub fn new(
+        server_name: String,
+        local_addr: SocketAddr,
+        remote: SocketAddr,
+        rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
+        tx_quic_to_udp: mpsc::Sender<UdpPacket>,
+        rx_tun_to_quic: mpsc::Receiver<Vec<u8>>,
+        tx_quic_to_tun: mpsc::Sender<Vec<u8>>,
+    ) -> Result<Self> {
+        let mut config = Self::configure_quic().unwrap();
 
-    // Generate a random source connection ID for the connection.
-    let mut scid = [0; quiche::MAX_CONN_ID_LEN];
-    SystemRandom::new().fill(&mut scid[..]).unwrap();
-    let scid = quiche::ConnectionId::from_ref(&scid);
+        // Generate a random source connection ID for the connection.
+        let mut scid = [0; quiche::MAX_CONN_ID_LEN];
+        SystemRandom::new().fill(&mut scid[..]).unwrap();
+        let scid = quiche::ConnectionId::from_ref(&scid);
 
-    let mut h3_config = quiche::h3::Config::new().unwrap();
-    h3_config.enable_extended_connect(true);
-    let mut http3_conn = None;
-    let req = vec![
-        quiche::h3::Header::new(b":method", b"CONNECT"),
-        quiche::h3::Header::new(b":protocol", b"connect-ip"),
-        quiche::h3::Header::new(b":scheme", b"https"),
-        quiche::h3::Header::new(b":authority", b"localhost"),
-        quiche::h3::Header::new(b":path", b"/vpn"),
-        quiche::h3::Header::new(b"capsule-protocol", b"?1"),
-    ];
+        // Create a QUIC connection and initiate handshake.
+        let conn = quiche::connect(Some(&server_name), &scid, local_addr, remote, &mut config)?;
 
-    let mut req_sent = false;
-    let tunnel_established = false;
+        info!(
+            "connecting to {:} from {:} with scid {:?}",
+            remote, local_addr, scid
+        );
 
-    // Create a QUIC connection and initiate handshake.
-    let mut conn = quiche::connect(Some(&server_name), &scid, local_addr, remote, &mut config)?;
-
-    info!(
-        "connecting to {:} from {:} with scid {:?}",
-        remote, local_addr, scid
-    );
-
-    // Send initial packet
-    let (write, send_info) = conn.send(&mut buf).expect("initial send failed");
-    tx_quic_to_udp
-        .send(UdpPacket {
-            data: buf[..write].to_vec(),
-            src: send_info.from,
-            dst: send_info.to,
+        Ok(Connection {
+            conn,
+            h3_conn: None,
+            rx_udp_to_quic,
+            tx_quic_to_udp,
+            rx_tun_to_quic,
+            tx_quic_to_tun,
         })
-        .await?;
+    }
 
-    let mut keepalive_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    fn configure_quic() -> Result<quiche::Config> {
+        // Create the configuration for the QUIC connection.
+        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
 
-    loop {
-        let timeout = conn.timeout();
-        tokio::select! {
-            // Handle connection timeout
-            _ = tokio::time::sleep(timeout.unwrap_or(std::time::Duration::from_secs(24 * 60 * 60))) => {
-                debug!("connection timeout");
-                conn.on_timeout();
-            }
+        // *CAUTION*: this should not be set to `false` in production!!!
+        config.verify_peer(false);
 
-            _ = keepalive_interval.tick() => {
-                if conn.is_established() {
-                    conn.send_ack_eliciting().unwrap();
-                    trace!("keepalive tick. time until timeout: {:?}", conn.timeout());
+        config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
+
+        config.set_max_idle_timeout(5000);
+        config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
+        config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
+        config.set_initial_max_data(10_000_000);
+        config.set_initial_max_stream_data_bidi_local(1_000_000);
+        config.set_initial_max_stream_data_bidi_remote(1_000_000);
+        config.set_initial_max_stream_data_uni(1_000_000);
+        config.set_initial_max_streams_bidi(100);
+        config.set_initial_max_streams_uni(100);
+        config.set_disable_active_migration(true);
+        config.enable_dgram(true, 30000, 30000);
+
+        Ok(config)
+    }
+
+    pub async fn start_connection_handling(&mut self) -> Result<()> {
+        let mut buf = [0; MAX_DATAGRAM_SIZE];
+
+        // Send initial packet
+        let (write, send_info) = self.conn.send(&mut buf).expect("initial send failed");
+        self.tx_quic_to_udp
+            .send(UdpPacket {
+                data: buf[..write].to_vec(),
+                src: send_info.from,
+                dst: send_info.to,
+            })
+            .await?;
+
+        let mut h3_config = quiche::h3::Config::new().unwrap();
+        h3_config.enable_extended_connect(true);
+        let req = vec![
+            quiche::h3::Header::new(b":method", b"CONNECT"),
+            quiche::h3::Header::new(b":protocol", b"connect-ip"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+            quiche::h3::Header::new(b":path", b"/vpn"),
+            quiche::h3::Header::new(b"capsule-protocol", b"?1"),
+        ];
+
+        let mut req_sent = false;
+        let tunnel_established = false;
+
+        let mut keepalive_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            let timeout = self.conn.timeout();
+            tokio::select! {
+                // Handle connection timeout
+                _ = tokio::time::sleep(timeout.unwrap_or(std::time::Duration::from_secs(24 * 60 * 60))) => {
+                    debug!("connection timeout");
+                    self.conn.on_timeout();
+                }
+
+                _ = keepalive_interval.tick() => {
+                    if self.conn.is_established() {
+                        self.conn.send_ack_eliciting().unwrap();
+                        trace!("keepalive tick. time until timeout: {:?}", self.conn.timeout());
+                    }
+                }
+
+                // Handle incoming UDP packets (QUIC protocol packets)
+                Some(packet) = self.rx_udp_to_quic.recv() => {
+                    let recv_info = quiche::RecvInfo {
+                        from: packet.src,
+                        to: packet.dst,
+                    };
+
+                    match self.conn.recv(&mut packet.data.clone(), recv_info) {
+                        Ok(_) => {
+                            trace!("processed {} bytes from QUIC packet", packet.data.len());
+                        }
+                        Err(e) => {
+                            debug!("recv failed: {:?}", e);
+                            if self.conn.is_closed() {
+                                info!("connection closed after recv error");
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Handle outgoing IP packets from TUN
+                Some(ip_packet) = self.rx_tun_to_quic.recv() => {
+                    if self.conn.is_established() {
+                        match self.conn.dgram_send(&ip_packet) {
+                            Ok(_) => {
+                                debug!("sent {} bytes as QUIC datagram", ip_packet.len());
+                            }
+                            Err(e) => {
+                                debug!("dgram_send failed: {:?}", e);
+                            }
+                        }
+                    } else {
+                        debug!("connection not established yet, dropping packet");
+                    }
                 }
             }
 
-            // Handle incoming UDP packets (QUIC protocol packets)
-            Some(packet) = rx_udp_to_quic.recv() => {
-                let recv_info = quiche::RecvInfo {
-                    from: packet.src,
-                    to: packet.dst,
-                };
+            // Check if connection is closed
+            if self.conn.is_closed() {
+                info!("connection closed, {:?}", self.conn.stats());
+                break;
+            }
 
-                match conn.recv(&mut packet.data.clone(), recv_info) {
-                    Ok(_) => {
-                        trace!("processed {} bytes from QUIC packet", packet.data.len());
-                    }
-                    Err(e) => {
-                        debug!("recv failed: {:?}", e);
-                        if conn.is_closed() {
-                            info!("connection closed after recv error");
+            // Create a new HTTP/3 connection once the QUIC connection is established.
+            if self.conn.is_established() && self.h3_conn.is_none() {
+                self.h3_conn = Some(
+                    quiche::h3::Connection::with_transport(&mut self.conn, &h3_config)
+                        .expect("Unable to create HTTP/3 connection, check the server's uni stream limit and window size"),
+                );
+            }
+
+            // Send HTTP requests once the QUIC connection is established, and until
+            // all requests have been sent.
+            if let Some(h3_conn) = &mut self.h3_conn {
+                if !req_sent {
+                    info!("sending HTTP request {req:?}");
+                    h3_conn.send_request(&mut self.conn, &req, false).unwrap();
+                    req_sent = true;
+                }
+            }
+
+            if let Some(http3_conn) = &mut self.h3_conn {
+                // Process HTTP/3 events.
+                loop {
+                    match http3_conn.poll(&mut self.conn) {
+                        Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
+                            info!(
+                                "got response headers {:?} on stream id {}",
+                                hdrs_to_strings(&list),
+                                stream_id
+                            );
+
+                            // Handle response headers and start capsule protocol
+                            let mut capsule_protocol = None;
+                            let mut status = None;
+                            for hdr in &list {
+                                match hdr.name() {
+                                    b":status" => status = Some(hdr.value()),
+                                    b"capsule-protocol" => capsule_protocol = Some(hdr.value()),
+                                    _ => (),
+                                }
+                            }
+
+                            match (status, capsule_protocol) {
+                                (Some(b"200"), Some(b"?1")) => (),
+                                _ => {
+                                    error!("unexpected response from server, closing connection");
+                                    self.conn
+                                        .close(true, 0x100, b"unexpected response")
+                                        .unwrap();
+                                }
+                            };
+
+                            // Send Address Request capsule
+                            let addr_req = AddressRequestCapsule {
+                                addresses: vec![RequestedAddress {
+                                    request_id: 1,
+                                    address: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+                                    prefix_len: 32,
+                                }],
+                            };
+                            let mut buf = vec![0u8; 1000];
+                            let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
+                            addr_req.append(&mut octets_mut).unwrap();
+                            let payload_len = octets_mut.off();
+                            let capsule = Capsule {
+                                capsule_type: CapsuleType::AddressAssign,
+                                payload: buf[..payload_len].to_vec(),
+                            };
+                            let mut buf = vec![0u8; 100];
+                            let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
+                            capsule.append(&mut octets_mut).unwrap();
+                            let payload_len = octets_mut.off();
+                            http3_conn
+                                .send_body(&mut self.conn, stream_id, &buf[..payload_len], false)
+                                .unwrap();
+                        }
+
+                        Ok((stream_id, quiche::h3::Event::Data)) => {
+                            while let Ok(read) =
+                                http3_conn.recv_body(&mut self.conn, stream_id, &mut buf)
+                            {
+                                debug!("got {read} bytes of response data on stream {stream_id}");
+                                // Handle capsule protocol data
+                            }
+                        }
+
+                        Ok((_stream_id, quiche::h3::Event::Finished)) => {
+                            info!("stream finished, closing connection");
+                            self.conn.close(true, 0x100, b"kthxbye").unwrap();
+                        }
+
+                        Ok((_stream_id, quiche::h3::Event::Reset(e))) => {
+                            error!("request was reset by peer with {e}, closing...");
+                            self.conn.close(true, 0x100, b"kthxbye").unwrap();
+                        }
+
+                        Ok((_, quiche::h3::Event::PriorityUpdate)) => unreachable!(),
+
+                        Ok((goaway_id, quiche::h3::Event::GoAway)) => {
+                            info!("GOAWAY id={goaway_id}");
+                        }
+
+                        Err(quiche::h3::Error::Done) => {
+                            break;
+                        }
+
+                        Err(e) => {
+                            error!("HTTP/3 processing failed: {e:?}");
+
                             break;
                         }
                     }
                 }
             }
 
-            // Handle outgoing IP packets from TUN
-            Some(ip_packet) = rx_tun_to_quic.recv() => {
-                if conn.is_established() {
-                    match conn.dgram_send(&ip_packet) {
-                        Ok(_) => {
-                            debug!("sent {} bytes as QUIC datagram", ip_packet.len());
-                        }
-                        Err(e) => {
-                            debug!("dgram_send failed: {:?}", e);
-                        }
+            // Check if connection is established
+            if self.conn.is_established() && tunnel_established {
+                // Receive datagrams from QUIC and forward to TUN
+                while let Ok(len) = self.conn.dgram_recv(&mut buf) {
+                    trace!("received {} bytes from QUIC datagram", len);
+                    if self.tx_quic_to_tun.send(buf[..len].to_vec()).await.is_err() {
+                        info!("TUN channel closed, stopping datagram forwarding");
+                        break;
                     }
-                } else {
-                    debug!("connection not established yet, dropping packet");
                 }
             }
-        }
 
-        // Check if connection is closed
-        if conn.is_closed() {
-            info!("connection closed, {:?}", conn.stats());
-            break;
-        }
-
-        // Create a new HTTP/3 connection once the QUIC connection is established.
-        if conn.is_established() && http3_conn.is_none() {
-            http3_conn = Some(
-                quiche::h3::Connection::with_transport(&mut conn, &h3_config)
-                .expect("Unable to create HTTP/3 connection, check the server's uni stream limit and window size"),
-            );
-        }
-
-        // Send HTTP requests once the QUIC connection is established, and until
-        // all requests have been sent.
-        if let Some(h3_conn) = &mut http3_conn {
-            if !req_sent {
-                info!("sending HTTP request {req:?}");
-
-                h3_conn.send_request(&mut conn, &req, false).unwrap();
-
-                req_sent = true;
-            }
-        }
-
-        if let Some(http3_conn) = &mut http3_conn {
-            // Process HTTP/3 events.
+            // Send any pending QUIC packets
             loop {
-                match http3_conn.poll(&mut conn) {
-                    Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
-                        info!(
-                            "got response headers {:?} on stream id {}",
-                            hdrs_to_strings(&list),
-                            stream_id
-                        );
-
-                        // Handle response headers and start capsule protocol
-                        let mut capsule_protocol = None;
-                        let mut status = None;
-                        for hdr in &list {
-                            match hdr.name() {
-                                b":status" => status = Some(hdr.value()),
-                                b"capsule-protocol" => capsule_protocol = Some(hdr.value()),
-                                _ => (),
-                            }
-                        }
-
-                        match (status, capsule_protocol) {
-                            (Some(b"200"), Some(b"?1")) => (),
-                            _ => {
-                                error!("unexpected response from server, closing connection");
-                                conn.close(true, 0x100, b"unexpected response").unwrap();
-                            }
-                        };
-
-                        // Send Address Request capsule
-                        let addr_req = AddressRequestCapsule {
-                            addresses: vec![RequestedAddress {
-                                request_id: 1,
-                                address: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
-                                prefix_len: 32,
-                            }],
-                        };
-                        let mut buf = vec![0u8; 1000];
-                        let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
-                        addr_req.append(&mut octets_mut).unwrap();
-                        let payload_len = octets_mut.off();
-                        let capsule = Capsule {
-                            capsule_type: CapsuleType::AddressAssign,
-                            payload: buf[..payload_len].to_vec(),
-                        };
-                        let mut buf = vec![0u8; 100];
-                        let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
-                        capsule.append(&mut octets_mut).unwrap();
-                        let payload_len = octets_mut.off();
-                        http3_conn
-                            .send_body(&mut conn, stream_id, &buf[..payload_len], false)
-                            .unwrap();
-                    }
-
-                    Ok((stream_id, quiche::h3::Event::Data)) => {
-                        while let Ok(read) = http3_conn.recv_body(&mut conn, stream_id, &mut buf) {
-                            debug!("got {read} bytes of response data on stream {stream_id}");
-                            // Handle capsule protocol data
-                        }
-                    }
-
-                    Ok((_stream_id, quiche::h3::Event::Finished)) => {
-                        info!("stream finished, closing connection");
-                        conn.close(true, 0x100, b"kthxbye").unwrap();
-                    }
-
-                    Ok((_stream_id, quiche::h3::Event::Reset(e))) => {
-                        error!("request was reset by peer with {e}, closing...");
-                        conn.close(true, 0x100, b"kthxbye").unwrap();
-                    }
-
-                    Ok((_, quiche::h3::Event::PriorityUpdate)) => unreachable!(),
-
-                    Ok((goaway_id, quiche::h3::Event::GoAway)) => {
-                        info!("GOAWAY id={goaway_id}");
-                    }
-
-                    Err(quiche::h3::Error::Done) => {
-                        break;
-                    }
-
+                let (write, send_info) = match self.conn.send(&mut buf) {
+                    Ok(v) => v,
+                    Err(quiche::Error::Done) => break,
                     Err(e) => {
-                        error!("HTTP/3 processing failed: {e:?}");
-
+                        debug!("send failed: {:?}", e);
                         break;
                     }
-                }
-            }
-        }
+                };
 
-        // Check if connection is established
-        if conn.is_established() && tunnel_established {
-            // Receive datagrams from QUIC and forward to TUN
-            while let Ok(len) = conn.dgram_recv(&mut buf) {
-                trace!("received {} bytes from QUIC datagram", len);
-                if tx_quic_to_tun.send(buf[..len].to_vec()).await.is_err() {
-                    info!("TUN channel closed, stopping datagram forwarding");
+                if self
+                    .tx_quic_to_udp
+                    .send(UdpPacket {
+                        data: buf[..write].to_vec(),
+                        src: send_info.from,
+                        dst: send_info.to,
+                    })
+                    .await
+                    .is_err()
+                {
+                    info!("UDP channel closed, cannot send packets");
                     break;
                 }
             }
         }
 
-        // Send any pending QUIC packets
-        loop {
-            let (write, send_info) = match conn.send(&mut buf) {
-                Ok(v) => v,
-                Err(quiche::Error::Done) => break,
-                Err(e) => {
-                    debug!("send failed: {:?}", e);
-                    break;
-                }
-            };
-
-            if tx_quic_to_udp
-                .send(UdpPacket {
-                    data: buf[..write].to_vec(),
-                    src: send_info.from,
-                    dst: send_info.to,
-                })
-                .await
-                .is_err()
-            {
-                info!("UDP channel closed, cannot send packets");
-                break;
-            }
-        }
+        info!("QUIC connection handler exiting");
+        Ok(())
     }
-
-    info!("QUIC connection handler exiting");
-    Ok(())
 }
 
 pub fn hdrs_to_strings(hdrs: &[quiche::h3::Header]) -> Vec<(String, String)> {

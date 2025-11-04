@@ -2,6 +2,7 @@ use anyhow::Result;
 use pnet::packet::ipv4::Ipv4Packet;
 use quiche::h3::NameValue;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::SocketAddr;
 use tokio::sync::mpsc;
@@ -62,10 +63,16 @@ impl ClientConnection {
         // Create TUN interface for this connection
         let (mut tx_quic_to_tun, rx_quic_to_tun) = mpsc::channel::<Vec<u8>>(1000);
         let (tx_tun_to_quic, mut rx_tun_to_quic) = mpsc::channel::<Vec<u8>>(1000);
-        let mut tun = tun::Tun::new(&tun_name, tun_ip, 1500);
-        let tun_handle = tun
-            .start(tx_tun_to_quic, rx_quic_to_tun, cancel_token.clone())
-            .await?;
+        let mut tun = tun::Tun::new(&tun_name, tx_tun_to_quic, 1350)?;
+        tun.addresses.push(tun::AddressRange {
+            base: IpAddr::V4(tun_ip),
+            prefix_len: 24,
+        });
+        tun.addresses.push(tun::AddressRange {
+            base: IpAddr::V4("10.248.2.128".parse().unwrap()),
+            prefix_len: 25,
+        });
+        tun.start(rx_quic_to_tun, cancel_token.clone()).await?;
 
         let mut buf = [0; MAX_DATAGRAM_SIZE];
         let mut keepalive_interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -134,7 +141,9 @@ impl ClientConnection {
         cancel_token.cancel();
 
         // Wait for TUN task to finish with timeout
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), tun_handle).await;
+        if let Some(tun_handle) = tun.handle.take() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), tun_handle).await;
+        }
 
         Ok(())
     }
