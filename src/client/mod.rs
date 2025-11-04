@@ -1,6 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 
 use anyhow::{Result, anyhow};
+use octets::Octets;
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -9,7 +10,10 @@ use url::Url;
 
 use quiche::h3::NameValue;
 
-use crate::connect_ip::capsule::{AddressRequestCapsule, Capsule, CapsuleType, RequestedAddress};
+use crate::connect_ip::capsule::{
+    AddressAssignCapsule, AddressRequestCapsule, Capsule, CapsuleType, RequestedAddress,
+};
+use crate::net::tun::AddressRange;
 use crate::net::{UdpPacket, tun};
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
@@ -101,11 +105,23 @@ pub async fn run(url: Url, bind: SocketAddr) -> Result<()> {
     result
 }
 
+struct CapsuleProtocolState {
+    request_sent: bool,
+    stream_established: bool,
+    stream_id: u64,
+    address_requested: bool,
+    tunnel_established: bool,
+    addresses: Vec<AddressRange>,
+    routes: Vec<IpAddr>,
+    updated: bool,
+}
+
 struct Connection {
     conn: quiche::Connection,
     h3_conn: Option<quiche::h3::Connection>,
     rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
     tx_quic_to_udp: mpsc::Sender<UdpPacket>,
+    capsule_state: CapsuleProtocolState,
 }
 
 impl Connection {
@@ -136,6 +152,16 @@ impl Connection {
             h3_conn: None,
             rx_udp_to_quic,
             tx_quic_to_udp,
+            capsule_state: CapsuleProtocolState {
+                request_sent: false,
+                stream_id: 0,
+                stream_established: false,
+                address_requested: false,
+                tunnel_established: false,
+                addresses: Vec::new(),
+                routes: Vec::new(),
+                updated: false,
+            },
         })
     }
 
@@ -170,18 +196,10 @@ impl Connection {
         let mut buf = [0; MAX_DATAGRAM_SIZE];
 
         // Channels between TUN and QUIC tasks. Contents are IP packets.
-        let (tx_quic_to_tun, rx_quic_to_tun) = mpsc::channel::<Vec<u8>>(1000);
+        let (mut tx_quic_to_tun, mut rx_quic_to_tun) = mpsc::channel::<Vec<u8>>(1000);
         let (tx_tun_to_quic, mut rx_tun_to_quic) = mpsc::channel::<Vec<u8>>(1000);
 
-        // convert the received bytes to an IPv4 address
-        let received_address = "10.248.2.180";
-
-        let mut tun = tun::Tun::new("tun0", tx_tun_to_quic, 1350)?;
-        tun.addresses.push(tun::AddressRange {
-            base: IpAddr::V4(received_address.parse::<Ipv4Addr>()?),
-            prefix_len: 24,
-        });
-        tun.start(rx_quic_to_tun, cancel_token.clone()).await?;
+        let mut tun = tun::Tun::new("tun0", tx_tun_to_quic.clone(), 1350)?;
 
         // Send initial packet
         let (write, send_info) = self.conn.send(&mut buf).expect("initial send failed");
@@ -203,9 +221,6 @@ impl Connection {
             quiche::h3::Header::new(b":path", b"/vpn"),
             quiche::h3::Header::new(b"capsule-protocol", b"?1"),
         ];
-
-        let mut req_sent = false;
-        let tunnel_established = false;
 
         let mut keepalive_interval = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
@@ -253,13 +268,8 @@ impl Connection {
                 // Handle outgoing IP packets from TUN
                 Some(ip_packet) = rx_tun_to_quic.recv() => {
                     if self.conn.is_established() {
-                        match self.conn.dgram_send(&ip_packet) {
-                            Ok(_) => {
-                                debug!("sent {} bytes as QUIC datagram", ip_packet.len());
-                            }
-                            Err(e) => {
-                                debug!("dgram_send failed: {:?}", e);
-                            }
+                        if let Err(e) = self.conn.dgram_send(&ip_packet) {
+                            debug!("dgram_send failed: {:?}", e);
                         }
                     } else {
                         debug!("connection not established yet, dropping packet");
@@ -284,16 +294,17 @@ impl Connection {
             // Send HTTP requests once the QUIC connection is established, and until
             // all requests have been sent.
             if let Some(h3_conn) = &mut self.h3_conn {
-                if !req_sent {
+                if !self.capsule_state.request_sent {
                     info!("sending HTTP request {req:?}");
                     h3_conn.send_request(&mut self.conn, &req, false).unwrap();
-                    req_sent = true;
+                    self.capsule_state.request_sent = true;
                 }
             }
 
-            if let Some(http3_conn) = &mut self.h3_conn {
+            if self.h3_conn.is_some() {
                 // Process HTTP/3 events.
                 loop {
+                    let http3_conn = self.h3_conn.as_mut().unwrap();
                     match http3_conn.poll(&mut self.conn) {
                         Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
                             info!(
@@ -301,59 +312,32 @@ impl Connection {
                                 hdrs_to_strings(&list),
                                 stream_id
                             );
-
-                            // Handle response headers and start capsule protocol
-                            let mut capsule_protocol = None;
-                            let mut status = None;
-                            for hdr in &list {
-                                match hdr.name() {
-                                    b":status" => status = Some(hdr.value()),
-                                    b"capsule-protocol" => capsule_protocol = Some(hdr.value()),
-                                    _ => (),
-                                }
+                            if Self::check_response(&list) {
+                                self.capsule_state.stream_id = stream_id;
+                                self.capsule_state.stream_established = true;
+                            } else {
+                                error!("unexpected response from server, closing connection");
+                                self.conn
+                                    .close(true, 0x100, b"unexpected response")
+                                    .unwrap();
                             }
-
-                            match (status, capsule_protocol) {
-                                (Some(b"200"), Some(b"?1")) => (),
-                                _ => {
-                                    error!("unexpected response from server, closing connection");
-                                    self.conn
-                                        .close(true, 0x100, b"unexpected response")
-                                        .unwrap();
-                                }
-                            };
-
-                            // Send Address Request capsule
-                            let addr_req = AddressRequestCapsule {
-                                addresses: vec![RequestedAddress {
-                                    request_id: 1,
-                                    address: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
-                                    prefix_len: 32,
-                                }],
-                            };
-                            let mut buf = vec![0u8; 1000];
-                            let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
-                            addr_req.append(&mut octets_mut).unwrap();
-                            let payload_len = octets_mut.off();
-                            let capsule = Capsule {
-                                capsule_type: CapsuleType::AddressAssign,
-                                payload: buf[..payload_len].to_vec(),
-                            };
-                            let mut buf = vec![0u8; 100];
-                            let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
-                            capsule.append(&mut octets_mut).unwrap();
-                            let payload_len = octets_mut.off();
-                            http3_conn
-                                .send_body(&mut self.conn, stream_id, &buf[..payload_len], false)
-                                .unwrap();
                         }
 
                         Ok((stream_id, quiche::h3::Event::Data)) => {
-                            while let Ok(read) =
-                                http3_conn.recv_body(&mut self.conn, stream_id, &mut buf)
-                            {
-                                debug!("got {read} bytes of response data on stream {stream_id}");
-                                // Handle capsule protocol data
+                            info!(
+                                "{} got data on stream id {}",
+                                self.conn.trace_id(),
+                                stream_id
+                            );
+                            while let Ok(read) = self.h3_conn.as_mut().unwrap().recv_body(
+                                &mut self.conn,
+                                stream_id,
+                                &mut buf,
+                            ) {
+                                trace!("got {read} bytes of response data on stream {stream_id}");
+                                let data = buf[..read].to_vec();
+                                // TODO: make sure all data is handled
+                                self.handle_capsule_data(stream_id, &data)?;
                             }
                         }
 
@@ -386,8 +370,34 @@ impl Connection {
                 }
             }
 
+            // TODO: update tun state based on capsule protocol state
+            if self.capsule_state.updated {
+                tun.abort();
+                drop(tun);
+                drop(tx_quic_to_tun);
+                (tx_quic_to_tun, rx_quic_to_tun) = mpsc::channel::<Vec<u8>>(1000);
+                tun = tun::Tun::new("tun0", tx_tun_to_quic.clone(), 1350)?;
+
+                tun.addresses.clear();
+                for addr in &self.capsule_state.addresses {
+                    tun.addresses.push(addr.clone());
+                }
+                self.capsule_state.updated = false;
+                tun.start(rx_quic_to_tun, cancel_token.clone()).await?;
+                info!("TUN device updated with new addresses, {:?}", tun.addresses);
+            }
+
+            if self.capsule_state.stream_established {
+                // Send initial capsules if not already sent
+                if !self.capsule_state.address_requested {
+                    self.send_initial_capsules()?;
+                    info!("sent initial capsules to establish tunnel");
+                    self.capsule_state.address_requested = true;
+                }
+            }
+
             // Check if connection is established
-            if self.conn.is_established() && tunnel_established {
+            if self.conn.is_established() && self.capsule_state.tunnel_established {
                 // Receive datagrams from QUIC and forward to TUN
                 while let Ok(len) = self.conn.dgram_recv(&mut buf) {
                     trace!("received {} bytes from QUIC datagram", len);
@@ -433,6 +443,103 @@ impl Connection {
 
         info!("QUIC connection handler exiting");
         Ok(())
+    }
+
+    fn check_response(headers: &[quiche::h3::Header]) -> bool {
+        // Handle response headers and start capsule protocol
+        let mut capsule_protocol = None;
+        let mut status = None;
+        for hdr in headers {
+            match hdr.name() {
+                b":status" => status = Some(hdr.value()),
+                b"capsule-protocol" => capsule_protocol = Some(hdr.value()),
+                _ => (),
+            }
+        }
+
+        match (status, capsule_protocol) {
+            (Some(b"200"), Some(b"?1")) => (),
+            _ => {
+                return false;
+            }
+        };
+        true
+    }
+
+    fn send_initial_capsules(&mut self) -> Result<()> {
+        let stream_id = self.capsule_state.stream_id;
+        // Send Address Request capsule
+        let addr_req = AddressRequestCapsule {
+            addresses: vec![RequestedAddress {
+                request_id: 1,
+                address: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+                prefix_len: 32,
+            }],
+        };
+        let mut buf = vec![0u8; 1000];
+        let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
+        addr_req.append(&mut octets_mut).unwrap();
+        let payload_len = octets_mut.off();
+        let capsule = Capsule {
+            capsule_type: CapsuleType::AddressRequest,
+            payload: buf[..payload_len].to_vec(),
+        };
+        let mut buf = vec![0u8; 100];
+        let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
+        capsule.append(&mut octets_mut).unwrap();
+        let payload_len = octets_mut.off();
+        self.h3_conn
+            .as_mut()
+            .unwrap()
+            .send_body(&mut self.conn, stream_id, &buf[..payload_len], false)
+            .unwrap();
+        Ok(())
+    }
+
+    /// Handles incoming capsule data.
+    fn handle_capsule_data(&mut self, stream_id: u64, data: &[u8]) -> Result<usize> {
+        info!(
+            "{} got capsule data on stream id {}: {:?}",
+            self.conn.trace_id(),
+            stream_id,
+            data
+        );
+        if self.capsule_state.stream_id != stream_id {
+            error!(
+                "{} received capsule data on unknown stream id {}",
+                self.conn.trace_id(),
+                stream_id
+            );
+            return Err(anyhow!("unknown stream id"));
+        }
+
+        // parse capsule data here
+        let mut octets = Octets::with_slice(data);
+        let capsule = Capsule::parse(&mut octets)?;
+        match capsule.capsule_type {
+            CapsuleType::AddressAssign => {
+                info!("received AddressAssign capsule: {:?}", capsule.payload);
+                self.capsule_state.addresses.clear();
+                self.capsule_state.updated = true;
+                let payload_octets = &mut Octets::with_slice(&capsule.payload);
+                let assign_capsule = AddressAssignCapsule::parse(payload_octets)?;
+                for addr in assign_capsule.addresses {
+                    self.capsule_state.addresses.push(AddressRange {
+                        base: addr.address,
+                        prefix_len: addr.prefix_len,
+                    });
+                }
+                self.capsule_state.tunnel_established = true;
+            }
+            CapsuleType::AddressRequest => {
+                info!("received AddressRequest capsule: {:?}", capsule.payload);
+            }
+            CapsuleType::RouteAdvertisement => {
+                info!("received RouteAdvertisement capsule: {:?}", capsule.payload);
+            }
+        }
+
+        Ok(octets.off())
     }
 }
 

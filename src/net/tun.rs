@@ -8,6 +8,7 @@ use tracing::{error, info, info_span, trace};
 use tracing_futures::Instrument as _;
 use tun_rs::DeviceBuilder;
 
+#[derive(Debug, Clone)]
 pub struct AddressRange {
     pub base: IpAddr,
     pub prefix_len: u8,

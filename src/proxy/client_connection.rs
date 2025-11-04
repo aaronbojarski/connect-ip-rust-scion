@@ -1,15 +1,16 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
+use octets::Octets;
 use pnet::packet::ipv4::Ipv4Packet;
 use quiche::h3::NameValue;
 use std::collections::HashMap;
-use std::net::IpAddr;
-use std::net::Ipv4Addr;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::trace;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, trace};
 
+use crate::connect_ip::capsule::{
+    AddressAssignCapsule, AddressRequestCapsule, AssignedAddress, Capsule, CapsuleType,
+};
 use crate::net::{UdpPacket, tun};
 use crate::proxy::MAX_DATAGRAM_SIZE;
 
@@ -23,6 +24,7 @@ pub struct ClientConnection {
     pub conn: quiche::Connection,
     pub scid: quiche::ConnectionId<'static>,
     pub h3_conn: Option<quiche::h3::Connection>,
+    pub stream_id: Option<u64>,
     pub remote_addr: SocketAddr,
     pub rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
     pub tx_quic_to_udp: mpsc::Sender<UdpPacket>,
@@ -41,6 +43,7 @@ impl ClientConnection {
             conn,
             scid,
             h3_conn: None,
+            stream_id: None,
             remote_addr,
             rx_udp_to_quic,
             tx_quic_to_udp,
@@ -212,10 +215,15 @@ impl ClientConnection {
                             self.conn.trace_id(),
                             stream_id
                         );
-                        // TODO: handle capsule protocol data
-                        while let Ok(read) = http3_conn.recv_body(&mut self.conn, stream_id, buf) {
+                        while let Ok(read) =
+                            self.h3_conn
+                                .as_mut()
+                                .unwrap()
+                                .recv_body(&mut self.conn, stream_id, buf)
+                        {
                             trace!("got {read} bytes of response data on stream {stream_id}");
-                            // Handle capsule protocol data
+                            let data = buf[..read].to_vec();
+                            self.handle_capsule_data(stream_id, &data)?;
                         }
                     }
 
@@ -279,13 +287,8 @@ impl ClientConnection {
         }
 
         if self.conn.is_established() {
-            match self.conn.dgram_send(&ip_packet) {
-                Ok(_) => {
-                    debug!("sent {} bytes as QUIC datagram", ip_packet.len());
-                }
-                Err(e) => {
-                    debug!("dgram_send failed: {:?}", e);
-                }
+            if let Err(e) = self.conn.dgram_send(&ip_packet) {
+                debug!("dgram_send failed: {:?}", e);
             }
         } else {
             debug!("connection not established yet, dropping packet");
@@ -301,16 +304,6 @@ impl ClientConnection {
             hdrs_to_strings(headers),
             stream_id
         );
-
-        // Check if HTTP/3 connection exists before proceeding
-        if self.h3_conn.is_none() {
-            error!(
-                "{} no HTTP/3 connection for request on stream {}",
-                self.conn.trace_id(),
-                stream_id
-            );
-            return;
-        }
 
         let (headers, body) = self.build_response(headers);
         let http3_conn = self.h3_conn.as_mut().unwrap();
@@ -355,6 +348,78 @@ impl ClientConnection {
 
             self.partial_responses.insert(stream_id, response);
         }
+        self.stream_id = Some(stream_id);
+    }
+
+    /// Handles incoming capsule data.
+    fn handle_capsule_data(&mut self, stream_id: u64, data: &[u8]) -> Result<usize> {
+        info!(
+            "{} got capsule data on stream id {}: {:?}",
+            self.conn.trace_id(),
+            stream_id,
+            data
+        );
+        if self.stream_id != Some(stream_id) {
+            error!(
+                "{} received capsule data on unknown stream id {}",
+                self.conn.trace_id(),
+                stream_id
+            );
+            return Err(anyhow!("unknown stream id"));
+        }
+
+        // parse capsule data here
+        let mut octets = Octets::with_slice(data);
+        let capsule = Capsule::parse(&mut octets)?;
+        match capsule.capsule_type {
+            CapsuleType::AddressAssign => {
+                info!("received AddressAssign capsule: {:?}", capsule.payload);
+                // probably site to site tunnel. Need to add to address list.
+            }
+            CapsuleType::AddressRequest => {
+                info!("received AddressRequest capsule: {:?}", capsule.payload);
+                // parse and handle address request
+                let payload_octets = &mut Octets::with_slice(&capsule.payload);
+                let request_capsule = AddressRequestCapsule::parse(payload_octets)?;
+                let mut assigned_addresses = vec![];
+                for addr in request_capsule.addresses {
+                    // TODO: properly assign addresses
+                    let assigned_addr = AssignedAddress {
+                        request_id: addr.request_id,
+                        address: IpAddr::V4(Ipv4Addr::new(10, 248, 2, 180)),
+                        prefix_len: 24,
+                    };
+                    info!("requested address: {:?}", addr.address);
+                    assigned_addresses.push(assigned_addr);
+                }
+
+                let addr_req = AddressAssignCapsule {
+                    addresses: assigned_addresses,
+                };
+                let mut buf = vec![0u8; 1000];
+                let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
+                addr_req.append(&mut octets_mut).unwrap();
+                let payload_len = octets_mut.off();
+                let capsule = Capsule {
+                    capsule_type: CapsuleType::AddressAssign,
+                    payload: buf[..payload_len].to_vec(),
+                };
+                let mut buf = vec![0u8; 100];
+                let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
+                capsule.append(&mut octets_mut).unwrap();
+                let payload_len = octets_mut.off();
+                self.h3_conn
+                    .as_mut()
+                    .unwrap()
+                    .send_body(&mut self.conn, stream_id, &buf[..payload_len], false)
+                    .unwrap();
+            }
+            CapsuleType::RouteAdvertisement => {
+                info!("received RouteAdvertisement capsule: {:?}", capsule.payload);
+            }
+        }
+
+        Ok(octets.off())
     }
 
     /// Builds an HTTP/3 response given a request.
