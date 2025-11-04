@@ -19,7 +19,7 @@ pub async fn run(url: Url, bind: SocketAddr) -> Result<()> {
     let mut buf = [0; 65535];
 
     let url = url;
-    let url_host = "10.248.100.11";
+    let url_host = url.host_str().ok_or_else(|| anyhow!("URL missing host"))?;
     let remote = (url_host, url.port().unwrap_or(4433))
         .to_socket_addrs()?
         .next()
@@ -30,26 +30,12 @@ pub async fn run(url: Url, bind: SocketAddr) -> Result<()> {
     // Get local address.
     let local_addr = socket.local_addr().unwrap();
 
-    // convert the received bytes to an IPv4 address
-    let received_address = "10.248.2.180";
-
-    // Channels between TUN and QUIC tasks. Contents are IP packets.
-    let (tx_quic_to_tun, rx_quic_to_tun) = mpsc::channel::<Vec<u8>>(1000);
-    let (tx_tun_to_quic, rx_tun_to_quic) = mpsc::channel::<Vec<u8>>(1000);
-
     // Channels between UDP and QUIC tasks. Contents are UDP datagrams (usually encrypted QUIC packets) with source address.
     let (tx_udp_to_quic, rx_udp_to_quic) = mpsc::channel::<UdpPacket>(1000);
     let (tx_quic_to_udp, mut rx_quic_to_udp) = mpsc::channel::<UdpPacket>(1000);
 
-    // Create cancellation token for TUN interface
+    // Create cancellation token for graceful shutdown
     let cancel_token = CancellationToken::new();
-
-    let mut tun = tun::Tun::new("tun0", tx_tun_to_quic, 1350)?;
-    tun.addresses.push(tun::AddressRange {
-        base: IpAddr::V4(received_address.parse::<Ipv4Addr>()?),
-        prefix_len: 24,
-    });
-    tun.start(rx_quic_to_tun, cancel_token.clone()).await?;
 
     let mut connection = Connection::new(
         "localhost".to_string(),
@@ -57,12 +43,15 @@ pub async fn run(url: Url, bind: SocketAddr) -> Result<()> {
         remote,
         rx_udp_to_quic,
         tx_quic_to_udp,
-        rx_tun_to_quic,
-        tx_quic_to_tun,
     )?;
 
     // Spawn QUIC connection handler task
-    let mut quic_handle = tokio::spawn(async move { connection.start_connection_handling().await });
+    let cancel_token_clone = cancel_token.clone();
+    let mut quic_handle = tokio::spawn(async move {
+        connection
+            .start_connection_handling(cancel_token_clone)
+            .await
+    });
 
     // Main loop: handle UDP socket
     let result = loop {
@@ -105,13 +94,8 @@ pub async fn run(url: Url, bind: SocketAddr) -> Result<()> {
     };
 
     // Graceful shutdown
-    info!("shutting down TUN interface");
+    debug!("shutting down remaining tasks");
     cancel_token.cancel();
-
-    // Wait for TUN task to finish with timeout
-    if let Some(tun_handle) = tun.handle.take() {
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), tun_handle).await;
-    }
 
     info!("client shutdown complete");
     result
@@ -122,8 +106,6 @@ struct Connection {
     h3_conn: Option<quiche::h3::Connection>,
     rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
     tx_quic_to_udp: mpsc::Sender<UdpPacket>,
-    rx_tun_to_quic: mpsc::Receiver<Vec<u8>>,
-    tx_quic_to_tun: mpsc::Sender<Vec<u8>>,
 }
 
 impl Connection {
@@ -133,8 +115,6 @@ impl Connection {
         remote: SocketAddr,
         rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
         tx_quic_to_udp: mpsc::Sender<UdpPacket>,
-        rx_tun_to_quic: mpsc::Receiver<Vec<u8>>,
-        tx_quic_to_tun: mpsc::Sender<Vec<u8>>,
     ) -> Result<Self> {
         let mut config = Self::configure_quic().unwrap();
 
@@ -156,8 +136,6 @@ impl Connection {
             h3_conn: None,
             rx_udp_to_quic,
             tx_quic_to_udp,
-            rx_tun_to_quic,
-            tx_quic_to_tun,
         })
     }
 
@@ -165,7 +143,7 @@ impl Connection {
         // Create the configuration for the QUIC connection.
         let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
 
-        // *CAUTION*: this should not be set to `false` in production!!!
+        // TODO: Load certificates properly and verify server identity
         config.verify_peer(false);
 
         config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
@@ -185,8 +163,25 @@ impl Connection {
         Ok(config)
     }
 
-    pub async fn start_connection_handling(&mut self) -> Result<()> {
+    pub async fn start_connection_handling(
+        &mut self,
+        cancel_token: CancellationToken,
+    ) -> Result<()> {
         let mut buf = [0; MAX_DATAGRAM_SIZE];
+
+        // Channels between TUN and QUIC tasks. Contents are IP packets.
+        let (tx_quic_to_tun, rx_quic_to_tun) = mpsc::channel::<Vec<u8>>(1000);
+        let (tx_tun_to_quic, mut rx_tun_to_quic) = mpsc::channel::<Vec<u8>>(1000);
+
+        // convert the received bytes to an IPv4 address
+        let received_address = "10.248.2.180";
+
+        let mut tun = tun::Tun::new("tun0", tx_tun_to_quic, 1350)?;
+        tun.addresses.push(tun::AddressRange {
+            base: IpAddr::V4(received_address.parse::<Ipv4Addr>()?),
+            prefix_len: 24,
+        });
+        tun.start(rx_quic_to_tun, cancel_token.clone()).await?;
 
         // Send initial packet
         let (write, send_info) = self.conn.send(&mut buf).expect("initial send failed");
@@ -216,6 +211,11 @@ impl Connection {
         loop {
             let timeout = self.conn.timeout();
             tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    info!("connection handler received shutdown signal");
+                    break;
+                }
+
                 // Handle connection timeout
                 _ = tokio::time::sleep(timeout.unwrap_or(std::time::Duration::from_secs(24 * 60 * 60))) => {
                     debug!("connection timeout");
@@ -251,7 +251,7 @@ impl Connection {
                 }
 
                 // Handle outgoing IP packets from TUN
-                Some(ip_packet) = self.rx_tun_to_quic.recv() => {
+                Some(ip_packet) = rx_tun_to_quic.recv() => {
                     if self.conn.is_established() {
                         match self.conn.dgram_send(&ip_packet) {
                             Ok(_) => {
@@ -391,7 +391,7 @@ impl Connection {
                 // Receive datagrams from QUIC and forward to TUN
                 while let Ok(len) = self.conn.dgram_recv(&mut buf) {
                     trace!("received {} bytes from QUIC datagram", len);
-                    if self.tx_quic_to_tun.send(buf[..len].to_vec()).await.is_err() {
+                    if tx_quic_to_tun.send(buf[..len].to_vec()).await.is_err() {
                         info!("TUN channel closed, stopping datagram forwarding");
                         break;
                     }
@@ -423,6 +423,12 @@ impl Connection {
                     break;
                 }
             }
+        }
+
+        cancel_token.cancel();
+
+        if let Some(tun_handle) = tun.handle.take() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), tun_handle).await;
         }
 
         info!("QUIC connection handler exiting");
