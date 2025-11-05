@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use ipnet::{IpNet, Ipv4Net};
 use octets::Octets;
 use pnet::packet::ipv4::Ipv4Packet;
 use quiche::h3::NameValue;
@@ -8,9 +9,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace};
 
-use crate::connect_ip::capsule::{
-    AddressAssignCapsule, AddressRequestCapsule, AssignedAddress, Capsule, CapsuleType,
-};
+use crate::connect_ip::capsule::{AddressAssignCapsule, AssignedAddress, Capsule};
 use crate::net::{UdpPacket, tun};
 use crate::proxy::MAX_DATAGRAM_SIZE;
 
@@ -67,14 +66,11 @@ impl ClientConnection {
         let (mut tx_quic_to_tun, rx_quic_to_tun) = mpsc::channel::<Vec<u8>>(1000);
         let (tx_tun_to_quic, mut rx_tun_to_quic) = mpsc::channel::<Vec<u8>>(1000);
         let mut tun = tun::Tun::new(&tun_name, tx_tun_to_quic, 1350)?;
-        tun.addresses.push(tun::AddressRange {
-            base: IpAddr::V4(tun_ip),
-            prefix_len: 24,
-        });
-        tun.addresses.push(tun::AddressRange {
-            base: IpAddr::V4("10.248.2.128".parse().unwrap()),
-            prefix_len: 25,
-        });
+        tun.addresses
+            .push(IpNet::from(Ipv4Net::new(tun_ip, 24).unwrap()));
+        tun.addresses.push(IpNet::from(
+            Ipv4Net::new("10.248.2.128".parse().unwrap(), 25).unwrap(),
+        ));
         tun.start(rx_quic_to_tun, cancel_token.clone()).await?;
 
         let mut buf = [0; MAX_DATAGRAM_SIZE];
@@ -371,40 +367,36 @@ impl ClientConnection {
         // parse capsule data here
         let mut octets = Octets::with_slice(data);
         let capsule = Capsule::parse(&mut octets)?;
-        match capsule.capsule_type {
-            CapsuleType::AddressAssign => {
-                info!("received AddressAssign capsule: {:?}", capsule.payload);
+        match capsule {
+            Capsule::AddressAssign(assign_capsule) => {
+                info!(
+                    "received AddressAssign capsule: {:?}",
+                    assign_capsule.addresses
+                );
                 // probably site to site tunnel. Need to add to address list.
             }
-            CapsuleType::AddressRequest => {
-                info!("received AddressRequest capsule: {:?}", capsule.payload);
-                // parse and handle address request
-                let payload_octets = &mut Octets::with_slice(&capsule.payload);
-                let request_capsule = AddressRequestCapsule::parse(payload_octets)?;
+            Capsule::AddressRequest(request_capsule) => {
+                info!(
+                    "received AddressRequest capsule: {:?}",
+                    request_capsule.addresses
+                );
+
                 let mut assigned_addresses = vec![];
                 for addr in request_capsule.addresses {
                     // TODO: properly assign addresses
                     let assigned_addr = AssignedAddress {
                         request_id: addr.request_id,
-                        address: IpAddr::V4(Ipv4Addr::new(10, 248, 2, 180)),
-                        prefix_len: 24,
+                        ip_net: IpNet::new(IpAddr::V4(Ipv4Addr::new(10, 248, 2, 180)), 24).unwrap(),
                     };
-                    info!("requested address: {:?}", addr.address);
+                    info!("requested address: {:?}", addr.ip_net);
                     assigned_addresses.push(assigned_addr);
                 }
 
-                let addr_req = AddressAssignCapsule {
+                let address_assign_capsule = AddressAssignCapsule {
                     addresses: assigned_addresses,
                 };
+                let capsule = Capsule::AddressAssign(address_assign_capsule);
                 let mut buf = vec![0u8; 1000];
-                let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
-                addr_req.append(&mut octets_mut).unwrap();
-                let payload_len = octets_mut.off();
-                let capsule = Capsule {
-                    capsule_type: CapsuleType::AddressAssign,
-                    payload: buf[..payload_len].to_vec(),
-                };
-                let mut buf = vec![0u8; 100];
                 let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
                 capsule.append(&mut octets_mut).unwrap();
                 let payload_len = octets_mut.off();
@@ -414,8 +406,11 @@ impl ClientConnection {
                     .send_body(&mut self.conn, stream_id, &buf[..payload_len], false)
                     .unwrap();
             }
-            CapsuleType::RouteAdvertisement => {
-                info!("received RouteAdvertisement capsule: {:?}", capsule.payload);
+            Capsule::RouteAdvertisement(route_capsule) => {
+                info!(
+                    "received RouteAdvertisement capsule: {:?}",
+                    route_capsule.routes
+                );
             }
         }
 

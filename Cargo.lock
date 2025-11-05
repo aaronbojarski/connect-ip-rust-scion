@@ -257,6 +257,7 @@ dependencies = [
  "h3",
  "h3-quinn",
  "http",
+ "ipnet",
  "octets",
  "pnet",
  "pnet_datalink",

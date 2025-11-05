@@ -1,19 +1,16 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 
 use anyhow::{Result, anyhow};
+use ipnet::IpNet;
 use octets::Octets;
+use quiche::h3::NameValue;
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace};
 use url::Url;
 
-use quiche::h3::NameValue;
-
-use crate::connect_ip::capsule::{
-    AddressAssignCapsule, AddressRequestCapsule, Capsule, CapsuleType, RequestedAddress,
-};
-use crate::net::tun::AddressRange;
+use crate::connect_ip::capsule::{AddressRequestCapsule, Capsule, RequestedAddress};
 use crate::net::{UdpPacket, tun};
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
@@ -111,8 +108,8 @@ struct CapsuleProtocolState {
     stream_id: u64,
     address_requested: bool,
     tunnel_established: bool,
-    addresses: Vec<AddressRange>,
-    routes: Vec<IpAddr>,
+    addresses: Vec<IpNet>,
+    routes: Vec<IpNet>,
     updated: bool,
 }
 
@@ -472,18 +469,10 @@ impl Connection {
         let addr_req = AddressRequestCapsule {
             addresses: vec![RequestedAddress {
                 request_id: 1,
-                address: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
-                prefix_len: 32,
+                ip_net: IpNet::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 32).unwrap(),
             }],
         };
-        let mut buf = vec![0u8; 1000];
-        let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
-        addr_req.append(&mut octets_mut).unwrap();
-        let payload_len = octets_mut.off();
-        let capsule = Capsule {
-            capsule_type: CapsuleType::AddressRequest,
-            payload: buf[..payload_len].to_vec(),
-        };
+        let capsule = Capsule::AddressRequest(addr_req);
         let mut buf = vec![0u8; 100];
         let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
         capsule.append(&mut octets_mut).unwrap();
@@ -516,26 +505,25 @@ impl Connection {
         // parse capsule data here
         let mut octets = Octets::with_slice(data);
         let capsule = Capsule::parse(&mut octets)?;
-        match capsule.capsule_type {
-            CapsuleType::AddressAssign => {
-                info!("received AddressAssign capsule: {:?}", capsule.payload);
+        match capsule {
+            Capsule::AddressAssign(assign_capsule) => {
+                info!("received AddressAssign capsule: {:?}", assign_capsule);
                 self.capsule_state.addresses.clear();
                 self.capsule_state.updated = true;
-                let payload_octets = &mut Octets::with_slice(&capsule.payload);
-                let assign_capsule = AddressAssignCapsule::parse(payload_octets)?;
+
                 for addr in assign_capsule.addresses {
-                    self.capsule_state.addresses.push(AddressRange {
-                        base: addr.address,
-                        prefix_len: addr.prefix_len,
-                    });
+                    self.capsule_state.addresses.push(addr.ip_net);
                 }
                 self.capsule_state.tunnel_established = true;
             }
-            CapsuleType::AddressRequest => {
-                info!("received AddressRequest capsule: {:?}", capsule.payload);
+            Capsule::AddressRequest(addr_req_capsule) => {
+                info!("received AddressRequest capsule: {:?}", addr_req_capsule);
             }
-            CapsuleType::RouteAdvertisement => {
-                info!("received RouteAdvertisement capsule: {:?}", capsule.payload);
+            Capsule::RouteAdvertisement(route_advertisement_capsule) => {
+                info!(
+                    "received RouteAdvertisement capsule: {:?}",
+                    route_advertisement_capsule
+                );
             }
         }
 

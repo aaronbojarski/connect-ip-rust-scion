@@ -1,6 +1,7 @@
 use std::net::IpAddr;
 
 use anyhow::{Result, anyhow};
+use ipnet::IpNet;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -8,18 +9,12 @@ use tracing::{error, info, info_span, trace};
 use tracing_futures::Instrument as _;
 use tun_rs::DeviceBuilder;
 
-#[derive(Debug, Clone)]
-pub struct AddressRange {
-    pub base: IpAddr,
-    pub prefix_len: u8,
-}
-
 pub struct Tun {
     pub name: String,
     pub tx_tun_to_quic: Sender<Vec<u8>>,
     pub handle: Option<JoinHandle<()>>,
     pub mtu: u16,
-    pub addresses: Vec<AddressRange>,
+    pub addresses: Vec<IpNet>,
 }
 
 impl Tun {
@@ -44,12 +39,12 @@ impl Tun {
             .build_async()?;
 
         for addr in &self.addresses {
-            match addr.base {
-                IpAddr::V4(_) => {
-                    dev.add_address_v4(addr.base, addr.prefix_len)?;
+            match addr.addr() {
+                IpAddr::V4(address) => {
+                    dev.add_address_v4(address, addr.prefix_len())?;
                 }
-                IpAddr::V6(_) => {
-                    dev.add_address_v6(addr.base, addr.prefix_len)?;
+                IpAddr::V6(address) => {
+                    dev.add_address_v6(address, addr.prefix_len())?;
                 }
             }
         }

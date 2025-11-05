@@ -1,19 +1,23 @@
 use std::net::IpAddr;
 
 use anyhow::Error;
+use ipnet::IpNet;
+
+use crate::net::ip_range_to_net;
 
 // Capsule types
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum CapsuleType {
     AddressAssign = 0x01,
     AddressRequest = 0x02,
     RouteAdvertisement = 0x03,
 }
 
-#[derive(Clone)]
-pub struct Capsule {
-    pub capsule_type: CapsuleType,
-    pub payload: Vec<u8>,
+#[derive(Clone, Debug)]
+pub enum Capsule {
+    AddressAssign(AddressAssignCapsule),
+    AddressRequest(AddressRequestCapsule),
+    RouteAdvertisement(RouteAdvertisementCapsule),
 }
 
 impl Capsule {
@@ -27,27 +31,57 @@ impl Capsule {
             _ => return Err(anyhow::anyhow!("Unknown capsule type")),
         };
 
-        let payload = octets.get_bytes_with_varint_length()?.to_vec();
+        let length = octets.get_varint()?;
+        let payload_bytes = octets.get_bytes(length as usize)?;
+        let mut payload_octets = octets::Octets::with_slice(payload_bytes.buf());
 
-        Ok(Capsule {
-            capsule_type,
-            payload,
-        })
+        let capsule = match capsule_type {
+            CapsuleType::AddressAssign => {
+                let addr_capsule = AddressAssignCapsule::parse(&mut payload_octets)?;
+                Capsule::AddressAssign(addr_capsule)
+            }
+            CapsuleType::AddressRequest => {
+                let addr_capsule = AddressRequestCapsule::parse(&mut payload_octets)?;
+                Capsule::AddressRequest(addr_capsule)
+            }
+            CapsuleType::RouteAdvertisement => {
+                let addr_capsule = RouteAdvertisementCapsule::parse(&mut payload_octets)?;
+                Capsule::RouteAdvertisement(addr_capsule)
+            }
+        };
+
+        Ok(capsule)
     }
 
     pub fn append(&self, octets: &mut octets::OctetsMut) -> Result<(), Error> {
-        octets.put_varint(self.capsule_type.clone() as u64)?;
-        octets.put_varint(self.payload.len() as u64)?;
-        octets.put_bytes(&self.payload)?;
+        match self {
+            Capsule::AddressAssign(capsule) => {
+                octets.put_varint(CapsuleType::AddressAssign as u64)?;
+                let len = capsule.len();
+                octets.put_varint(len as u64)?;
+                capsule.append(octets)?;
+            }
+            Capsule::AddressRequest(capsule) => {
+                octets.put_varint(CapsuleType::AddressRequest as u64)?;
+                let len = capsule.len();
+                octets.put_varint(len as u64)?;
+                capsule.append(octets)?;
+            }
+            Capsule::RouteAdvertisement(capsule) => {
+                octets.put_varint(CapsuleType::RouteAdvertisement as u64)?;
+                let len = capsule.len();
+                octets.put_varint(len as u64)?;
+                capsule.append(octets)?;
+            }
+        }
         Ok(())
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AssignedAddress {
     pub request_id: u64,
-    pub address: IpAddr,
-    pub prefix_len: u8,
+    pub ip_net: IpNet,
 }
 
 impl AssignedAddress {
@@ -70,17 +104,15 @@ impl AssignedAddress {
 
         let prefix_len = octets.get_u8()?;
 
-        Ok(AssignedAddress {
-            request_id,
-            address,
-            prefix_len,
-        })
+        let ip_net = IpNet::new(address, prefix_len)?;
+
+        Ok(AssignedAddress { request_id, ip_net })
     }
 
     pub fn append(&self, octets: &mut octets::OctetsMut) -> Result<(), Error> {
         octets.put_varint(self.request_id)?;
 
-        match self.address {
+        match self.ip_net.addr() {
             IpAddr::V4(addr) => {
                 octets.put_u8(4)?;
                 octets.put_bytes(&addr.octets())?;
@@ -91,12 +123,20 @@ impl AssignedAddress {
             }
         }
 
-        octets.put_u8(self.prefix_len)?;
+        octets.put_u8(self.ip_net.prefix_len())?;
         Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        let addr_len = match self.ip_net.addr() {
+            IpAddr::V4(_) => 4,
+            IpAddr::V6(_) => 16,
+        };
+        1 + addr_len + 1 + octets::varint_len(self.request_id)
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AddressAssignCapsule {
     pub addresses: Vec<AssignedAddress>,
 }
@@ -121,13 +161,16 @@ impl AddressAssignCapsule {
         }
         Ok(())
     }
+
+    pub fn len(&self) -> usize {
+        self.addresses.iter().map(|addr| addr.len()).sum()
+    }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RequestedAddress {
     pub request_id: u64,
-    pub address: IpAddr,
-    pub prefix_len: u8,
+    pub ip_net: IpNet,
 }
 
 impl RequestedAddress {
@@ -150,17 +193,15 @@ impl RequestedAddress {
 
         let prefix_len = octets.get_u8()?;
 
-        Ok(RequestedAddress {
-            request_id,
-            address,
-            prefix_len,
-        })
+        let ip_net = IpNet::new(address, prefix_len)?;
+
+        Ok(RequestedAddress { request_id, ip_net })
     }
 
     pub fn append(&self, octets: &mut octets::OctetsMut) -> Result<(), Error> {
         octets.put_varint(self.request_id)?;
 
-        match self.address {
+        match self.ip_net.addr() {
             IpAddr::V4(addr) => {
                 octets.put_u8(4)?;
                 octets.put_bytes(&addr.octets())?;
@@ -171,12 +212,20 @@ impl RequestedAddress {
             }
         }
 
-        octets.put_u8(self.prefix_len)?;
+        octets.put_u8(self.ip_net.prefix_len())?;
         Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        let addr_len = match self.ip_net.addr() {
+            IpAddr::V4(_) => 4,
+            IpAddr::V6(_) => 16,
+        };
+        1 + addr_len + 1 + octets::varint_len(self.request_id)
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AddressRequestCapsule {
     pub addresses: Vec<RequestedAddress>,
 }
@@ -197,12 +246,15 @@ impl AddressRequestCapsule {
         }
         Ok(())
     }
+
+    pub fn len(&self) -> usize {
+        self.addresses.iter().map(|addr| addr.len()).sum()
+    }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RouteAdvertisement {
-    pub start: IpAddr,
-    pub end: IpAddr,
+    pub ip_net: IpNet,
     pub proto: u8,
 }
 
@@ -234,11 +286,15 @@ impl RouteAdvertisement {
 
         let proto = octets.get_u8()?;
 
-        Ok(RouteAdvertisement { start, end, proto })
+        let ip_net = ip_range_to_net(start, end)?;
+
+        Ok(RouteAdvertisement { ip_net, proto })
     }
 
     pub fn append(&self, octets: &mut octets::OctetsMut) -> Result<(), Error> {
-        match (self.start, self.end) {
+        let start = self.ip_net.network();
+        let end = self.ip_net.broadcast();
+        match (start, end) {
             (IpAddr::V4(start_addr), IpAddr::V4(end_addr)) => {
                 octets.put_u8(4)?;
                 octets.put_bytes(&start_addr.octets())?;
@@ -259,9 +315,17 @@ impl RouteAdvertisement {
         octets.put_u8(self.proto)?;
         Ok(())
     }
+
+    pub fn len(&self) -> usize {
+        let addr_len = match self.ip_net.addr() {
+            IpAddr::V4(_) => 4,
+            IpAddr::V6(_) => 16,
+        };
+        1 + addr_len * 2 + 1
+    }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RouteAdvertisementCapsule {
     pub routes: Vec<RouteAdvertisement>,
 }
@@ -282,6 +346,10 @@ impl RouteAdvertisementCapsule {
         }
         Ok(())
     }
+
+    pub fn len(&self) -> usize {
+        self.routes.iter().map(|route| route.len()).sum()
+    }
 }
 
 // test parsing and writing of capsules
@@ -294,13 +362,12 @@ mod tests {
         let addresses = vec![
             AssignedAddress {
                 request_id: 1,
-                address: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
-                prefix_len: 24,
+                ip_net: IpNet::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 24).unwrap(),
             },
             AssignedAddress {
                 request_id: 2,
-                address: IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
-                prefix_len: 64,
+                ip_net: IpNet::new(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)), 64)
+                    .unwrap(),
             },
         ];
         let capsule = AddressAssignCapsule::new(addresses.clone());
@@ -314,8 +381,7 @@ mod tests {
         assert_eq!(parsed_capsule.addresses.len(), addresses.len());
         for (parsed, original) in parsed_capsule.addresses.iter().zip(addresses.iter()) {
             assert_eq!(parsed.request_id, original.request_id);
-            assert_eq!(parsed.address, original.address);
-            assert_eq!(parsed.prefix_len, original.prefix_len);
+            assert_eq!(parsed.ip_net, original.ip_net);
         }
     }
 
@@ -324,13 +390,15 @@ mod tests {
         let addresses = vec![
             RequestedAddress {
                 request_id: 1,
-                address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-                prefix_len: 16,
+                ip_net: IpNet::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 16).unwrap(),
             },
             RequestedAddress {
                 request_id: 2,
-                address: IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
-                prefix_len: 48,
+                ip_net: IpNet::new(
+                    IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+                    48,
+                )
+                .unwrap(),
             },
         ];
         let capsule = AddressRequestCapsule {
@@ -346,8 +414,7 @@ mod tests {
         assert_eq!(parsed_capsule.addresses.len(), addresses.len());
         for (parsed, original) in parsed_capsule.addresses.iter().zip(addresses.iter()) {
             assert_eq!(parsed.request_id, original.request_id);
-            assert_eq!(parsed.address, original.address);
-            assert_eq!(parsed.prefix_len, original.prefix_len);
+            assert_eq!(parsed.ip_net, original.ip_net);
         }
     }
 
@@ -355,13 +422,15 @@ mod tests {
     fn test_route_advertisement_capsule() {
         let routes = vec![
             RouteAdvertisement {
-                start: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 0)),
-                end: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 255)),
+                ip_net: IpNet::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 0)), 24).unwrap(),
                 proto: 17,
             },
             RouteAdvertisement {
-                start: IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0)),
-                end: IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 255)),
+                ip_net: IpNet::new(
+                    IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0)),
+                    48,
+                )
+                .unwrap(),
                 proto: 6,
             },
         ];
@@ -377,28 +446,36 @@ mod tests {
         let parsed_capsule = RouteAdvertisementCapsule::parse(&mut octets).unwrap();
         assert_eq!(parsed_capsule.routes.len(), routes.len());
         for (parsed, original) in parsed_capsule.routes.iter().zip(routes.iter()) {
-            assert_eq!(parsed.start, original.start);
-            assert_eq!(parsed.end, original.end);
+            assert_eq!(parsed.ip_net, original.ip_net);
             assert_eq!(parsed.proto, original.proto);
         }
     }
 
     #[test]
     fn test_capsule_parsing_and_writing() {
-        let capsule = Capsule {
-            capsule_type: CapsuleType::AddressAssign,
-            payload: vec![1, 2, 3, 4, 5],
-        };
+        let capsule = Capsule::AddressAssign(AddressAssignCapsule {
+            addresses: vec![AssignedAddress {
+                request_id: 42,
+                ip_net: IpNet::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 24).unwrap(),
+            }],
+        });
+
         let mut buf = vec![0u8; 100];
         let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
         capsule.append(&mut octets_mut).unwrap();
         let written = octets_mut.off();
         let mut octets = octets::Octets::with_slice(&buf[..written]);
         let parsed_capsule = Capsule::parse(&mut octets).unwrap();
-        assert_eq!(
-            parsed_capsule.capsule_type as u8,
-            capsule.capsule_type as u8
-        );
-        assert_eq!(parsed_capsule.payload, capsule.payload);
+
+        match parsed_capsule {
+            Capsule::AddressAssign(assign_capsule) => {
+                assert_eq!(assign_capsule.addresses.len(), 1);
+                let addr = &assign_capsule.addresses[0];
+                assert_eq!(addr.request_id, 42);
+                assert_eq!(addr.ip_net.addr(), IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
+                assert_eq!(addr.ip_net.prefix_len(), 24);
+            }
+            _ => panic!("Expected AddressAssign capsule"),
+        }
     }
 }
