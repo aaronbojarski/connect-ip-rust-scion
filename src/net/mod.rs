@@ -17,12 +17,7 @@ pub fn ip_range_to_net(start: IpAddr, end: IpAddr) -> Result<IpNet, Error> {
             let end_u32 = u32::from(end_v4);
 
             let diff = end_u32.wrapping_sub(start_u32);
-
-            let prefix_len = if diff == 0 {
-                32
-            } else {
-                32 - (diff + 1).leading_zeros() as u8
-            };
+            let prefix_len = diff.leading_zeros() as u8;
 
             IpNet::new(start, prefix_len).map_err(|e| anyhow::anyhow!("Invalid IP network: {}", e))
         }
@@ -31,12 +26,7 @@ pub fn ip_range_to_net(start: IpAddr, end: IpAddr) -> Result<IpNet, Error> {
             let end_u128 = u128::from(end_v6);
 
             let diff = end_u128.wrapping_sub(start_u128);
-
-            let prefix_len = if diff == 0 {
-                128
-            } else {
-                128 - (diff + 1).leading_zeros() as u8
-            };
+            let prefix_len = diff.leading_zeros() as u8;
 
             IpNet::new(start, prefix_len).map_err(|e| anyhow::anyhow!("Invalid IP network: {}", e))
         }
