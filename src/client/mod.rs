@@ -103,15 +103,20 @@ pub async fn run(url: Url, bind: SocketAddr) -> Result<()> {
     result
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum CapsuleProtocolStatus {
+    Initialized,
+    RequestSent,
+    StreamEstablished,
+    AddressRequested,
+    TunnelEstablished,
+}
+
 struct CapsuleProtocolState {
-    request_sent: bool,
-    stream_established: bool,
+    status: CapsuleProtocolStatus,
     stream_id: u64,
-    address_requested: bool,
-    tunnel_established: bool,
     addresses: Vec<IpNet>,
     routes: Vec<IpNet>,
-    updated: bool,
 }
 
 struct Connection {
@@ -151,14 +156,10 @@ impl Connection {
             rx_udp_to_quic,
             tx_quic_to_udp,
             capsule_state: CapsuleProtocolState {
-                request_sent: false,
                 stream_id: 0,
-                stream_established: false,
-                address_requested: false,
-                tunnel_established: false,
+                status: CapsuleProtocolStatus::Initialized,
                 addresses: Vec::new(),
                 routes: Vec::new(),
-                updated: false,
             },
         })
     }
@@ -295,10 +296,10 @@ impl Connection {
             // Send HTTP requests once the QUIC connection is established, and until
             // all requests have been sent.
             if let Some(h3_conn) = &mut self.h3_conn {
-                if !self.capsule_state.request_sent {
+                if self.capsule_state.status == CapsuleProtocolStatus::Initialized {
                     info!("sending HTTP request {req:?}");
                     h3_conn.send_request(&mut self.conn, &req, false).unwrap();
-                    self.capsule_state.request_sent = true;
+                    self.capsule_state.status = CapsuleProtocolStatus::RequestSent;
                 }
             }
 
@@ -313,9 +314,11 @@ impl Connection {
                                 hdrs_to_strings(&list),
                                 stream_id
                             );
+                            // TODO: Drop connection if another stream already exists
                             if Self::check_response(&list) {
                                 self.capsule_state.stream_id = stream_id;
-                                self.capsule_state.stream_established = true;
+                                self.capsule_state.status =
+                                    CapsuleProtocolStatus::StreamEstablished;
                             } else {
                                 error!("unexpected response from server, closing connection");
                                 self.conn
@@ -379,17 +382,16 @@ impl Connection {
                 }
             }
 
-            if self.capsule_state.stream_established {
-                // Send initial capsules if not already sent
-                if !self.capsule_state.address_requested {
-                    self.send_initial_capsules()?;
-                    info!("sent initial capsules to establish tunnel");
-                    self.capsule_state.address_requested = true;
-                }
+            if self.capsule_state.status == CapsuleProtocolStatus::StreamEstablished {
+                self.send_initial_capsules()?;
+                info!("sent initial capsules to establish tunnel");
+                self.capsule_state.status = CapsuleProtocolStatus::AddressRequested;
             }
 
             // Check if connection is established
-            if self.conn.is_established() && self.capsule_state.tunnel_established {
+            if self.conn.is_established()
+                && self.capsule_state.status == CapsuleProtocolStatus::TunnelEstablished
+            {
                 // Receive datagrams from QUIC and forward to TUN
                 while let Ok(len) = self.conn.dgram_recv(&mut buf) {
                     trace!("received {} bytes from QUIC datagram", len);
@@ -516,7 +518,6 @@ impl Connection {
                         .await?;
                 }
                 self.capsule_state.addresses.clear();
-                self.capsule_state.updated = true;
 
                 // Add new addresses
                 for addr in assign_capsule.addresses {
@@ -525,7 +526,7 @@ impl Connection {
                         .await?;
                     self.capsule_state.addresses.push(addr.ip_net);
                 }
-                self.capsule_state.tunnel_established = true;
+                self.capsule_state.status = CapsuleProtocolStatus::TunnelEstablished;
             }
             Capsule::AddressRequest(addr_req_capsule) => {
                 info!("received AddressRequest capsule: {:?}", addr_req_capsule);
