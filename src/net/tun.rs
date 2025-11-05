@@ -9,12 +9,16 @@ use tracing::{error, info, info_span, trace};
 use tracing_futures::Instrument as _;
 use tun_rs::DeviceBuilder;
 
+pub enum AddressUpdate {
+    Add(IpNet),
+    Remove(IpNet),
+}
+
 pub struct Tun {
     pub name: String,
     pub tx_tun_to_quic: Sender<Vec<u8>>,
     pub handle: Option<JoinHandle<()>>,
     pub mtu: u16,
-    pub addresses: Vec<IpNet>,
 }
 
 impl Tun {
@@ -24,30 +28,19 @@ impl Tun {
             tx_tun_to_quic,
             handle: None,
             mtu,
-            addresses: Vec::new(),
         })
     }
 
     pub async fn start(
         &mut self,
         mut rx_in_tun: Receiver<Vec<u8>>,
+        mut rx_address_updates: Receiver<AddressUpdate>,
         cancel_token: CancellationToken,
     ) -> Result<()> {
         let dev = DeviceBuilder::new()
             .name(self.name.clone())
             .mtu(self.mtu)
             .build_async()?;
-
-        for addr in &self.addresses {
-            match addr.addr() {
-                IpAddr::V4(address) => {
-                    dev.add_address_v4(address, addr.prefix_len())?;
-                }
-                IpAddr::V6(address) => {
-                    dev.add_address_v6(address, addr.prefix_len())?;
-                }
-            }
-        }
 
         let name = self.name.clone();
         let tx_tun_to_quic = self.tx_tun_to_quic.clone();
@@ -62,6 +55,27 @@ impl Tun {
                             _ = cancel_token.cancelled() => {
                                 info!("TUN device {} received shutdown signal", name);
                                 break;
+                            }
+
+                            // Handle address updates
+                            Some(update) = rx_address_updates.recv() => {
+                                match update {
+                                    AddressUpdate::Add(ipnet) => {
+                                        match ipnet.addr() {
+                                            IpAddr::V4(address) => {
+                                                dev.add_address_v4(address, ipnet.prefix_len())?;
+                                            }
+                                            IpAddr::V6(address) => {
+                                                dev.add_address_v6(address, ipnet.prefix_len())?;
+                                            }
+                                        }
+                                        info!("Added address {} to TUN device {}", ipnet, name);
+                                    }
+                                    AddressUpdate::Remove(ipnet) => {
+                                        dev.remove_address(ipnet.addr())?;
+                                        info!("Removed address {} from TUN device {}", ipnet, name);
+                                    }
+                                }
                             }
 
                             // Read from TUN device and send to main task

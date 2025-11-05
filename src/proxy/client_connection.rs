@@ -9,7 +9,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace};
 
-use crate::connect_ip::capsule::{AddressAssignCapsule, AssignedAddress, Capsule};
+use crate::connect_ip::capsule::{
+    AddressAssignCapsule, AssignedAddress, Capsule, RouteAdvertisement, RouteAdvertisementCapsule,
+};
 use crate::net::{UdpPacket, tun};
 use crate::proxy::MAX_DATAGRAM_SIZE;
 
@@ -66,12 +68,20 @@ impl ClientConnection {
         let (mut tx_quic_to_tun, rx_quic_to_tun) = mpsc::channel::<Vec<u8>>(1000);
         let (tx_tun_to_quic, mut rx_tun_to_quic) = mpsc::channel::<Vec<u8>>(1000);
         let mut tun = tun::Tun::new(&tun_name, tx_tun_to_quic, 1350)?;
-        tun.addresses
-            .push(IpNet::from(Ipv4Net::new(tun_ip, 24).unwrap()));
-        tun.addresses.push(IpNet::from(
-            Ipv4Net::new("10.248.2.128".parse().unwrap(), 25).unwrap(),
-        ));
-        tun.start(rx_quic_to_tun, cancel_token.clone()).await?;
+
+        let (tx_address_updates, rx_address_updates) = mpsc::channel::<tun::AddressUpdate>(100);
+        tun.start(rx_quic_to_tun, rx_address_updates, cancel_token.clone())
+            .await?;
+        tx_address_updates
+            .send(tun::AddressUpdate::Add(IpNet::from(
+                Ipv4Net::new(tun_ip, 24).unwrap(),
+            )))
+            .await?;
+        tx_address_updates
+            .send(tun::AddressUpdate::Add(IpNet::from(
+                Ipv4Net::new("10.248.2.128".parse().unwrap(), 25).unwrap(),
+            )))
+            .await?;
 
         let mut buf = [0; MAX_DATAGRAM_SIZE];
         let mut keepalive_interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -386,7 +396,7 @@ impl ClientConnection {
                     // TODO: properly assign addresses
                     let assigned_addr = AssignedAddress {
                         request_id: addr.request_id,
-                        ip_net: IpNet::new(IpAddr::V4(Ipv4Addr::new(10, 248, 2, 180)), 24).unwrap(),
+                        ip_net: IpNet::new(IpAddr::V4(Ipv4Addr::new(10, 248, 2, 180)), 32).unwrap(),
                     };
                     info!("requested address: {:?}", addr.ip_net);
                     assigned_addresses.push(assigned_addr);
@@ -399,6 +409,16 @@ impl ClientConnection {
                 let mut buf = vec![0u8; 1000];
                 let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
                 capsule.append(&mut octets_mut).unwrap();
+
+                let route_advertisement_capsule = RouteAdvertisementCapsule {
+                    routes: vec![RouteAdvertisement {
+                        ip_net: IpNet::new(IpAddr::V4(Ipv4Addr::new(10, 248, 2, 0)), 24).unwrap(),
+                        proto: 0,
+                    }],
+                };
+                let capsule = Capsule::RouteAdvertisement(route_advertisement_capsule);
+                capsule.append(&mut octets_mut).unwrap();
+
                 let payload_len = octets_mut.off();
                 self.h3_conn
                     .as_mut()

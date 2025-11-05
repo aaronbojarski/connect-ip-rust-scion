@@ -1,4 +1,5 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::process::Command;
 
 use anyhow::{Result, anyhow};
 use ipnet::IpNet;
@@ -193,10 +194,13 @@ impl Connection {
         let mut buf = [0; MAX_DATAGRAM_SIZE];
 
         // Channels between TUN and QUIC tasks. Contents are IP packets.
-        let (mut tx_quic_to_tun, mut rx_quic_to_tun) = mpsc::channel::<Vec<u8>>(1000);
+        let (tx_quic_to_tun, rx_quic_to_tun) = mpsc::channel::<Vec<u8>>(1000);
         let (tx_tun_to_quic, mut rx_tun_to_quic) = mpsc::channel::<Vec<u8>>(1000);
 
         let mut tun = tun::Tun::new("tun0", tx_tun_to_quic.clone(), 1350)?;
+        let (tx_address_updates, rx_address_updates) = mpsc::channel::<tun::AddressUpdate>(100);
+        tun.start(rx_quic_to_tun, rx_address_updates, cancel_token.clone())
+            .await?;
 
         // Send initial packet
         let (write, send_info) = self.conn.send(&mut buf).expect("initial send failed");
@@ -332,9 +336,17 @@ impl Connection {
                                 &mut buf,
                             ) {
                                 trace!("got {read} bytes of response data on stream {stream_id}");
-                                let data = buf[..read].to_vec();
-                                // TODO: make sure all data is handled
-                                self.handle_capsule_data(stream_id, &data)?;
+
+                                let mut consumed = 0;
+                                while consumed < read {
+                                    consumed += self
+                                        .handle_capsule_data(
+                                            stream_id,
+                                            &buf[consumed..read].to_vec(),
+                                            tx_address_updates.clone(),
+                                        )
+                                        .await?;
+                                }
                             }
                         }
 
@@ -365,23 +377,6 @@ impl Connection {
                         }
                     }
                 }
-            }
-
-            // TODO: update tun state based on capsule protocol state
-            if self.capsule_state.updated {
-                tun.abort();
-                drop(tun);
-                drop(tx_quic_to_tun);
-                (tx_quic_to_tun, rx_quic_to_tun) = mpsc::channel::<Vec<u8>>(1000);
-                tun = tun::Tun::new("tun0", tx_tun_to_quic.clone(), 1350)?;
-
-                tun.addresses.clear();
-                for addr in &self.capsule_state.addresses {
-                    tun.addresses.push(addr.clone());
-                }
-                self.capsule_state.updated = false;
-                tun.start(rx_quic_to_tun, cancel_token.clone()).await?;
-                info!("TUN device updated with new addresses, {:?}", tun.addresses);
             }
 
             if self.capsule_state.stream_established {
@@ -486,7 +481,12 @@ impl Connection {
     }
 
     /// Handles incoming capsule data.
-    fn handle_capsule_data(&mut self, stream_id: u64, data: &[u8]) -> Result<usize> {
+    async fn handle_capsule_data(
+        &mut self,
+        stream_id: u64,
+        data: &[u8],
+        tx_address_updates: mpsc::Sender<tun::AddressUpdate>,
+    ) -> Result<usize> {
         info!(
             "{} got capsule data on stream id {}: {:?}",
             self.conn.trace_id(),
@@ -508,10 +508,21 @@ impl Connection {
         match capsule {
             Capsule::AddressAssign(assign_capsule) => {
                 info!("received AddressAssign capsule: {:?}", assign_capsule);
+
+                // Remove old addresses as they are no longer valid
+                for addr in self.capsule_state.addresses.iter() {
+                    tx_address_updates
+                        .send(tun::AddressUpdate::Remove(addr.clone()))
+                        .await?;
+                }
                 self.capsule_state.addresses.clear();
                 self.capsule_state.updated = true;
 
+                // Add new addresses
                 for addr in assign_capsule.addresses {
+                    tx_address_updates
+                        .send(tun::AddressUpdate::Add(addr.ip_net))
+                        .await?;
                     self.capsule_state.addresses.push(addr.ip_net);
                 }
                 self.capsule_state.tunnel_established = true;
@@ -524,6 +535,23 @@ impl Connection {
                     "received RouteAdvertisement capsule: {:?}",
                     route_advertisement_capsule
                 );
+                // remove old routes
+                for route in self.capsule_state.routes.iter() {
+                    let status = Command::new("ip")
+                        .args(&["route", "del", &route.to_string(), "dev", "tun0"])
+                        .status()?;
+                    info!("Removed route {} with status {:?}", route, status);
+                }
+                self.capsule_state.routes.clear();
+
+                // add new routes
+                for route in route_advertisement_capsule.routes {
+                    let status = Command::new("ip")
+                        .args(&["route", "add", &route.ip_net.to_string(), "dev", "tun0"])
+                        .status()?;
+                    info!("Added route {} with status {:?}", route.ip_net, status);
+                    self.capsule_state.routes.push(route.ip_net);
+                }
             }
         }
 
