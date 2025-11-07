@@ -1,17 +1,31 @@
 # connect-ip-rust-scion
 
-## Starting Test Network
-NOTE that currently all addresses and routes are hardcoded. This will need to be changed soon.
+## Building
+To build the project, use cargo.
+```bash
+cargo build --bin proxy --bin client
+```
 
+## Running tests
+To run the unit tests, use cargo test.
+```bash
+cargo test
+```
+
+## Running example in test network
 To start the test network, run the `testnet.sh` script.
-
 ```bash
 sudo bash ./testnet.sh up
 ```
 
+The proxy requires a valid certificate to run. A self-signed certificate can be generated using the following command.
+```bash
+openssl req -x509 -newkey rsa:4096 -keyout key.der -outform DER -out cert.der -outform DER -days 365 -nodes -subj "/CN=localhost"
+```
+
 Then start the server the corresponding namespace.
 ```bash
-sudo ip netns exec proxy_ns ./target/debug/server --listen 10.248.100.11:4433
+sudo ip netns exec proxy_ns ./target/debug/proxy --listen 10.248.100.11:4433
 ```
 
 Then start the client in another terminal.
@@ -34,3 +48,17 @@ It is also possible to ping from one endhost to the other.
 ```bash
 sudo ip netns exec eh0ns ping 10.248.2.1
 ```
+
+## TODO:
+- improve QUIC implementation
+    - check connection establishment
+    - add retry logic
+    - certificates
+    - access logic (authentication/authorization)
+- improve http3
+    - use correct quarter stream id for datagrams
+    - request on new stream
+    - add checks on IP packets (src/dst addresses)
+- scion integration
+    - switch socket
+    - translate addresses
