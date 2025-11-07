@@ -416,10 +416,7 @@ impl ClientConnection {
         let capsule = Capsule::parse(&mut octets)?;
         match capsule {
             Capsule::AddressAssign(assign_capsule) => {
-                info!(
-                    "received AddressAssign capsule: {:?}",
-                    assign_capsule.addresses
-                );
+                info!("received AddressAssign capsule: {:?}", assign_capsule);
                 // Remove old addresses as they are no longer valid
                 for addr in self.capsule_state.proxy_addresses.iter() {
                     tx_address_updates
@@ -437,10 +434,7 @@ impl ClientConnection {
                 }
             }
             Capsule::AddressRequest(request_capsule) => {
-                info!(
-                    "received AddressRequest capsule: {:?}",
-                    request_capsule.addresses
-                );
+                info!("received AddressRequest capsule: {:?}", request_capsule);
 
                 let mut assigned_addresses = self
                     .capsule_state
@@ -504,10 +498,7 @@ impl ClientConnection {
                     .unwrap();
             }
             Capsule::RouteAdvertisement(route_capsule) => {
-                info!(
-                    "received RouteAdvertisement capsule: {:?}",
-                    route_capsule.routes
-                );
+                info!("received RouteAdvertisement capsule: {:?}", route_capsule);
                 // TODO: add some validation here
 
                 // remove old routes
