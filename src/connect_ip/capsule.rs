@@ -1,9 +1,12 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use anyhow::Error;
 use ipnet::IpNet;
 
 use crate::net::ip_range_to_net;
+
+pub const CAPSULE_PROTOCOL_EMPTY_ADDRESS: IpNet =
+    IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 32);
 
 // Capsule types
 #[derive(Clone, Debug)]

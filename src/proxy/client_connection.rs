@@ -4,16 +4,19 @@ use octets::Octets;
 use pnet::packet::ipv4::Ipv4Packet;
 use quiche::h3::NameValue;
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::process::Command;
-use tokio::sync::mpsc;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::connect_ip::capsule::{
-    AddressAssignCapsule, AssignedAddress, Capsule, RouteAdvertisement, RouteAdvertisementCapsule,
+    AddressAssignCapsule, AssignedAddress, CAPSULE_PROTOCOL_EMPTY_ADDRESS, Capsule,
+    RouteAdvertisement, RouteAdvertisementCapsule,
 };
-use crate::net::{UdpPacket, tun};
+use crate::net::{
+    UdpPacket, add_route, get_next_avail_subnet, get_specific_subnet, remove_route, tun,
+};
 use crate::proxy::MAX_DATAGRAM_SIZE;
 
 struct PartialResponse {
@@ -41,6 +44,7 @@ pub struct ClientConnection {
     pub rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
     pub tx_quic_to_udp: mpsc::Sender<UdpPacket>,
     pub tun_name: String,
+    available_addresses: Arc<Mutex<Vec<IpNet>>>,
     partial_responses: HashMap<u64, PartialResponse>,
     assign_addresses_and_routes_done: bool,
     capsule_state: CapsuleProtocolState,
@@ -54,7 +58,8 @@ impl ClientConnection {
         rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
         tx_quic_to_udp: mpsc::Sender<UdpPacket>,
         tun_name: String,
-        client_ip: Ipv4Addr,
+        available_addresses: Arc<Mutex<Vec<IpNet>>>,
+        routes: Vec<IpNet>,
     ) -> Self {
         ClientConnection {
             conn,
@@ -64,15 +69,14 @@ impl ClientConnection {
             rx_udp_to_quic,
             tx_quic_to_udp,
             tun_name,
+            available_addresses,
             partial_responses: HashMap::new(),
             assign_addresses_and_routes_done: false,
             capsule_state: CapsuleProtocolState {
                 stream_id: None,
-                client_addresses: vec![IpNet::new(IpAddr::V4(client_ip), 32).unwrap()],
+                client_addresses: vec![],
                 proxy_addresses: vec![],
-                proxy_routes: vec![
-                    IpNet::new(IpAddr::V4(Ipv4Addr::new(10, 248, 2, 0)), 24).unwrap(),
-                ],
+                proxy_routes: routes,
                 client_routes: vec![],
             },
         }
@@ -438,18 +442,52 @@ impl ClientConnection {
                     request_capsule.addresses
                 );
 
-                let mut assigned_addresses = vec![];
+                let mut assigned_addresses = self
+                    .capsule_state
+                    .client_addresses
+                    .clone()
+                    .into_iter()
+                    .map(|ip_net| AssignedAddress {
+                        request_id: 0,
+                        ip_net,
+                    })
+                    .collect::<Vec<AssignedAddress>>();
                 for addr in request_capsule.addresses {
-                    // TODO: properly assign addresses and add the routes to the TUN interface
-                    // TODO: if requested IP can not be granted, notify by returning 0.0.0.0/32
-                    // TODO: send addresses that are not requested but have been assigned previously (in case that makes sense)
-                    let assigned_addr = AssignedAddress {
-                        request_id: addr.request_id,
-                        ip_net: IpNet::new(IpAddr::V4(Ipv4Addr::new(10, 248, 2, 180)), 32).unwrap(),
+                    let assigned_net = if addr.ip_net == CAPSULE_PROTOCOL_EMPTY_ADDRESS {
+                        get_next_avail_subnet(&mut self.available_addresses, 32).await
+                    } else {
+                        get_specific_subnet(&mut self.available_addresses, addr.ip_net).await
                     };
-                    info!("requested address: {:?}", addr.ip_net);
-                    assigned_addresses.push(assigned_addr);
+                    if let Some(assigned_subnet) = assigned_net {
+                        info!("assigning requested address to client: {}", assigned_subnet);
+                        let assigned_address = AssignedAddress {
+                            request_id: addr.request_id,
+                            ip_net: assigned_subnet.clone(),
+                        };
+                        assigned_addresses.push(assigned_address);
+
+                        if let Err(e) = add_route(&assigned_subnet, self.tun_name.clone()) {
+                            error!(
+                                "failed to add route {} to dev {}: {}",
+                                assigned_subnet, self.tun_name, e
+                            );
+                            continue;
+                        }
+                        info!("Added route {} to dev {}", assigned_subnet, self.tun_name);
+                        self.capsule_state.client_addresses.push(assigned_subnet);
+                    } else {
+                        assigned_addresses.push(AssignedAddress {
+                            request_id: addr.request_id,
+                            ip_net: CAPSULE_PROTOCOL_EMPTY_ADDRESS,
+                        });
+                        warn!("requested address {} not available", addr.ip_net);
+                    }
                 }
+
+                info!(
+                    "sending AddressAssign capsule with addresses: {:?}",
+                    assigned_addresses
+                );
 
                 let address_assign_capsule = AddressAssignCapsule {
                     addresses: assigned_addresses,
@@ -458,6 +496,12 @@ impl ClientConnection {
                 let mut buf = vec![0u8; 1000];
                 let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
                 capsule.append(&mut octets_mut).unwrap();
+                let payload_len = octets_mut.off();
+                self.h3_conn
+                    .as_mut()
+                    .unwrap()
+                    .send_body(&mut self.conn, stream_id, &buf[..payload_len], false)
+                    .unwrap();
             }
             Capsule::RouteAdvertisement(route_capsule) => {
                 info!(
@@ -467,28 +511,28 @@ impl ClientConnection {
                 // TODO: add some validation here
 
                 // remove old routes
-                // TODO: handle errors
                 for route in self.capsule_state.client_routes.iter() {
-                    let status = Command::new("ip")
-                        .args(&["route", "del", &route.to_string(), "dev", &self.tun_name])
-                        .status()?;
-                    info!("Removed route {} with status {:?}", route, status);
+                    if let Err(e) = remove_route(&route, self.tun_name.clone()) {
+                        error!(
+                            "failed to remove route {} from dev {}: {}",
+                            route, self.tun_name, e
+                        );
+                        continue;
+                    }
+                    info!("Removed route {} to dev {}", route, self.tun_name);
                 }
                 self.capsule_state.client_routes.clear();
 
                 // add new routes
-                // TODO: handle errors
                 for route in route_capsule.routes {
-                    let status = Command::new("ip")
-                        .args(&[
-                            "route",
-                            "add",
-                            &route.ip_net.to_string(),
-                            "dev",
-                            &self.tun_name,
-                        ])
-                        .status()?;
-                    info!("Added route {} with status {:?}", route.ip_net, status);
+                    if let Err(e) = add_route(&route.ip_net, self.tun_name.clone()) {
+                        error!(
+                            "failed to add route {} to dev {}: {}",
+                            route.ip_net, self.tun_name, e
+                        );
+                        continue;
+                    }
+                    info!("Added route {} to {}", route.ip_net, self.tun_name);
                     self.capsule_state.client_routes.push(route.ip_net);
                 }
             }
@@ -506,27 +550,33 @@ impl ClientConnection {
         let mut buf = vec![0u8; 1000];
         let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
 
-        // Assign addresses to client
+        // Assign a /32 address from the address pool to client
         let mut assigned_addresses = vec![];
-        for addr in &self.capsule_state.client_addresses {
+        if let Some(addr) = get_next_avail_subnet(&mut self.available_addresses, 32).await {
             info!("assigning address to client: {}", addr);
+            self.capsule_state.client_addresses.push(addr.clone());
             let assigned_address = AssignedAddress {
                 request_id: 0,
                 ip_net: addr.clone(),
             };
             assigned_addresses.push(assigned_address);
 
-            let status = Command::new("ip")
-                .args(&["route", "add", &addr.to_string(), "dev", &self.tun_name])
-                .status()?;
-            info!("Added route {} with status {:?}", addr, status);
-        }
+            if let Err(e) = add_route(&addr, self.tun_name.clone()) {
+                error!(
+                    "failed to add route {} to dev {}: {}",
+                    addr, self.tun_name, e
+                );
+            }
+            info!("Added route {} to dev {}", addr, self.tun_name);
 
-        let address_assign_capsule = AddressAssignCapsule {
-            addresses: assigned_addresses,
-        };
-        let capsule = Capsule::AddressAssign(address_assign_capsule);
-        capsule.append(&mut octets_mut)?;
+            let address_assign_capsule = AddressAssignCapsule {
+                addresses: assigned_addresses,
+            };
+            let capsule = Capsule::AddressAssign(address_assign_capsule);
+            capsule.append(&mut octets_mut)?;
+        } else {
+            error!("no available addresses to assign to client");
+        }
 
         // Advertise route
         let mut routes = vec![];
