@@ -23,14 +23,14 @@ struct PartialResponse {
 }
 struct CapsuleProtocolState {
     stream_id: Option<u64>,
-    /// addresses we assigned to the client
+    /// addresses the proxy assigns to the client
     client_addresses: Vec<IpNet>,
-    /// addresses assigned to us by the client (site to site)
+    /// addresses the client assigns to the proxy (site to site)
     proxy_addresses: Vec<IpNet>,
-    /// routes we advertise to the client
-    local_routes: Vec<IpNet>,
-    /// routes the client advertised to us
-    remote_routes: Vec<IpNet>,
+    /// routes the proxy advertises to the client
+    proxy_routes: Vec<IpNet>,
+    /// routes the client advertises to the proxy
+    client_routes: Vec<IpNet>,
 }
 
 pub struct ClientConnection {
@@ -40,6 +40,7 @@ pub struct ClientConnection {
     pub remote_addr: SocketAddr,
     pub rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
     pub tx_quic_to_udp: mpsc::Sender<UdpPacket>,
+    pub tun_name: String,
     partial_responses: HashMap<u64, PartialResponse>,
     assign_addresses_and_routes_done: bool,
     capsule_state: CapsuleProtocolState,
@@ -52,6 +53,8 @@ impl ClientConnection {
         remote_addr: SocketAddr,
         rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
         tx_quic_to_udp: mpsc::Sender<UdpPacket>,
+        tun_name: String,
+        client_ip: Ipv4Addr,
     ) -> Self {
         ClientConnection {
             conn,
@@ -60,30 +63,25 @@ impl ClientConnection {
             remote_addr,
             rx_udp_to_quic,
             tx_quic_to_udp,
+            tun_name,
             partial_responses: HashMap::new(),
             assign_addresses_and_routes_done: false,
             capsule_state: CapsuleProtocolState {
                 stream_id: None,
-                client_addresses: vec![
-                    IpNet::new(IpAddr::V4(Ipv4Addr::new(10, 248, 1, 180)), 32).unwrap(),
-                ],
+                client_addresses: vec![IpNet::new(IpAddr::V4(client_ip), 32).unwrap()],
                 proxy_addresses: vec![],
-                local_routes: vec![
+                proxy_routes: vec![
                     IpNet::new(IpAddr::V4(Ipv4Addr::new(10, 248, 2, 0)), 24).unwrap(),
                 ],
-                remote_routes: vec![],
+                client_routes: vec![],
             },
         }
     }
 
-    pub async fn handle_client_connection(
-        mut self,
-        tun_name: String,
-        tun_ip: Ipv4Addr,
-    ) -> Result<()> {
+    pub async fn handle_client_connection(mut self) -> Result<()> {
         info!(
-            "starting connection handler for {:?} with TUN {} ({})",
-            self.scid, tun_name, tun_ip
+            "starting connection handler for {:?} with TUN {} and address ({:?})",
+            self.scid, self.tun_name, self.capsule_state.client_addresses
         );
         // Create cancellation token for clean shutdown
         let cancel_token = CancellationToken::new();
@@ -91,7 +89,7 @@ impl ClientConnection {
         // Create TUN interface for this connection
         let (mut tx_quic_to_tun, rx_quic_to_tun) = mpsc::channel::<Vec<u8>>(1000);
         let (tx_tun_to_quic, mut rx_tun_to_quic) = mpsc::channel::<Vec<u8>>(1000);
-        let mut tun = tun::Tun::new(&tun_name, tx_tun_to_quic, 1350)?;
+        let mut tun = tun::Tun::new(&self.tun_name, tx_tun_to_quic, 1350)?;
 
         let (mut tx_address_updates, rx_address_updates) = mpsc::channel::<tun::AddressUpdate>(100);
         tun.start(rx_quic_to_tun, rx_address_updates, cancel_token.clone())
@@ -131,12 +129,10 @@ impl ClientConnection {
                 }
             }
 
-            // Assign addresses and routes to client (capsule protocol)
-            if self.h3_conn.is_some() && !self.assign_addresses_and_routes_done {
-                if let Some(stream_id) = self.capsule_state.stream_id {
-                    self.assign_addresses_and_routes(stream_id).await?;
-                    self.assign_addresses_and_routes_done = true;
-                }
+            // Check if connection was closed while processing packets
+            if self.conn.is_closed() {
+                info!("connection {:?} closed", self.scid);
+                break;
             }
 
             // Send any pending QUIC packets
@@ -157,11 +153,6 @@ impl ClientConnection {
                         dst: send_info.to,
                     })
                     .await?;
-            }
-
-            if self.conn.is_closed() {
-                info!("connection {:?} closed", self.scid);
-                break;
             }
         }
 
@@ -192,16 +183,72 @@ impl ClientConnection {
         };
 
         // Process the packet
-        match self.conn.recv(&mut packet.data.clone(), recv_info) {
-            Ok(_) => {
-                // debug!("processed {} bytes", packet.data.len());
-            }
-            Err(e) => {
-                debug!("recv failed: {:?}", e);
-                return Ok(());
+        if let Err(e) = self.conn.recv(&mut packet.data.clone(), recv_info) {
+            debug!("recv failed: {:?}", e);
+            return Ok(());
+        }
+
+        // Handle HTTP/3 connection establishment and process HTTP/3 data
+        self.handle_http3_connection(tx_address_updates, buf)
+            .await?;
+
+        // Handle capsule protocol (initial address assignment and route advertisement)
+        if self.h3_conn.is_some() && !self.assign_addresses_and_routes_done {
+            if let Some(stream_id) = self.capsule_state.stream_id {
+                self.assign_addresses_and_routes(stream_id).await?;
+                self.assign_addresses_and_routes_done = true;
             }
         }
 
+        // Handle datagrams if connection is established
+        // TODO: only forward if actually connected and data on correct stream
+        if self.conn.is_established() && !self.conn.is_in_early_data() {
+            // Receive datagrams from QUIC and forward to TUN
+            while let Ok(len) = self.conn.dgram_recv(buf) {
+                debug!("received {} bytes from QUIC datagram", len);
+
+                if let Some(ipv4) = Ipv4Packet::new(&buf[..len]) {
+                    let src = ipv4.get_source();
+                    let dest = ipv4.get_destination();
+                    info!(
+                        "forwarding IP packet to TUN: {} -> {}, {} bytes",
+                        src, dest, len
+                    );
+                }
+
+                tx_quic_to_tun.send(buf[..len].to_vec()).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn process_tun_packet(&mut self, ip_packet: Vec<u8>) -> Result<()> {
+        if let Some(ipv4) = Ipv4Packet::new(&ip_packet) {
+            let src = ipv4.get_source();
+            let dest = ipv4.get_destination();
+            info!(
+                "received IP packet from TUN: {} -> {}, {} bytes",
+                src,
+                dest,
+                ip_packet.len()
+            );
+        }
+
+        if self.conn.is_established() {
+            if let Err(e) = self.conn.dgram_send(&ip_packet) {
+                debug!("dgram_send failed: {:?}", e);
+            }
+        } else {
+            debug!("connection not established yet, dropping packet");
+        }
+        Ok(())
+    }
+
+    async fn handle_http3_connection(
+        &mut self,
+        tx_address_updates: &mut mpsc::Sender<tun::AddressUpdate>,
+        buf: &mut [u8],
+    ) -> Result<()> {
         // Setup HTTP/3 connection if not already done
         if (self.conn.is_in_early_data() || self.conn.is_established()) && self.h3_conn.is_none() {
             let mut h3_config = quiche::h3::Config::new().unwrap();
@@ -236,7 +283,7 @@ impl ClientConnection {
                     }
 
                     Ok((stream_id, quiche::h3::Event::Data)) => {
-                        info!(
+                        trace!(
                             "{} got data on stream id {}",
                             self.conn.trace_id(),
                             stream_id
@@ -285,48 +332,6 @@ impl ClientConnection {
                     }
                 }
             }
-        }
-
-        // Handle datagrams if connection is established
-        // TODO: only forward if actually connected and data on correct stream
-        if self.conn.is_established() && !self.conn.is_in_early_data() {
-            // Receive datagrams from QUIC and forward to TUN
-            while let Ok(len) = self.conn.dgram_recv(buf) {
-                debug!("received {} bytes from QUIC datagram", len);
-
-                if let Some(ipv4) = Ipv4Packet::new(&buf[..len]) {
-                    let src = ipv4.get_source();
-                    let dest = ipv4.get_destination();
-                    info!(
-                        "forwarding IP packet to TUN: {} -> {}, {} bytes",
-                        src, dest, len
-                    );
-                }
-
-                tx_quic_to_tun.send(buf[..len].to_vec()).await?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn process_tun_packet(&mut self, ip_packet: Vec<u8>) -> Result<()> {
-        if let Some(ipv4) = Ipv4Packet::new(&ip_packet) {
-            let src = ipv4.get_source();
-            let dest = ipv4.get_destination();
-            info!(
-                "received IP packet from TUN: {} -> {}, {} bytes",
-                src,
-                dest,
-                ip_packet.len()
-            );
-        }
-
-        if self.conn.is_established() {
-            if let Err(e) = self.conn.dgram_send(&ip_packet) {
-                debug!("dgram_send failed: {:?}", e);
-            }
-        } else {
-            debug!("connection not established yet, dropping packet");
         }
         Ok(())
     }
@@ -393,12 +398,6 @@ impl ClientConnection {
         data: &[u8],
         tx_address_updates: &mut mpsc::Sender<tun::AddressUpdate>,
     ) -> Result<usize> {
-        info!(
-            "{} got capsule data on stream id {}: {:?}",
-            self.conn.trace_id(),
-            stream_id,
-            data
-        );
         if self.capsule_state.stream_id != Some(stream_id) {
             error!(
                 "{} received capsule data on unknown stream id {}",
@@ -441,7 +440,9 @@ impl ClientConnection {
 
                 let mut assigned_addresses = vec![];
                 for addr in request_capsule.addresses {
-                    // TODO: properly assign addresses
+                    // TODO: properly assign addresses and add the routes to the TUN interface
+                    // TODO: if requested IP can not be granted, notify by returning 0.0.0.0/32
+                    // TODO: send addresses that are not requested but have been assigned previously (in case that makes sense)
                     let assigned_addr = AssignedAddress {
                         request_id: addr.request_id,
                         ip_net: IpNet::new(IpAddr::V4(Ipv4Addr::new(10, 248, 2, 180)), 32).unwrap(),
@@ -466,21 +467,29 @@ impl ClientConnection {
                 // TODO: add some validation here
 
                 // remove old routes
-                for route in self.capsule_state.remote_routes.iter() {
+                // TODO: handle errors
+                for route in self.capsule_state.client_routes.iter() {
                     let status = Command::new("ip")
-                        .args(&["route", "del", &route.to_string(), "dev", "tun0"])
+                        .args(&["route", "del", &route.to_string(), "dev", &self.tun_name])
                         .status()?;
                     info!("Removed route {} with status {:?}", route, status);
                 }
-                self.capsule_state.remote_routes.clear();
+                self.capsule_state.client_routes.clear();
 
                 // add new routes
+                // TODO: handle errors
                 for route in route_capsule.routes {
                     let status = Command::new("ip")
-                        .args(&["route", "add", &route.ip_net.to_string(), "dev", "tun0"])
+                        .args(&[
+                            "route",
+                            "add",
+                            &route.ip_net.to_string(),
+                            "dev",
+                            &self.tun_name,
+                        ])
                         .status()?;
                     info!("Added route {} with status {:?}", route.ip_net, status);
-                    self.capsule_state.remote_routes.push(route.ip_net);
+                    self.capsule_state.client_routes.push(route.ip_net);
                 }
             }
         }
@@ -508,7 +517,7 @@ impl ClientConnection {
             assigned_addresses.push(assigned_address);
 
             let status = Command::new("ip")
-                .args(&["route", "add", &addr.to_string(), "dev", "tun7"])
+                .args(&["route", "add", &addr.to_string(), "dev", &self.tun_name])
                 .status()?;
             info!("Added route {} with status {:?}", addr, status);
         }
@@ -521,7 +530,7 @@ impl ClientConnection {
 
         // Advertise route
         let mut routes = vec![];
-        for route in &self.capsule_state.local_routes {
+        for route in &self.capsule_state.proxy_routes {
             info!("advertising route to client: {}", route);
             routes.push(RouteAdvertisement {
                 ip_net: route.clone(),

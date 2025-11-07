@@ -21,13 +21,12 @@ fn main() {
         .with_max_level(tracing::Level::DEBUG)
         .init();
     let opt = Opt::parse();
-    let code = {
-        if let Err(e) = connect_ip_rust_scion::client::run(opt.url, opt.bind) {
+    let code =
+        if let Err(e) = connect_ip_rust_scion::client::run(opt.url, opt.bind, "tun0".to_string()) {
             eprintln!("ERROR: {e}");
             1
         } else {
             0
-        }
-    };
+        };
     ::std::process::exit(code);
 }

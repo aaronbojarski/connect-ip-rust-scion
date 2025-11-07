@@ -40,7 +40,7 @@ pub async fn run(listen: SocketAddr) -> Result<()> {
         Arc::new(Mutex::new(HashMap::new()));
 
     let mut buf = [0; 65535];
-    let mut next_tun_ip = 7u8; // Start from 10.248.1.7
+    let mut next_tun_ip = 180u8;
 
     // Main loop: handle UDP socket
     loop {
@@ -118,7 +118,8 @@ pub async fn run(listen: SocketAddr) -> Result<()> {
                     let (tx_to_connection, rx_from_main) = mpsc::channel::<UdpPacket>(1000);
 
                     // Allocate TUN IP for this client
-                    let tun_ip = Ipv4Addr::new(10, 248, 1, next_tun_ip);
+                    // TODO: add shared (Arc Mutex IpNet) datastructure to assign IPs properly
+                    let client_ip = Ipv4Addr::new(10, 248, 2, next_tun_ip);
                     let tun_name = format!("tun{}", next_tun_ip);
                     next_tun_ip += 1;
 
@@ -130,6 +131,8 @@ pub async fn run(listen: SocketAddr) -> Result<()> {
                             src,
                             rx_from_main,
                             tx_quic_to_udp.clone(),
+                            tun_name,
+                            client_ip,
                         );
                     connections.lock().await.insert(scid.clone().into_owned(), tx_to_connection);
 
@@ -137,10 +140,7 @@ pub async fn run(listen: SocketAddr) -> Result<()> {
                     let scid_owned = scid.clone().into_owned();
                     let connections_clone = connections.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = client_conn.handle_client_connection(
-                            tun_name,
-                            tun_ip,
-                        ).await {
+                        if let Err(e) = client_conn.handle_client_connection().await {
                             error!("connection {:?} error: {:?}", scid_owned, e);
                         }
                         connections_clone.lock().await.remove(&scid_owned);
