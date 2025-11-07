@@ -4,6 +4,7 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 use ipnet::IpNet;
 use octets::Octets;
+use pnet::packet::ipv4::Ipv4Packet;
 use quiche::h3::NameValue;
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::sync::{Mutex, mpsc};
@@ -15,9 +16,7 @@ use crate::connect_ip::capsule::{
     AddressAssignCapsule, AddressRequestCapsule, AssignedAddress, CAPSULE_PROTOCOL_EMPTY_ADDRESS,
     Capsule, RequestedAddress, RouteAdvertisement, RouteAdvertisementCapsule,
 };
-use crate::net::{
-    UdpPacket, add_route, get_next_avail_subnet, get_specific_subnet, remove_route, tun,
-};
+use crate::net::{UdpPacket, get_next_avail_subnet, get_specific_subnet, tun};
 
 #[derive(Debug, Eq, PartialEq)]
 enum StreamStatus {
@@ -174,6 +173,16 @@ impl Connection {
 
                 // Outgoing IP packets from TUN
                 Some(ip_packet) = rx_tun_to_quic.recv() => {
+                        if let Some(ipv4) = Ipv4Packet::new(&ip_packet) {
+                        let src = ipv4.get_source();
+                        let dest = ipv4.get_destination();
+                        info!(
+                            "received IP packet from TUN: {} -> {}, {} bytes",
+                            src,
+                            dest,
+                            ip_packet.len()
+                        );
+                    }
                     if self.conn.is_established() {
                         if let Err(e) = self.conn.dgram_send(&ip_packet) {
                             debug!("dgram_send failed: {:?}", e);
@@ -247,14 +256,21 @@ impl Connection {
         self.handle_http3(tx_address_updates.clone()).await?;
 
         // Handle capsule protocol (initial address assignment and route advertisement)
-        self.handle_capsule_protocol().await?;
+        self.handle_capsule_protocol(tx_address_updates).await?;
 
         // Handle datagrams and forward to TUN if tunnel is established
         if self.conn.is_established() && self.stream_state == StreamStatus::TunnelEstablished {
             // Receive datagrams from QUIC and forward to TUN
             let mut buf = vec![0; MAX_DATAGRAM_SIZE];
             while let Ok(len) = self.conn.dgram_recv(&mut buf) {
-                trace!("received {} bytes from QUIC datagram", len);
+                if let Some(ipv4) = Ipv4Packet::new(&buf[..len]) {
+                    let src = ipv4.get_source();
+                    let dest = ipv4.get_destination();
+                    trace!(
+                        "received IP from QUIC, forwarding to TUN: {} -> {}, {} bytes",
+                        src, dest, len
+                    );
+                }
                 if tx_quic_to_tun.send(buf[..len].to_vec()).await.is_err() {
                     info!("TUN channel closed, stopping datagram forwarding");
                     break;
@@ -380,7 +396,10 @@ impl Connection {
         Ok(())
     }
 
-    async fn handle_capsule_protocol(&mut self) -> Result<()> {
+    async fn handle_capsule_protocol(
+        &mut self,
+        tx_address_updates: mpsc::Sender<tun::AddressUpdate>,
+    ) -> Result<()> {
         if self.capsule_state.request_address_done == false
             && self.stream_state == StreamStatus::TunnelEstablished
         {
@@ -392,7 +411,7 @@ impl Connection {
         if !self.capsule_state.assign_address_done
             && self.stream_state == StreamStatus::TunnelEstablished
         {
-            self.send_addresses_and_routes(self.capsule_state.stream_id)
+            self.send_addresses_and_routes(self.capsule_state.stream_id, tx_address_updates)
                 .await?;
             self.capsule_state.assign_address_done = true;
         }
@@ -443,6 +462,7 @@ impl Connection {
     }
 
     /// Handles incoming capsule data.
+    /// TODO: this can be shared between client and proxy with some refactoring
     async fn handle_capsule_data(
         &mut self,
         stream_id: u64,
@@ -468,7 +488,7 @@ impl Connection {
                 // Remove old addresses as they are no longer valid
                 for addr in self.capsule_state.client_addresses.iter() {
                     tx_address_updates
-                        .send(tun::AddressUpdate::Remove(addr.clone()))
+                        .send(tun::AddressUpdate::RemoveAddress(addr.clone()))
                         .await?;
                 }
                 self.capsule_state.client_addresses.clear();
@@ -477,9 +497,18 @@ impl Connection {
                 for addr in assign_capsule.addresses {
                     // TODO: check request_id
                     tx_address_updates
-                        .send(tun::AddressUpdate::Add(addr.ip_net))
+                        .send(tun::AddressUpdate::AddAddress(addr.ip_net))
                         .await?;
                     self.capsule_state.client_addresses.push(addr.ip_net);
+                }
+
+                // Removing addresses can have the effect of removing routes. Re-add all routes.
+                let mut all_routes = self.capsule_state.proxy_addresses.clone();
+                all_routes.extend(self.capsule_state.proxy_routes.clone());
+                for route in all_routes.iter() {
+                    tx_address_updates
+                        .send(tun::AddressUpdate::AddRoute(route.clone()))
+                        .await?;
                 }
             }
             Capsule::AddressRequest(request_capsule) => {
@@ -509,14 +538,9 @@ impl Connection {
                         };
                         assigned_addresses.push(assigned_address);
 
-                        if let Err(e) = add_route(&assigned_subnet, self.tun_name.clone()) {
-                            error!(
-                                "failed to add route {} to dev {}: {}",
-                                assigned_subnet, self.tun_name, e
-                            );
-                            continue;
-                        }
-                        info!("Added route {} to dev {}", assigned_subnet, self.tun_name);
+                        tx_address_updates
+                            .send(tun::AddressUpdate::AddRoute(assigned_subnet.clone()))
+                            .await?;
                         self.capsule_state.proxy_addresses.push(assigned_subnet);
                     } else {
                         assigned_addresses.push(AssignedAddress {
@@ -552,27 +576,17 @@ impl Connection {
 
                 // remove old routes
                 for route in self.capsule_state.proxy_routes.iter() {
-                    if let Err(e) = remove_route(&route, self.tun_name.clone()) {
-                        error!(
-                            "failed to remove route {} from dev {}: {}",
-                            route, self.tun_name, e
-                        );
-                        continue;
-                    }
-                    info!("Removed route {} to dev {}", route, self.tun_name);
+                    tx_address_updates
+                        .send(tun::AddressUpdate::RemoveRoute(route.clone()))
+                        .await?;
                 }
                 self.capsule_state.proxy_routes.clear();
 
                 // add new routes
                 for route in route_capsule.routes {
-                    if let Err(e) = add_route(&route.ip_net, self.tun_name.clone()) {
-                        error!(
-                            "failed to add route {} to dev {}: {}",
-                            route.ip_net, self.tun_name, e
-                        );
-                        continue;
-                    }
-                    info!("Added route {} to {}", route.ip_net, self.tun_name);
+                    tx_address_updates
+                        .send(tun::AddressUpdate::AddRoute(route.ip_net.clone()))
+                        .await?;
                     self.capsule_state.proxy_routes.push(route.ip_net);
                 }
             }
@@ -581,7 +595,11 @@ impl Connection {
         Ok(octets.off())
     }
 
-    async fn send_addresses_and_routes(&mut self, stream_id: u64) -> Result<()> {
+    async fn send_addresses_and_routes(
+        &mut self,
+        stream_id: u64,
+        tx_address_updates: mpsc::Sender<tun::AddressUpdate>,
+    ) -> Result<()> {
         info!(
             "{} assigning addresses and routes to client",
             self.conn.trace_id()
@@ -601,13 +619,9 @@ impl Connection {
             };
             assigned_addresses.push(assigned_address);
 
-            if let Err(e) = add_route(&addr, self.tun_name.clone()) {
-                error!(
-                    "failed to add route {} to dev {}: {}",
-                    addr, self.tun_name, e
-                );
-            }
-            info!("Added route {} to dev {}", addr, self.tun_name);
+            tx_address_updates
+                .send(tun::AddressUpdate::AddAddress(addr.clone()))
+                .await?;
 
             let address_assign_capsule = AddressAssignCapsule {
                 addresses: assigned_addresses,

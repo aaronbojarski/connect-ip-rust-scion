@@ -14,9 +14,7 @@ use crate::connect_ip::capsule::{
     AddressAssignCapsule, AssignedAddress, CAPSULE_PROTOCOL_EMPTY_ADDRESS, Capsule,
     RouteAdvertisement, RouteAdvertisementCapsule,
 };
-use crate::net::{
-    UdpPacket, add_route, get_next_avail_subnet, get_specific_subnet, remove_route, tun,
-};
+use crate::net::{UdpPacket, get_next_avail_subnet, get_specific_subnet, tun};
 use crate::proxy::MAX_DATAGRAM_SIZE;
 
 struct PartialResponse {
@@ -199,7 +197,8 @@ impl ClientConnection {
         // Handle capsule protocol (initial address assignment and route advertisement)
         if self.h3_conn.is_some() && !self.assign_addresses_and_routes_done {
             if let Some(stream_id) = self.capsule_state.stream_id {
-                self.assign_addresses_and_routes(stream_id).await?;
+                self.assign_addresses_and_routes(stream_id, tx_address_updates)
+                    .await?;
                 self.assign_addresses_and_routes_done = true;
             }
         }
@@ -420,7 +419,7 @@ impl ClientConnection {
                 // Remove old addresses as they are no longer valid
                 for addr in self.capsule_state.proxy_addresses.iter() {
                     tx_address_updates
-                        .send(tun::AddressUpdate::Remove(addr.clone()))
+                        .send(tun::AddressUpdate::RemoveAddress(addr.clone()))
                         .await?;
                 }
                 self.capsule_state.proxy_addresses.clear();
@@ -428,9 +427,18 @@ impl ClientConnection {
                 // Add new addresses
                 for addr in assign_capsule.addresses {
                     tx_address_updates
-                        .send(tun::AddressUpdate::Add(addr.ip_net))
+                        .send(tun::AddressUpdate::AddAddress(addr.ip_net))
                         .await?;
                     self.capsule_state.proxy_addresses.push(addr.ip_net);
+                }
+
+                // Removing addresses can have the effect of removing routes. Re-add all routes.
+                let mut all_routes = self.capsule_state.client_addresses.clone();
+                all_routes.extend(self.capsule_state.client_routes.clone());
+                for route in all_routes.iter() {
+                    tx_address_updates
+                        .send(tun::AddressUpdate::AddRoute(route.clone()))
+                        .await?;
                 }
             }
             Capsule::AddressRequest(request_capsule) => {
@@ -460,14 +468,9 @@ impl ClientConnection {
                         };
                         assigned_addresses.push(assigned_address);
 
-                        if let Err(e) = add_route(&assigned_subnet, self.tun_name.clone()) {
-                            error!(
-                                "failed to add route {} to dev {}: {}",
-                                assigned_subnet, self.tun_name, e
-                            );
-                            continue;
-                        }
-                        info!("Added route {} to dev {}", assigned_subnet, self.tun_name);
+                        tx_address_updates
+                            .send(tun::AddressUpdate::AddRoute(assigned_subnet.clone()))
+                            .await?;
                         self.capsule_state.client_addresses.push(assigned_subnet);
                     } else {
                         assigned_addresses.push(AssignedAddress {
@@ -503,27 +506,18 @@ impl ClientConnection {
 
                 // remove old routes
                 for route in self.capsule_state.client_routes.iter() {
-                    if let Err(e) = remove_route(&route, self.tun_name.clone()) {
-                        error!(
-                            "failed to remove route {} from dev {}: {}",
-                            route, self.tun_name, e
-                        );
-                        continue;
-                    }
-                    info!("Removed route {} to dev {}", route, self.tun_name);
+                    tx_address_updates
+                        .send(tun::AddressUpdate::RemoveRoute(route.clone()))
+                        .await?;
                 }
                 self.capsule_state.client_routes.clear();
 
                 // add new routes
                 for route in route_capsule.routes {
-                    if let Err(e) = add_route(&route.ip_net, self.tun_name.clone()) {
-                        error!(
-                            "failed to add route {} to dev {}: {}",
-                            route.ip_net, self.tun_name, e
-                        );
-                        continue;
-                    }
-                    info!("Added route {} to {}", route.ip_net, self.tun_name);
+                    tx_address_updates
+                        .send(tun::AddressUpdate::AddRoute(route.ip_net.clone()))
+                        .await?;
+
                     self.capsule_state.client_routes.push(route.ip_net);
                 }
             }
@@ -532,7 +526,11 @@ impl ClientConnection {
         Ok(octets.off())
     }
 
-    async fn assign_addresses_and_routes(&mut self, stream_id: u64) -> Result<()> {
+    async fn assign_addresses_and_routes(
+        &mut self,
+        stream_id: u64,
+        tx_address_updates: &mut mpsc::Sender<tun::AddressUpdate>,
+    ) -> Result<()> {
         info!(
             "{} assigning addresses and routes to client",
             self.conn.trace_id()
@@ -552,13 +550,9 @@ impl ClientConnection {
             };
             assigned_addresses.push(assigned_address);
 
-            if let Err(e) = add_route(&addr, self.tun_name.clone()) {
-                error!(
-                    "failed to add route {} to dev {}: {}",
-                    addr, self.tun_name, e
-                );
-            }
-            info!("Added route {} to dev {}", addr, self.tun_name);
+            tx_address_updates
+                .send(tun::AddressUpdate::AddAddress(addr.clone()))
+                .await?;
 
             let address_assign_capsule = AddressAssignCapsule {
                 addresses: assigned_addresses,

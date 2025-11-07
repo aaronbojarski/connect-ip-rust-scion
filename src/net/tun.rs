@@ -9,9 +9,13 @@ use tracing::{error, info, info_span, trace};
 use tracing_futures::Instrument as _;
 use tun_rs::DeviceBuilder;
 
+use crate::net::{add_route, remove_route};
+
 pub enum AddressUpdate {
-    Add(IpNet),
-    Remove(IpNet),
+    AddAddress(IpNet),
+    RemoveAddress(IpNet),
+    AddRoute(IpNet),
+    RemoveRoute(IpNet),
 }
 
 pub struct Tun {
@@ -60,7 +64,7 @@ impl Tun {
                             // Handle address updates
                             Some(update) = rx_address_updates.recv() => {
                                 match update {
-                                    AddressUpdate::Add(ipnet) => {
+                                    AddressUpdate::AddAddress(ipnet) => {
                                         match ipnet.addr() {
                                             IpAddr::V4(address) => {
                                                 dev.add_address_v4(address, ipnet.prefix_len())?;
@@ -71,9 +75,23 @@ impl Tun {
                                         }
                                         info!("Added address {} to TUN device {}", ipnet, name);
                                     }
-                                    AddressUpdate::Remove(ipnet) => {
+                                    AddressUpdate::RemoveAddress(ipnet) => {
                                         dev.remove_address(ipnet.addr())?;
                                         info!("Removed address {} from TUN device {}", ipnet, name);
+                                    }
+                                    AddressUpdate::AddRoute(ipnet) => {
+                                        if let Err(e) = add_route(&ipnet, name.clone()) {
+                                            error!("Failed to add route {}: {}", ipnet, e);
+                                        } else {
+                                            info!("Added route {} via TUN device {}", ipnet, name);
+                                        }
+                                    }
+                                    AddressUpdate::RemoveRoute(ipnet) => {
+                                        if let Err(e) = remove_route(&ipnet, name.clone()) {
+                                            error!("Failed to remove route {}: {}", ipnet, e);
+                                        } else {
+                                            info!("Removed route {} via TUN device {}", ipnet, name);
+                                        }
                                     }
                                 }
                             }
