@@ -56,7 +56,6 @@ sudo ip netns exec eh0ns ping 10.248.2.1
     - certificates
     - access logic (authentication/authorization)
 - improve http3
-    - use correct quarter stream id for datagrams
     - request on new stream
     - add checks on IP packets (src/dst addresses)
 - scion integration

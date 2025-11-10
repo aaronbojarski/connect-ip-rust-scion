@@ -1,11 +1,12 @@
 use anyhow::{Result, anyhow};
 use ipnet::IpNet;
-use octets::Octets;
+use octets::{Octets, OctetsMut};
 use pnet::packet::ipv4::Ipv4Packet;
 use quiche::h3::NameValue;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::vec;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
@@ -209,17 +210,41 @@ impl ClientConnection {
             // Receive datagrams from QUIC and forward to TUN
             while let Ok(len) = self.conn.dgram_recv(buf) {
                 debug!("received {} bytes from QUIC datagram", len);
+                let mut octets = Octets::with_slice(&buf[..len]);
+                let stream_id = octets.get_varint()? * 4;
+                let context_id = octets.get_varint()?;
+                let packet_start = octets.off();
 
-                if let Some(ipv4) = Ipv4Packet::new(&buf[..len]) {
+                if self.capsule_state.stream_id != Some(stream_id) {
+                    error!(
+                        "{} received datagram on unknown stream id {}",
+                        self.conn.trace_id(),
+                        stream_id
+                    );
+                    continue;
+                }
+
+                if context_id != 0 {
+                    error!(
+                        "{} received datagram with unknown context id {}",
+                        self.conn.trace_id(),
+                        context_id
+                    );
+                    continue;
+                }
+
+                if let Some(ipv4) = Ipv4Packet::new(&buf[packet_start..len]) {
                     let src = ipv4.get_source();
                     let dest = ipv4.get_destination();
                     info!(
                         "forwarding IP packet to TUN: {} -> {}, {} bytes",
-                        src, dest, len
+                        src,
+                        dest,
+                        len - packet_start
                     );
+                    // TODO: validate packet addresses before sending to TUN
+                    tx_quic_to_tun.send(buf[packet_start..len].to_vec()).await?;
                 }
-
-                tx_quic_to_tun.send(buf[..len].to_vec()).await?;
             }
         }
         Ok(())
@@ -237,8 +262,14 @@ impl ClientConnection {
             );
         }
 
-        if self.conn.is_established() {
-            if let Err(e) = self.conn.dgram_send(&ip_packet) {
+        if self.conn.is_established() && self.capsule_state.stream_id.is_some() {
+            let mut buf = vec![0u8; MAX_DATAGRAM_SIZE];
+            let mut octets = OctetsMut::with_slice(&mut buf);
+            octets.put_varint(self.capsule_state.stream_id.unwrap() / 4)?;
+            octets.put_varint(0)?;
+            octets.put_bytes(&ip_packet)?;
+            let len = octets.off();
+            if let Err(e) = self.conn.dgram_send(&buf[..len]) {
                 debug!("dgram_send failed: {:?}", e);
             }
         } else {
@@ -550,8 +581,9 @@ impl ClientConnection {
             };
             assigned_addresses.push(assigned_address);
 
+            // Add route to local tun for routing
             tx_address_updates
-                .send(tun::AddressUpdate::AddAddress(addr.clone()))
+                .send(tun::AddressUpdate::AddRoute(addr.clone()))
                 .await?;
 
             let address_assign_capsule = AddressAssignCapsule {

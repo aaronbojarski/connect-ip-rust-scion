@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use ipnet::IpNet;
-use octets::Octets;
+use octets::{Octets, OctetsMut};
 use pnet::packet::ipv4::Ipv4Packet;
 use quiche::h3::NameValue;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -27,7 +27,7 @@ enum StreamStatus {
 
 struct CapsuleProtocolState {
     /// stream of this ip-connect session
-    stream_id: u64,
+    stream_id: Option<u64>,
     /// addresses the proxy assigns to the client
     client_addresses: Vec<IpNet>,
     /// addresses the client assigns to the proxy (site to site)
@@ -86,11 +86,9 @@ impl Connection {
             available_addresses,
             stream_state: StreamStatus::Initialized,
             capsule_state: CapsuleProtocolState {
-                stream_id: 0,
+                stream_id: None,
                 client_addresses: vec![],
-                proxy_addresses: vec![
-                    IpNet::new(IpAddr::V4(Ipv4Addr::new(10, 248, 1, 180)), 32).unwrap(),
-                ],
+                proxy_addresses: vec![],
                 proxy_routes: vec![],
                 client_routes: routes,
                 request_address_done: false,
@@ -173,7 +171,7 @@ impl Connection {
 
                 // Outgoing IP packets from TUN
                 Some(ip_packet) = rx_tun_to_quic.recv() => {
-                        if let Some(ipv4) = Ipv4Packet::new(&ip_packet) {
+                    if let Some(ipv4) = Ipv4Packet::new(&ip_packet) {
                         let src = ipv4.get_source();
                         let dest = ipv4.get_destination();
                         info!(
@@ -183,8 +181,13 @@ impl Connection {
                             ip_packet.len()
                         );
                     }
-                    if self.conn.is_established() {
-                        if let Err(e) = self.conn.dgram_send(&ip_packet) {
+                    if self.conn.is_established() && self.capsule_state.stream_id.is_some() {
+                        let mut octets = OctetsMut::with_slice(&mut buf);
+                        octets.put_varint(self.capsule_state.stream_id.unwrap() / 4)?;
+                        octets.put_varint(0)?;
+                        octets.put_bytes(&ip_packet)?;
+                        let len = octets.off();
+                        if let Err(e) = self.conn.dgram_send(&buf[..len]) {
                             debug!("dgram_send failed: {:?}", e);
                         }
                     } else {
@@ -263,17 +266,41 @@ impl Connection {
             // Receive datagrams from QUIC and forward to TUN
             let mut buf = vec![0; MAX_DATAGRAM_SIZE];
             while let Ok(len) = self.conn.dgram_recv(&mut buf) {
-                if let Some(ipv4) = Ipv4Packet::new(&buf[..len]) {
+                debug!("received {} bytes from QUIC datagram", len);
+                let mut octets = Octets::with_slice(&buf[..len]);
+                let stream_id = octets.get_varint()? * 4;
+                let context_id = octets.get_varint()?;
+                let packet_start = octets.off();
+
+                if self.capsule_state.stream_id != Some(stream_id) {
+                    error!(
+                        "{} received datagram on unknown stream id {}",
+                        self.conn.trace_id(),
+                        stream_id
+                    );
+                    continue;
+                }
+
+                if context_id != 0 {
+                    error!(
+                        "{} received datagram with unknown context id {}",
+                        self.conn.trace_id(),
+                        context_id
+                    );
+                    continue;
+                }
+
+                if let Some(ipv4) = Ipv4Packet::new(&buf[packet_start..len]) {
                     let src = ipv4.get_source();
                     let dest = ipv4.get_destination();
-                    trace!(
-                        "received IP from QUIC, forwarding to TUN: {} -> {}, {} bytes",
-                        src, dest, len
+                    info!(
+                        "forwarding IP packet to TUN: {} -> {}, {} bytes",
+                        src,
+                        dest,
+                        len - packet_start
                     );
-                }
-                if tx_quic_to_tun.send(buf[..len].to_vec()).await.is_err() {
-                    info!("TUN channel closed, stopping datagram forwarding");
-                    break;
+                    // TODO: validate packet addresses before sending to TUN
+                    tx_quic_to_tun.send(buf[packet_start..len].to_vec()).await?;
                 }
             }
         }
@@ -309,7 +336,7 @@ impl Connection {
             if self.stream_state == StreamStatus::Initialized {
                 info!("sending HTTP request {req:?}");
                 let stream_id = h3_conn.send_request(&mut self.conn, &req, false).unwrap();
-                self.capsule_state.stream_id = stream_id;
+                self.capsule_state.stream_id = Some(stream_id);
                 info!("sent CONNECT request on stream {}", stream_id);
                 self.stream_state = StreamStatus::RequestSent;
             }
@@ -328,7 +355,7 @@ impl Connection {
                         );
                         // TODO: Drop connection if another stream already exists
                         if Self::check_response(&list) {
-                            self.capsule_state.stream_id = stream_id;
+                            // self.capsule_state.stream_id = Some(stream_id);
                             self.stream_state = StreamStatus::TunnelEstablished;
                         } else {
                             error!("unexpected response from server, closing connection");
@@ -410,9 +437,13 @@ impl Connection {
 
         if !self.capsule_state.assign_address_done
             && self.stream_state == StreamStatus::TunnelEstablished
+            && self.capsule_state.stream_id.is_some()
         {
-            self.send_addresses_and_routes(self.capsule_state.stream_id, tx_address_updates)
-                .await?;
+            self.send_addresses_and_routes(
+                self.capsule_state.stream_id.unwrap(),
+                tx_address_updates,
+            )
+            .await?;
             self.capsule_state.assign_address_done = true;
         }
         Ok(())
@@ -440,7 +471,7 @@ impl Connection {
     }
 
     fn send_address_request(&mut self) -> Result<()> {
-        let stream_id = self.capsule_state.stream_id;
+        let stream_id = self.capsule_state.stream_id.unwrap();
         // Send Address Request capsule
         let addr_req = AddressRequestCapsule {
             addresses: vec![RequestedAddress {
@@ -469,7 +500,7 @@ impl Connection {
         data: &[u8],
         tx_address_updates: mpsc::Sender<tun::AddressUpdate>,
     ) -> Result<usize> {
-        if self.capsule_state.stream_id != stream_id {
+        if self.capsule_state.stream_id != Some(stream_id) {
             error!(
                 "{} received capsule data on unknown stream id {}",
                 self.conn.trace_id(),
@@ -619,8 +650,9 @@ impl Connection {
             };
             assigned_addresses.push(assigned_address);
 
+            // Add route to local tun for routing
             tx_address_updates
-                .send(tun::AddressUpdate::AddAddress(addr.clone()))
+                .send(tun::AddressUpdate::AddRoute(addr.clone()))
                 .await?;
 
             let address_assign_capsule = AddressAssignCapsule {
