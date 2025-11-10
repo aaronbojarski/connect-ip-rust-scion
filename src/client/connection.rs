@@ -1,43 +1,28 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
-
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use ipnet::IpNet;
 use octets::{Octets, OctetsMut};
 use pnet::packet::ipv4::Ipv4Packet;
 use quiche::h3::NameValue;
 use ring::rand::{SecureRandom, SystemRandom};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, trace};
 
 use crate::client::MAX_DATAGRAM_SIZE;
 use crate::connect_ip::capsule::{
-    AddressAssignCapsule, AddressRequestCapsule, AssignedAddress, CAPSULE_PROTOCOL_EMPTY_ADDRESS,
-    Capsule, RequestedAddress, RouteAdvertisement, RouteAdvertisementCapsule,
+    AddressAssignCapsule, AddressRequestCapsule, AssignedAddress, Capsule, RequestedAddress,
+    RouteAdvertisement, RouteAdvertisementCapsule,
 };
-use crate::net::{UdpPacket, get_next_avail_subnet, get_specific_subnet, tun};
+use crate::connect_ip::capsule_protocol::{CapsuleProtocolState, handle_capsule_data};
+use crate::net::{UdpPacket, get_next_avail_subnet, tun};
 
 #[derive(Debug, Eq, PartialEq)]
 enum StreamStatus {
     Initialized,
     RequestSent,
     TunnelEstablished,
-}
-
-struct CapsuleProtocolState {
-    /// stream of this ip-connect session
-    stream_id: Option<u64>,
-    /// addresses the proxy assigns to the client
-    client_addresses: Vec<IpNet>,
-    /// addresses the client assigns to the proxy (site to site)
-    proxy_addresses: Vec<IpNet>,
-    /// routes the proxy advertises to the client
-    proxy_routes: Vec<IpNet>,
-    /// routes the client advertises to the proxy
-    client_routes: Vec<IpNet>,
-    request_address_done: bool,
-    assign_address_done: bool,
 }
 
 pub struct Connection {
@@ -49,6 +34,8 @@ pub struct Connection {
     available_addresses: Arc<Mutex<Vec<IpNet>>>,
     stream_state: StreamStatus,
     capsule_state: CapsuleProtocolState,
+    assign_address_done: bool,
+    request_address_done: bool,
 }
 
 impl Connection {
@@ -87,13 +74,13 @@ impl Connection {
             stream_state: StreamStatus::Initialized,
             capsule_state: CapsuleProtocolState {
                 stream_id: None,
-                client_addresses: vec![],
-                proxy_addresses: vec![],
-                proxy_routes: vec![],
-                client_routes: routes,
-                request_address_done: false,
-                assign_address_done: false,
+                remote_addresses: vec![],
+                local_addresses: vec![],
+                local_routes: routes,
+                remote_routes: vec![],
             },
+            assign_address_done: false,
+            request_address_done: false,
         })
     }
 
@@ -132,7 +119,7 @@ impl Connection {
         let (tx_tun_to_quic, mut rx_tun_to_quic) = mpsc::channel::<Vec<u8>>(1000);
 
         let mut tun = tun::Tun::new(&self.tun_name, tx_tun_to_quic.clone(), 1350)?;
-        let (tx_address_updates, rx_address_updates) = mpsc::channel::<tun::AddressUpdate>(100);
+        let (mut tx_address_updates, rx_address_updates) = mpsc::channel::<tun::AddressUpdate>(100);
         tun.start(rx_quic_to_tun, rx_address_updates, cancel_token.clone())
             .await?;
 
@@ -166,7 +153,7 @@ impl Connection {
 
                 // Incoming UDP packets (QUIC protocol packets)
                 Some(packet) = self.rx_udp_to_quic.recv() => {
-                    self.process_udp_packet(packet, tx_quic_to_tun.clone(), tx_address_updates.clone()).await?;
+                    self.process_udp_packet(packet, tx_quic_to_tun.clone(), &mut tx_address_updates).await?;
                 }
 
                 // Outgoing IP packets from TUN
@@ -243,7 +230,7 @@ impl Connection {
         &mut self,
         packet: UdpPacket,
         tx_quic_to_tun: mpsc::Sender<Vec<u8>>,
-        tx_address_updates: mpsc::Sender<tun::AddressUpdate>,
+        tx_address_updates: &mut mpsc::Sender<tun::AddressUpdate>,
     ) -> Result<()> {
         let recv_info = quiche::RecvInfo {
             from: packet.src,
@@ -256,7 +243,7 @@ impl Connection {
         }
 
         // Handle HTTP/3 connection establishment and process HTTP/3 data
-        self.handle_http3(tx_address_updates.clone()).await?;
+        self.handle_http3(tx_address_updates).await?;
 
         // Handle capsule protocol (initial address assignment and route advertisement)
         self.handle_capsule_protocol(tx_address_updates).await?;
@@ -310,7 +297,7 @@ impl Connection {
 
     async fn handle_http3(
         &mut self,
-        tx_address_updates: mpsc::Sender<tun::AddressUpdate>,
+        tx_address_updates: &mut mpsc::Sender<tun::AddressUpdate>,
     ) -> Result<()> {
         let mut h3_config = quiche::h3::Config::new().unwrap();
         h3_config.enable_extended_connect(true);
@@ -381,13 +368,16 @@ impl Connection {
 
                             let mut consumed = 0;
                             while consumed < read {
-                                consumed += self
-                                    .handle_capsule_data(
-                                        stream_id,
-                                        &buf[consumed..read].to_vec(),
-                                        tx_address_updates.clone(),
-                                    )
-                                    .await?;
+                                consumed += handle_capsule_data(
+                                    stream_id,
+                                    &buf[consumed..read].to_vec(),
+                                    &mut self.capsule_state,
+                                    &mut self.conn,
+                                    &mut self.h3_conn,
+                                    &mut self.available_addresses,
+                                    tx_address_updates,
+                                )
+                                .await?;
                             }
                         }
                     }
@@ -425,17 +415,17 @@ impl Connection {
 
     async fn handle_capsule_protocol(
         &mut self,
-        tx_address_updates: mpsc::Sender<tun::AddressUpdate>,
+        tx_address_updates: &mut mpsc::Sender<tun::AddressUpdate>,
     ) -> Result<()> {
-        if self.capsule_state.request_address_done == false
+        if self.request_address_done == false
             && self.stream_state == StreamStatus::TunnelEstablished
         {
             self.send_address_request()?;
             info!("sent initial capsules to establish tunnel");
-            self.capsule_state.request_address_done = true;
+            self.request_address_done = true;
         }
 
-        if !self.capsule_state.assign_address_done
+        if !self.assign_address_done
             && self.stream_state == StreamStatus::TunnelEstablished
             && self.capsule_state.stream_id.is_some()
         {
@@ -444,7 +434,7 @@ impl Connection {
                 tx_address_updates,
             )
             .await?;
-            self.capsule_state.assign_address_done = true;
+            self.assign_address_done = true;
         }
         Ok(())
     }
@@ -492,147 +482,13 @@ impl Connection {
         Ok(())
     }
 
-    /// Handles incoming capsule data.
-    /// TODO: this can be shared between client and proxy with some refactoring
-    async fn handle_capsule_data(
-        &mut self,
-        stream_id: u64,
-        data: &[u8],
-        tx_address_updates: mpsc::Sender<tun::AddressUpdate>,
-    ) -> Result<usize> {
-        if self.capsule_state.stream_id != Some(stream_id) {
-            error!(
-                "{} received capsule data on unknown stream id {}",
-                self.conn.trace_id(),
-                stream_id
-            );
-            return Err(anyhow!("unknown stream id"));
-        }
-
-        // parse capsule data here
-        let mut octets = Octets::with_slice(data);
-        let capsule = Capsule::parse(&mut octets)?;
-        match capsule {
-            Capsule::AddressAssign(assign_capsule) => {
-                info!("received AddressAssign capsule: {:?}", assign_capsule);
-
-                // Remove old addresses as they are no longer valid
-                for addr in self.capsule_state.client_addresses.iter() {
-                    tx_address_updates
-                        .send(tun::AddressUpdate::RemoveAddress(addr.clone()))
-                        .await?;
-                }
-                self.capsule_state.client_addresses.clear();
-
-                // Add new addresses
-                for addr in assign_capsule.addresses {
-                    // TODO: check request_id
-                    tx_address_updates
-                        .send(tun::AddressUpdate::AddAddress(addr.ip_net))
-                        .await?;
-                    self.capsule_state.client_addresses.push(addr.ip_net);
-                }
-
-                // Removing addresses can have the effect of removing routes. Re-add all routes.
-                let mut all_routes = self.capsule_state.proxy_addresses.clone();
-                all_routes.extend(self.capsule_state.proxy_routes.clone());
-                for route in all_routes.iter() {
-                    tx_address_updates
-                        .send(tun::AddressUpdate::AddRoute(route.clone()))
-                        .await?;
-                }
-            }
-            Capsule::AddressRequest(request_capsule) => {
-                info!("received AddressRequest capsule: {:?}", request_capsule);
-
-                let mut assigned_addresses = self
-                    .capsule_state
-                    .proxy_addresses
-                    .clone()
-                    .into_iter()
-                    .map(|ip_net| AssignedAddress {
-                        request_id: 0,
-                        ip_net,
-                    })
-                    .collect::<Vec<AssignedAddress>>();
-                for addr in request_capsule.addresses {
-                    let assigned_net = if addr.ip_net == CAPSULE_PROTOCOL_EMPTY_ADDRESS {
-                        get_next_avail_subnet(&mut self.available_addresses, 32).await
-                    } else {
-                        get_specific_subnet(&mut self.available_addresses, addr.ip_net).await
-                    };
-                    if let Some(assigned_subnet) = assigned_net {
-                        info!("assigning requested address to client: {}", assigned_subnet);
-                        let assigned_address = AssignedAddress {
-                            request_id: addr.request_id,
-                            ip_net: assigned_subnet.clone(),
-                        };
-                        assigned_addresses.push(assigned_address);
-
-                        tx_address_updates
-                            .send(tun::AddressUpdate::AddRoute(assigned_subnet.clone()))
-                            .await?;
-                        self.capsule_state.proxy_addresses.push(assigned_subnet);
-                    } else {
-                        assigned_addresses.push(AssignedAddress {
-                            request_id: addr.request_id,
-                            ip_net: CAPSULE_PROTOCOL_EMPTY_ADDRESS,
-                        });
-                        warn!("requested address {} not available", addr.ip_net);
-                    }
-                }
-
-                info!(
-                    "sending AddressAssign capsule with addresses: {:?}",
-                    assigned_addresses
-                );
-
-                let address_assign_capsule = AddressAssignCapsule {
-                    addresses: assigned_addresses,
-                };
-                let capsule = Capsule::AddressAssign(address_assign_capsule);
-                let mut buf = vec![0u8; 1000];
-                let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
-                capsule.append(&mut octets_mut).unwrap();
-                let payload_len = octets_mut.off();
-                self.h3_conn
-                    .as_mut()
-                    .unwrap()
-                    .send_body(&mut self.conn, stream_id, &buf[..payload_len], false)
-                    .unwrap();
-            }
-            Capsule::RouteAdvertisement(route_capsule) => {
-                info!("received RouteAdvertisement capsule: {:?}", route_capsule);
-                // TODO: add some validation here
-
-                // remove old routes
-                for route in self.capsule_state.proxy_routes.iter() {
-                    tx_address_updates
-                        .send(tun::AddressUpdate::RemoveRoute(route.clone()))
-                        .await?;
-                }
-                self.capsule_state.proxy_routes.clear();
-
-                // add new routes
-                for route in route_capsule.routes {
-                    tx_address_updates
-                        .send(tun::AddressUpdate::AddRoute(route.ip_net.clone()))
-                        .await?;
-                    self.capsule_state.proxy_routes.push(route.ip_net);
-                }
-            }
-        }
-
-        Ok(octets.off())
-    }
-
     async fn send_addresses_and_routes(
         &mut self,
         stream_id: u64,
-        tx_address_updates: mpsc::Sender<tun::AddressUpdate>,
+        tx_address_updates: &mut mpsc::Sender<tun::AddressUpdate>,
     ) -> Result<()> {
         info!(
-            "{} assigning addresses and routes to client",
+            "{} assigning addresses and routes to peer",
             self.conn.trace_id()
         );
 
@@ -642,8 +498,8 @@ impl Connection {
         // Assign a /32 address from the address pool
         let mut assigned_addresses = vec![];
         if let Some(addr) = get_next_avail_subnet(&mut self.available_addresses, 32).await {
-            info!("assigning address to proxy: {}", addr);
-            self.capsule_state.proxy_addresses.push(addr.clone());
+            info!("assigning address to peer: {}", addr);
+            self.capsule_state.remote_addresses.push(addr.clone());
             let assigned_address = AssignedAddress {
                 request_id: 0,
                 ip_net: addr.clone(),
@@ -666,8 +522,8 @@ impl Connection {
 
         // Advertise route
         let mut routes = vec![];
-        for route in &self.capsule_state.client_routes {
-            info!("advertising route to client: {}", route);
+        for route in &self.capsule_state.local_routes {
+            info!("advertising route to peer: {}", route);
             routes.push(RouteAdvertisement {
                 ip_net: route.clone(),
                 proto: 0,
