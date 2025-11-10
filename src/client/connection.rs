@@ -174,7 +174,7 @@ impl Connection {
                     Ok(v) => v,
                     Err(quiche::Error::Done) => break,
                     Err(e) => {
-                        debug!("send failed: {:?}", e);
+                        error!("send failed: {:?}", e);
                         break;
                     }
                 };
@@ -217,7 +217,7 @@ impl Connection {
         };
 
         if let Err(e) = self.conn.recv(&mut packet.data.clone(), recv_info) {
-            debug!("recv failed: {:?}", e);
+            error!("recv failed: {:?}, recv_info: {:?}", e, recv_info);
             return Ok(());
         }
 
@@ -292,7 +292,7 @@ impl Connection {
             octets.put_bytes(&ip_packet)?;
             let len = octets.off();
             if let Err(e) = self.conn.dgram_send(&buf[..len]) {
-                debug!("dgram_send failed: {:?}", e);
+                error!("dgram_send failed: {:?}", e);
             }
         } else {
             debug!("connection not established yet, dropping packet");
