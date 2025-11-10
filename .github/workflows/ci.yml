@@ -72,7 +72,7 @@ jobs:
             https://10.248.100.11:4433 \
             --host localhost \
             --routes 10.248.1.0/24 \
-            --address-pool 10.248.2.128/25 \
+            --address-pool 10.248.1.128/25 \
             --log info > client.log 2>&1 &
           echo $! > client.pid
           sleep 5
