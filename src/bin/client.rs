@@ -23,13 +23,19 @@ struct Opt {
     /// Address pool to assign from
     #[clap(long)]
     address_pool: Vec<IpNet>,
+
+    /// Tracing level (trace, debug, info, warn, error)
+    #[clap(long = "log", default_value = "info")]
+    log_level: tracing::Level,
 }
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .init();
     let opt = Opt::parse();
+
+    tracing_subscriber::fmt()
+        .with_max_level(opt.log_level)
+        .init();
+
     let config = connect_ip_rust_scion::client::ClientConfig {
         bind: opt.bind,
         url: opt.url.clone(),
