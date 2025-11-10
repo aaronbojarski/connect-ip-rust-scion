@@ -11,11 +11,10 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace};
 
-use crate::connect_ip::capsule::{
-    AddressAssignCapsule, AssignedAddress, Capsule, RouteAdvertisement, RouteAdvertisementCapsule,
+use crate::connect_ip::capsule_protocol::{
+    CapsuleProtocolState, assign_addresses_and_routes, handle_capsule_data,
 };
-use crate::connect_ip::capsule_protocol::{CapsuleProtocolState, handle_capsule_data};
-use crate::net::{UdpPacket, get_next_avail_subnet, tun};
+use crate::net::{UdpPacket, tun};
 use crate::proxy::MAX_DATAGRAM_SIZE;
 
 struct PartialResponse {
@@ -184,17 +183,23 @@ impl ClientConnection {
         self.handle_http3_connection(tx_address_updates, buf)
             .await?;
 
-        // Handle capsule protocol (initial address assignment and route advertisement)
-        if self.h3_conn.is_some() && !self.assign_addresses_and_routes_done {
-            if let Some(stream_id) = self.capsule_state.stream_id {
-                self.assign_addresses_and_routes(stream_id, tx_address_updates)
-                    .await?;
-                self.assign_addresses_and_routes_done = true;
-            }
+        // Handle initial address assignment and route advertisement
+        if self.h3_conn.is_some()
+            && !self.capsule_state.stream_id.is_none()
+            && !self.assign_addresses_and_routes_done
+        {
+            assign_addresses_and_routes(
+                &mut self.capsule_state,
+                &mut self.conn,
+                &mut self.h3_conn,
+                &mut self.available_addresses,
+                tx_address_updates,
+            )
+            .await?;
+            self.assign_addresses_and_routes_done = true;
         }
 
         // Handle datagrams if connection is established
-        // TODO: only forward if actually connected and data on correct stream
         if self.conn.is_established() && !self.conn.is_in_early_data() {
             // Receive datagrams from QUIC and forward to TUN
             while let Ok(len) = self.conn.dgram_recv(buf) {
@@ -415,67 +420,6 @@ impl ClientConnection {
             self.partial_responses.insert(stream_id, response);
         }
         self.capsule_state.stream_id = Some(stream_id);
-    }
-
-    async fn assign_addresses_and_routes(
-        &mut self,
-        stream_id: u64,
-        tx_address_updates: &mut mpsc::Sender<tun::AddressUpdate>,
-    ) -> Result<()> {
-        info!(
-            "{} assigning addresses and routes to client",
-            self.conn.trace_id()
-        );
-
-        let mut buf = vec![0u8; 1000];
-        let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
-
-        // Assign a /32 address from the address pool to client
-        let mut assigned_addresses = vec![];
-        if let Some(addr) = get_next_avail_subnet(&mut self.available_addresses, 32).await {
-            info!("assigning address to client: {}", addr);
-            self.capsule_state.remote_addresses.push(addr.clone());
-            let assigned_address = AssignedAddress {
-                request_id: 0,
-                ip_net: addr.clone(),
-            };
-            assigned_addresses.push(assigned_address);
-
-            // Add route to local tun for routing
-            tx_address_updates
-                .send(tun::AddressUpdate::AddRoute(addr.clone()))
-                .await?;
-
-            let address_assign_capsule = AddressAssignCapsule {
-                addresses: assigned_addresses,
-            };
-            let capsule = Capsule::AddressAssign(address_assign_capsule);
-            capsule.append(&mut octets_mut)?;
-        } else {
-            error!("no available addresses to assign to client");
-        }
-
-        // Advertise route
-        let mut routes = vec![];
-        for route in &self.capsule_state.local_routes {
-            info!("advertising route to client: {}", route);
-            routes.push(RouteAdvertisement {
-                ip_net: route.clone(),
-                proto: 0,
-            });
-        }
-        let route_advertisement_capsule = RouteAdvertisementCapsule { routes: routes };
-        let capsule = Capsule::RouteAdvertisement(route_advertisement_capsule);
-        capsule.append(&mut octets_mut)?;
-
-        let payload_len = octets_mut.off();
-        self.h3_conn
-            .as_mut()
-            .unwrap()
-            .send_body(&mut self.conn, stream_id, &buf[..payload_len], false)
-            .unwrap();
-
-        Ok(())
     }
 
     /// Builds an HTTP/3 response given a request.

@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use crate::{
-    connect_ip::capsule::CAPSULE_PROTOCOL_EMPTY_ADDRESS,
+    connect_ip::capsule::{
+        CAPSULE_PROTOCOL_EMPTY_ADDRESS, RouteAdvertisement, RouteAdvertisementCapsule,
+    },
     net::{get_next_avail_subnet, get_specific_subnet, tun},
 };
 use anyhow::{Result, anyhow};
@@ -157,4 +159,76 @@ pub async fn handle_capsule_data(
     }
 
     Ok(octets.off())
+}
+
+pub async fn assign_addresses_and_routes(
+    state: &mut CapsuleProtocolState,
+    mut conn: &mut quiche::Connection,
+    h3_conn: &mut Option<quiche::h3::Connection>,
+    mut available_addresses: &mut Arc<Mutex<Vec<IpNet>>>,
+    tx_address_updates: &mut mpsc::Sender<tun::AddressUpdate>,
+) -> Result<()> {
+    if state.stream_id.is_none() {
+        return Err(anyhow!("stream id is None"));
+    }
+
+    info!(
+        "{} assigning addresses and routes to client",
+        conn.trace_id()
+    );
+
+    let mut buf = vec![0u8; 1000];
+    let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
+
+    // Assign a /32 address from the address pool to peer
+    let mut assigned_addresses = vec![];
+    if let Some(addr) = get_next_avail_subnet(&mut available_addresses, 32).await {
+        info!("assigning address to client: {}", addr);
+        state.remote_addresses.push(addr.clone());
+        let assigned_address = AssignedAddress {
+            request_id: 0,
+            ip_net: addr.clone(),
+        };
+        assigned_addresses.push(assigned_address);
+
+        // Add route to local tun for routing
+        tx_address_updates
+            .send(tun::AddressUpdate::AddRoute(addr.clone()))
+            .await?;
+
+        let address_assign_capsule = AddressAssignCapsule {
+            addresses: assigned_addresses,
+        };
+        let capsule = Capsule::AddressAssign(address_assign_capsule);
+        capsule.append(&mut octets_mut)?;
+    } else {
+        error!("no available addresses to assign to client");
+    }
+
+    // Advertise route
+    let mut routes = vec![];
+    for route in &state.local_routes {
+        info!("advertising route to client: {}", route);
+        routes.push(RouteAdvertisement {
+            ip_net: route.clone(),
+            proto: 0,
+        });
+    }
+    let route_advertisement_capsule = RouteAdvertisementCapsule { routes: routes };
+    let capsule = Capsule::RouteAdvertisement(route_advertisement_capsule);
+    capsule.append(&mut octets_mut)?;
+
+    let payload_len = octets_mut.off();
+    h3_conn
+        .as_mut()
+        .unwrap()
+        .send_body(
+            &mut conn,
+            state.stream_id.unwrap(),
+            &buf[..payload_len],
+            false,
+        )
+        .unwrap();
+
+    Ok(())
 }

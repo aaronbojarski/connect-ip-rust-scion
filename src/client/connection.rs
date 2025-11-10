@@ -11,12 +11,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace};
 
 use crate::client::MAX_DATAGRAM_SIZE;
-use crate::connect_ip::capsule::{
-    AddressAssignCapsule, AddressRequestCapsule, AssignedAddress, Capsule, RequestedAddress,
-    RouteAdvertisement, RouteAdvertisementCapsule,
+use crate::connect_ip::capsule::{AddressRequestCapsule, Capsule, RequestedAddress};
+use crate::connect_ip::capsule_protocol::{
+    CapsuleProtocolState, assign_addresses_and_routes, handle_capsule_data,
 };
-use crate::connect_ip::capsule_protocol::{CapsuleProtocolState, handle_capsule_data};
-use crate::net::{UdpPacket, get_next_avail_subnet, tun};
+use crate::net::{UdpPacket, tun};
 
 #[derive(Debug, Eq, PartialEq)]
 enum StreamStatus {
@@ -429,8 +428,11 @@ impl Connection {
             && self.stream_state == StreamStatus::TunnelEstablished
             && self.capsule_state.stream_id.is_some()
         {
-            self.send_addresses_and_routes(
-                self.capsule_state.stream_id.unwrap(),
+            assign_addresses_and_routes(
+                &mut self.capsule_state,
+                &mut self.conn,
+                &mut self.h3_conn,
+                &mut self.available_addresses,
                 tx_address_updates,
             )
             .await?;
@@ -479,72 +481,6 @@ impl Connection {
             .unwrap()
             .send_body(&mut self.conn, stream_id, &buf[..payload_len], false)
             .unwrap();
-        Ok(())
-    }
-
-    async fn send_addresses_and_routes(
-        &mut self,
-        stream_id: u64,
-        tx_address_updates: &mut mpsc::Sender<tun::AddressUpdate>,
-    ) -> Result<()> {
-        info!(
-            "{} assigning addresses and routes to peer",
-            self.conn.trace_id()
-        );
-
-        let mut buf = vec![0u8; 1000];
-        let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
-
-        // Assign a /32 address from the address pool
-        let mut assigned_addresses = vec![];
-        if let Some(addr) = get_next_avail_subnet(&mut self.available_addresses, 32).await {
-            info!("assigning address to peer: {}", addr);
-            self.capsule_state.remote_addresses.push(addr.clone());
-            let assigned_address = AssignedAddress {
-                request_id: 0,
-                ip_net: addr.clone(),
-            };
-            assigned_addresses.push(assigned_address);
-
-            // Add route to local tun for routing
-            tx_address_updates
-                .send(tun::AddressUpdate::AddRoute(addr.clone()))
-                .await?;
-
-            let address_assign_capsule = AddressAssignCapsule {
-                addresses: assigned_addresses,
-            };
-            let capsule = Capsule::AddressAssign(address_assign_capsule);
-            capsule.append(&mut octets_mut)?;
-        } else {
-            error!("no available addresses to assign to client");
-        }
-
-        // Advertise route
-        let mut routes = vec![];
-        for route in &self.capsule_state.local_routes {
-            info!("advertising route to peer: {}", route);
-            routes.push(RouteAdvertisement {
-                ip_net: route.clone(),
-                proto: 0,
-            });
-        }
-        let route_advertisement_capsule = RouteAdvertisementCapsule { routes: routes };
-        let capsule = Capsule::RouteAdvertisement(route_advertisement_capsule);
-        capsule.append(&mut octets_mut)?;
-
-        let payload_len = octets_mut.off();
-        self.h3_conn
-            .as_mut()
-            .unwrap()
-            .send_body(&mut self.conn, stream_id, &buf[..payload_len], false)
-            .unwrap();
-
-        info!(
-            "{} sent AddressAssign and RouteAdvertisement capsules",
-            self.conn.trace_id()
-        );
-
         Ok(())
     }
 }
