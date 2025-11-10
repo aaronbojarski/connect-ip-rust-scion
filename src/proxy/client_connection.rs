@@ -203,7 +203,6 @@ impl ClientConnection {
         if self.conn.is_established() && !self.conn.is_in_early_data() {
             // Receive datagrams from QUIC and forward to TUN
             while let Ok(len) = self.conn.dgram_recv(buf) {
-                debug!("received {} bytes from QUIC datagram", len);
                 let mut octets = Octets::with_slice(&buf[..len]);
                 let stream_id = octets.get_varint()? * 4;
                 let context_id = octets.get_varint()?;
@@ -230,7 +229,7 @@ impl ClientConnection {
                 if let Some(ipv4) = Ipv4Packet::new(&buf[packet_start..len]) {
                     let src = ipv4.get_source();
                     let dest = ipv4.get_destination();
-                    info!(
+                    debug!(
                         "forwarding IP packet to TUN: {} -> {}, {} bytes",
                         src,
                         dest,
@@ -248,7 +247,7 @@ impl ClientConnection {
         if let Some(ipv4) = Ipv4Packet::new(&ip_packet) {
             let src = ipv4.get_source();
             let dest = ipv4.get_destination();
-            info!(
+            debug!(
                 "received IP packet from TUN: {} -> {}, {} bytes",
                 src,
                 dest,

@@ -15,11 +15,19 @@ struct Opt {
     /// Address to bind on
     #[clap(long = "bind", default_value = "0.0.0.0:0")]
     bind: SocketAddr,
+
+    /// Routes to advertise to the proxy
+    #[clap(long)]
+    routes: Vec<IpNet>,
+
+    /// Address pool to assign from
+    #[clap(long)]
+    address_pool: Vec<IpNet>,
 }
 
 fn main() {
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
+        .with_max_level(tracing::Level::INFO)
         .init();
     let opt = Opt::parse();
     let config = connect_ip_rust_scion::client::ClientConfig {
@@ -27,20 +35,8 @@ fn main() {
         url: opt.url.clone(),
         cert_path: std::path::PathBuf::new(),
         key_path: std::path::PathBuf::new(),
-        routes: vec![
-            IpNet::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 248, 1, 0)),
-                24,
-            )
-            .unwrap(),
-        ],
-        address_pool: vec![
-            IpNet::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 248, 1, 128)),
-                25,
-            )
-            .unwrap(),
-        ],
+        routes: opt.routes,
+        address_pool: opt.address_pool,
         tun_name: "tun0".to_string(),
     };
     let client = connect_ip_rust_scion::client::Client::new(config);

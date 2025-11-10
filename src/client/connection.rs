@@ -15,6 +15,7 @@ use crate::connect_ip::capsule::{AddressRequestCapsule, Capsule, RequestedAddres
 use crate::connect_ip::capsule_protocol::{
     CapsuleProtocolState, assign_addresses_and_routes, handle_capsule_data,
 };
+use crate::connect_ip::request::build_request;
 use crate::net::{UdpPacket, tun};
 
 #[derive(Debug, Eq, PartialEq)]
@@ -157,28 +158,7 @@ impl Connection {
 
                 // Outgoing IP packets from TUN
                 Some(ip_packet) = rx_tun_to_quic.recv() => {
-                    if let Some(ipv4) = Ipv4Packet::new(&ip_packet) {
-                        let src = ipv4.get_source();
-                        let dest = ipv4.get_destination();
-                        info!(
-                            "received IP packet from TUN: {} -> {}, {} bytes",
-                            src,
-                            dest,
-                            ip_packet.len()
-                        );
-                    }
-                    if self.conn.is_established() && self.capsule_state.stream_id.is_some() {
-                        let mut octets = OctetsMut::with_slice(&mut buf);
-                        octets.put_varint(self.capsule_state.stream_id.unwrap() / 4)?;
-                        octets.put_varint(0)?;
-                        octets.put_bytes(&ip_packet)?;
-                        let len = octets.off();
-                        if let Err(e) = self.conn.dgram_send(&buf[..len]) {
-                            debug!("dgram_send failed: {:?}", e);
-                        }
-                    } else {
-                        debug!("connection not established yet, dropping packet");
-                    }
+                    self.process_tun_packet(ip_packet).await?;
                 }
             }
 
@@ -252,7 +232,6 @@ impl Connection {
             // Receive datagrams from QUIC and forward to TUN
             let mut buf = vec![0; MAX_DATAGRAM_SIZE];
             while let Ok(len) = self.conn.dgram_recv(&mut buf) {
-                debug!("received {} bytes from QUIC datagram", len);
                 let mut octets = Octets::with_slice(&buf[..len]);
                 let stream_id = octets.get_varint()? * 4;
                 let context_id = octets.get_varint()?;
@@ -279,7 +258,7 @@ impl Connection {
                 if let Some(ipv4) = Ipv4Packet::new(&buf[packet_start..len]) {
                     let src = ipv4.get_source();
                     let dest = ipv4.get_destination();
-                    info!(
+                    debug!(
                         "forwarding IP packet to TUN: {} -> {}, {} bytes",
                         src,
                         dest,
@@ -294,23 +273,41 @@ impl Connection {
         Ok(())
     }
 
+    async fn process_tun_packet(&mut self, ip_packet: Vec<u8>) -> Result<()> {
+        let mut buf = vec![0; MAX_DATAGRAM_SIZE];
+        if let Some(ipv4) = Ipv4Packet::new(&ip_packet) {
+            let src = ipv4.get_source();
+            let dest = ipv4.get_destination();
+            debug!(
+                "received IP packet from TUN: {} -> {}, {} bytes",
+                src,
+                dest,
+                ip_packet.len()
+            );
+        }
+        if self.conn.is_established() && self.capsule_state.stream_id.is_some() {
+            let mut octets = OctetsMut::with_slice(&mut buf);
+            octets.put_varint(self.capsule_state.stream_id.unwrap() / 4)?;
+            octets.put_varint(0)?;
+            octets.put_bytes(&ip_packet)?;
+            let len = octets.off();
+            if let Err(e) = self.conn.dgram_send(&buf[..len]) {
+                debug!("dgram_send failed: {:?}", e);
+            }
+        } else {
+            debug!("connection not established yet, dropping packet");
+        }
+        Ok(())
+    }
+
     async fn handle_http3(
         &mut self,
         tx_address_updates: &mut mpsc::Sender<tun::AddressUpdate>,
     ) -> Result<()> {
-        let mut h3_config = quiche::h3::Config::new().unwrap();
-        h3_config.enable_extended_connect(true);
-        let req = vec![
-            quiche::h3::Header::new(b":method", b"CONNECT"),
-            quiche::h3::Header::new(b":protocol", b"connect-ip"),
-            quiche::h3::Header::new(b":scheme", b"https"),
-            quiche::h3::Header::new(b":authority", b"localhost"),
-            quiche::h3::Header::new(b":path", b"/vpn"),
-            quiche::h3::Header::new(b"capsule-protocol", b"?1"),
-        ];
-
         // Create a new HTTP/3 connection once the QUIC connection is established.
         if self.conn.is_established() && self.h3_conn.is_none() {
+            let mut h3_config = quiche::h3::Config::new().unwrap();
+            h3_config.enable_extended_connect(true);
             self.h3_conn = Some(
                 quiche::h3::Connection::with_transport(&mut self.conn, &h3_config)
                     .expect("Unable to create HTTP/3 connection, check the server's uni stream limit and window size"),
@@ -320,6 +317,7 @@ impl Connection {
         // Send HTTP requests.
         if let Some(h3_conn) = &mut self.h3_conn {
             if self.stream_state == StreamStatus::Initialized {
+                let req = build_request("localhost".to_string(), "/vpn".to_string());
                 info!("sending HTTP request {req:?}");
                 let stream_id = h3_conn.send_request(&mut self.conn, &req, false).unwrap();
                 self.capsule_state.stream_id = Some(stream_id);
@@ -339,6 +337,14 @@ impl Connection {
                             hdrs_to_strings(&list),
                             stream_id
                         );
+                        if stream_id != self.capsule_state.stream_id.unwrap() {
+                            error!(
+                                "{} got headers on unknown stream id {}",
+                                self.conn.trace_id(),
+                                stream_id
+                            );
+                            continue;
+                        }
                         // TODO: Drop connection if another stream already exists
                         if Self::check_response(&list) {
                             // self.capsule_state.stream_id = Some(stream_id);
