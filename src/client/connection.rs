@@ -7,7 +7,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::client::MAX_DATAGRAM_SIZE;
 use crate::connect_ip::capsule::{AddressRequestCapsule, Capsule, RequestedAddress};
@@ -15,7 +15,7 @@ use crate::connect_ip::capsule_protocol::{
     CapsuleProtocolState, assign_addresses_and_routes, handle_capsule_data,
 };
 use crate::connect_ip::request::{build_request, check_response, headers_to_strings};
-use crate::net::{UdpPacket, tun};
+use crate::net::{UdpPacket, check_packet_src_dst, tun};
 
 #[derive(Debug, Eq, PartialEq)]
 enum StreamStatus {
@@ -258,13 +258,27 @@ impl Connection {
                     let src = ipv4.get_source();
                     let dest = ipv4.get_destination();
                     debug!(
-                        "forwarding IP packet to TUN: {} -> {}, {} bytes",
+                        "received IP packet from QUIC: {} -> {}, {} bytes",
                         src,
                         dest,
                         len - packet_start
                     );
-                    // TODO: validate packet addresses before sending to TUN
-                    tx_quic_to_tun.send(buf[packet_start..len].to_vec()).await?;
+
+                    if check_packet_src_dst(
+                        IpAddr::V4(src),
+                        IpAddr::V4(dest),
+                        &self.capsule_state.remote_addresses,
+                        &self.capsule_state.remote_routes,
+                        &self.capsule_state.local_addresses,
+                        &self.capsule_state.local_routes,
+                    ) {
+                        tx_quic_to_tun.send(buf[packet_start..len].to_vec()).await?;
+                    } else {
+                        warn!(
+                            "dropping packet from peer with invalid src/dst: {} -> {}",
+                            src, dest
+                        );
+                    }
                 }
             }
         }
@@ -283,7 +297,28 @@ impl Connection {
                 dest,
                 ip_packet.len()
             );
+            if !check_packet_src_dst(
+                IpAddr::V4(src),
+                IpAddr::V4(dest),
+                &self.capsule_state.local_addresses,
+                &self.capsule_state.local_routes,
+                &self.capsule_state.remote_addresses,
+                &self.capsule_state.remote_routes,
+            ) {
+                warn!(
+                    "dropping packet from TUN with invalid src/dst: {} -> {}",
+                    src, dest
+                );
+                return Ok(());
+            }
+        } else {
+            debug!(
+                "received non-IPv4 packet from TUN, {} bytes",
+                ip_packet.len()
+            );
+            return Ok(());
         }
+
         if self.conn.is_established() && self.capsule_state.stream_id.is_some() {
             let mut octets = OctetsMut::with_slice(&mut buf);
             octets.put_varint(self.capsule_state.stream_id.unwrap() / 4)?;

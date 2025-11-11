@@ -153,3 +153,20 @@ pub fn remove_route(destination: &IpNet, dev: String) -> Result<(), Error> {
         Err(anyhow::anyhow!("ExitStatus: {}", status))
     }
 }
+
+pub fn check_packet_src_dst(
+    packet_src: IpAddr,
+    packet_dst: IpAddr,
+    allowed_src_1: &Vec<IpNet>,
+    allowed_src_2: &Vec<IpNet>,
+    allowed_dst_1: &Vec<IpNet>,
+    allowed_dst_2: &Vec<IpNet>,
+) -> bool {
+    let src_valid = allowed_src_1.iter().any(|net| net.contains(&packet_src))
+        || allowed_src_2.iter().any(|net| net.contains(&packet_src));
+
+    let dst_valid = allowed_dst_1.iter().any(|net| net.contains(&packet_dst))
+        || allowed_dst_2.iter().any(|net| net.contains(&packet_dst));
+
+    src_valid && dst_valid
+}

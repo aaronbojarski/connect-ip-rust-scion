@@ -30,7 +30,7 @@ sudo ip netns exec proxy_ns ./target/debug/proxy --listen 10.248.100.11:4433 --r
 
 Then start the client in another terminal.
 ```bash
-sudo ip netns exec client_ns ./target/debug/client https://10.248.100.11:4433 --host localhost --routes 10.248.1.0/24 --address-pool 10.248.2.128/25
+sudo ip netns exec client_ns ./target/debug/client https://10.248.100.11:4433 --host localhost --routes 10.248.1.0/24 --address-pool 10.248.1.128/25
 ```
 
 Enable packet forwading in the server and client namespaces.
@@ -53,9 +53,6 @@ sudo ip netns exec eh0ns ping 10.248.2.1
 - improve QUIC implementation
     - certificates
     - access logic (authentication/authorization)
-- improve http3
-    - add checks on IP packets (src/dst addresses)
-    - return addresses to pool on connection close
 - scion integration
     - switch socket
     - translate addresses
