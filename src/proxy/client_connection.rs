@@ -14,7 +14,7 @@ use crate::connect_ip::capsule_protocol::{
     CapsuleProtocolState, assign_addresses_and_routes, handle_capsule_data,
 };
 use crate::connect_ip::request::{build_response, headers_to_strings};
-use crate::net::{UdpPacket, tun};
+use crate::net::{UdpPacket, return_subnet, tun};
 use crate::proxy::MAX_DATAGRAM_SIZE;
 
 struct PartialResponse {
@@ -156,6 +156,12 @@ impl ClientConnection {
         // Wait for TUN task to finish with timeout
         if let Some(tun_handle) = tun.handle.take() {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(2), tun_handle).await;
+        }
+
+        // TODO: return addresses also if connection fails before releasing them
+        for addr in self.capsule_state.remote_addresses.iter() {
+            info!("Releasing address {}", addr);
+            return_subnet(self.available_addresses.clone(), *addr).await;
         }
 
         Ok(())

@@ -70,7 +70,7 @@ pub async fn get_next_avail_subnet(
     None
 }
 
-pub async fn return_subnet(available_nets: &mut Arc<Mutex<Vec<IpNet>>>, subnet: IpNet) {
+pub async fn return_subnet(available_nets: Arc<Mutex<Vec<IpNet>>>, subnet: IpNet) {
     let mut available_nets = available_nets.lock().await;
     available_nets.push(subnet);
     *available_nets = IpNet::aggregate(&available_nets);
