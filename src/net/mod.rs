@@ -106,7 +106,21 @@ pub async fn get_specific_subnet(
     None
 }
 
-pub fn add_route(destination: &IpNet, dev: String) -> Result<(), Error> {
+pub fn add_route(destination: &IpNet, dev: String) -> Result<bool, Error> {
+    // check if the route already exists
+    let existing_routes = match destination {
+        IpNet::V4(_) => Command::new("ip")
+            .args(&["route", "show", &destination.to_string(), "dev", &dev])
+            .output()?,
+        IpNet::V6(_) => Command::new("ip")
+            .args(&["-6", "route", "show", &destination.to_string(), "dev", &dev])
+            .output()?,
+    };
+
+    if !existing_routes.stdout.is_empty() {
+        return Ok(false);
+    }
+
     let status = match destination {
         IpNet::V4(_) => Command::new("ip")
             .args(&["route", "add", &destination.to_string(), "dev", &dev])
@@ -117,7 +131,7 @@ pub fn add_route(destination: &IpNet, dev: String) -> Result<(), Error> {
     };
 
     if status.success() {
-        Ok(())
+        Ok(true)
     } else {
         Err(anyhow::anyhow!("ExitStatus: {}", status))
     }

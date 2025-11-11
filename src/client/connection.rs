@@ -2,7 +2,6 @@ use anyhow::Result;
 use ipnet::IpNet;
 use octets::{Octets, OctetsMut};
 use pnet::packet::ipv4::Ipv4Packet;
-use quiche::h3::NameValue;
 use ring::rand::{SecureRandom, SystemRandom};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -15,7 +14,7 @@ use crate::connect_ip::capsule::{AddressRequestCapsule, Capsule, RequestedAddres
 use crate::connect_ip::capsule_protocol::{
     CapsuleProtocolState, assign_addresses_and_routes, handle_capsule_data,
 };
-use crate::connect_ip::request::build_request;
+use crate::connect_ip::request::{build_request, check_response, headers_to_strings};
 use crate::net::{UdpPacket, tun};
 
 #[derive(Debug, Eq, PartialEq)]
@@ -334,20 +333,21 @@ impl Connection {
                     Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
                         info!(
                             "got response headers {:?} on stream id {}",
-                            hdrs_to_strings(&list),
+                            headers_to_strings(&list),
                             stream_id
                         );
-                        if stream_id != self.capsule_state.stream_id.unwrap() {
+                        if Some(stream_id) != self.capsule_state.stream_id {
                             error!(
-                                "{} got headers on unknown stream id {}",
+                                "{} got headers on unknown stream id {}. Closing connection.",
                                 self.conn.trace_id(),
                                 stream_id
                             );
+                            self.conn
+                                .close(true, 0x100, b"headers on unknown stream")
+                                .unwrap();
                             continue;
                         }
-                        // TODO: Drop connection if another stream already exists
-                        if Self::check_response(&list) {
-                            // self.capsule_state.stream_id = Some(stream_id);
+                        if check_response(&list) {
                             self.stream_state = StreamStatus::TunnelEstablished;
                         } else {
                             error!("unexpected response from server, closing connection");
@@ -426,7 +426,7 @@ impl Connection {
             && self.stream_state == StreamStatus::TunnelEstablished
         {
             self.send_address_request()?;
-            info!("sent initial capsules to establish tunnel");
+            info!("sent address request capsule");
             self.request_address_done = true;
         }
 
@@ -445,27 +445,6 @@ impl Connection {
             self.assign_address_done = true;
         }
         Ok(())
-    }
-
-    fn check_response(headers: &[quiche::h3::Header]) -> bool {
-        // Handle response headers and start capsule protocol
-        let mut capsule_protocol = None;
-        let mut status = None;
-        for hdr in headers {
-            match hdr.name() {
-                b":status" => status = Some(hdr.value()),
-                b"capsule-protocol" => capsule_protocol = Some(hdr.value()),
-                _ => (),
-            }
-        }
-
-        match (status, capsule_protocol) {
-            (Some(b"200"), Some(b"?1")) => (),
-            _ => {
-                return false;
-            }
-        };
-        true
     }
 
     fn send_address_request(&mut self) -> Result<()> {
@@ -489,15 +468,4 @@ impl Connection {
             .unwrap();
         Ok(())
     }
-}
-
-pub fn hdrs_to_strings(hdrs: &[quiche::h3::Header]) -> Vec<(String, String)> {
-    hdrs.iter()
-        .map(|h| {
-            let name = String::from_utf8_lossy(h.name()).to_string();
-            let value = String::from_utf8_lossy(h.value()).to_string();
-
-            (name, value)
-        })
-        .collect()
 }

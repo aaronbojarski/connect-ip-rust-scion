@@ -2,7 +2,6 @@ use anyhow::Result;
 use ipnet::IpNet;
 use octets::{Octets, OctetsMut};
 use pnet::packet::ipv4::Ipv4Packet;
-use quiche::h3::NameValue;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -14,6 +13,7 @@ use tracing::{debug, error, info, trace};
 use crate::connect_ip::capsule_protocol::{
     CapsuleProtocolState, assign_addresses_and_routes, handle_capsule_data,
 };
+use crate::connect_ip::request::{build_response, headers_to_strings};
 use crate::net::{UdpPacket, tun};
 use crate::proxy::MAX_DATAGRAM_SIZE;
 
@@ -304,8 +304,18 @@ impl ClientConnection {
             loop {
                 let http3_conn = self.h3_conn.as_mut().unwrap();
                 match http3_conn.poll(&mut self.conn) {
-                    // TODO: only allow request for one stream per connection
                     Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
+                        if self.capsule_state.stream_id.is_some() {
+                            error!(
+                                "{} got headers after successful request on stream id {}. Closing connection.",
+                                self.conn.trace_id(),
+                                stream_id
+                            );
+                            self.conn
+                                .close(true, 0x100, b"headers on unknown stream")
+                                .unwrap();
+                            continue;
+                        }
                         self.handle_request(stream_id, &list);
                     }
 
@@ -371,11 +381,11 @@ impl ClientConnection {
         info!(
             "{} got request {:?} on stream id {}",
             self.conn.trace_id(),
-            hdrs_to_strings(headers),
+            headers_to_strings(headers),
             stream_id
         );
 
-        let (headers, body) = self.build_response(headers);
+        let (headers, body) = build_response(headers);
         let http3_conn = self.h3_conn.as_mut().unwrap();
 
         match http3_conn.send_response(&mut self.conn, stream_id, &headers, false) {
@@ -421,37 +431,6 @@ impl ClientConnection {
         self.capsule_state.stream_id = Some(stream_id);
     }
 
-    /// Builds an HTTP/3 response given a request.
-    fn build_response(
-        &mut self,
-        request: &[quiche::h3::Header],
-    ) -> (Vec<quiche::h3::Header>, Vec<u8>) {
-        let mut method = None;
-        let mut protocol = None;
-
-        for hdr in request {
-            match hdr.name() {
-                b":protocol" => protocol = Some(hdr.value()),
-
-                b":method" => method = Some(hdr.value()),
-
-                _ => (),
-            }
-        }
-
-        let (status, body) = match (method, protocol) {
-            (Some(b"CONNECT"), Some(b"connect-ip")) => (200, Vec::new()),
-            _ => (405, Vec::new()),
-        };
-
-        let headers = vec![
-            quiche::h3::Header::new(b":status", status.to_string().as_bytes()),
-            quiche::h3::Header::new(b"capsule-protocol", "?1".as_bytes()),
-        ];
-
-        (headers, body)
-    }
-
     /// Handles newly writable streams. This is quiche boilerplate for handling partial writes.
     fn handle_writable(&mut self, stream_id: u64) {
         let http3_conn = match &mut self.h3_conn {
@@ -489,9 +468,7 @@ impl ClientConnection {
         }
 
         resp.headers = None;
-
         let body = &resp.body[resp.written..];
-
         let written = match http3_conn.send_body(&mut self.conn, stream_id, body, false) {
             Ok(v) => v,
 
@@ -511,15 +488,4 @@ impl ClientConnection {
             self.partial_responses.remove(&stream_id);
         }
     }
-}
-
-pub fn hdrs_to_strings(hdrs: &[quiche::h3::Header]) -> Vec<(String, String)> {
-    hdrs.iter()
-        .map(|h| {
-            let name = String::from_utf8_lossy(h.name()).to_string();
-            let value = String::from_utf8_lossy(h.value()).to_string();
-
-            (name, value)
-        })
-        .collect()
 }

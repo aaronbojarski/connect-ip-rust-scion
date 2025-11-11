@@ -5,7 +5,7 @@ use ipnet::IpNet;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, info_span, trace};
+use tracing::{debug, error, info, info_span, trace};
 use tracing_futures::Instrument as _;
 use tun_rs::DeviceBuilder;
 
@@ -80,10 +80,16 @@ impl Tun {
                                         info!("Removed address {} from TUN device {}", ipnet, name);
                                     }
                                     AddressUpdate::AddRoute(ipnet) => {
-                                        if let Err(e) = add_route(&ipnet, name.clone()) {
-                                            error!("Failed to add route {}: {}", ipnet, e);
-                                        } else {
-                                            info!("Added route {} via TUN device {}", ipnet, name);
+                                        match add_route(&ipnet, name.clone()) {
+                                            Ok(true) => {
+                                                info!("Added route {} via TUN device {}", ipnet, name);
+                                            }
+                                            Ok(false) => {
+                                                debug!("Route {} already exists, not adding again", ipnet);
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to add route {}: {}", ipnet, e);
+                                            }
                                         }
                                     }
                                     AddressUpdate::RemoveRoute(ipnet) => {
@@ -102,7 +108,7 @@ impl Tun {
                                 let packet_data = buf[..len].to_vec();
                                 trace!("TUN -> QUIC: {:?}", packet_data);
                                 if tx_tun_to_quic.send(packet_data.clone()).await.is_err() {
-                                    info!("TUN device {} connection closed (send failed)", name);
+                                    error!("TUN device {} connection closed (send failed)", name);
                                     break;
                                 }
                             }

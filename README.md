@@ -54,7 +54,6 @@ sudo ip netns exec eh0ns ping 10.248.2.1
     - certificates
     - access logic (authentication/authorization)
 - improve http3
-    - request on new stream
     - add checks on IP packets (src/dst addresses)
     - return addresses to pool on connection close
 - scion integration
