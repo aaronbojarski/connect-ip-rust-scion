@@ -69,11 +69,10 @@ impl Proxy {
             tokio::select! {
                 // Receive datagram from UDP socket
                 Ok((len, src)) = socket.recv_from(&mut buf) => {
-                    let packet_data = buf[..len].to_vec();
+                    let mut packet_data = buf[..len].to_vec();
 
                     // Parse the QUIC packet header to identify connection
-                    let mut packet_slice = packet_data.clone();
-                    let hdr = match quiche::Header::from_slice(&mut packet_slice, quiche::MAX_CONN_ID_LEN) {
+                    let hdr = match quiche::Header::from_slice(&mut packet_data, quiche::MAX_CONN_ID_LEN) {
                         Ok(v) => v,
                         Err(e) => {
                             debug!("failed to parse header: {:?}", e);

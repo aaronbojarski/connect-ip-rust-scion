@@ -132,9 +132,11 @@ impl Connection {
             })
             .await?;
 
+        let mut packet_buf: Vec<UdpPacket> = Vec::with_capacity(10);
         let mut keepalive_interval = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
             let timeout = self.conn.timeout();
+            packet_buf.clear();
             tokio::select! {
                 // Connection timeout
                 _ = tokio::time::sleep(timeout.unwrap_or(std::time::Duration::from_secs(24 * 60 * 60))) => {
@@ -151,8 +153,8 @@ impl Connection {
                 }
 
                 // Incoming UDP packets (QUIC protocol packets)
-                Some(packet) = self.rx_udp_to_quic.recv() => {
-                    self.process_udp_packet(packet, tx_quic_to_tun.clone(), &mut tx_address_updates).await?;
+                num_packets = self.rx_udp_to_quic.recv_many(&mut packet_buf, 10) => {
+                    self.process_udp_packets(&mut packet_buf, num_packets, &tx_quic_to_tun, &mut tx_address_updates).await?;
                 }
 
                 // Outgoing IP packets from TUN
@@ -204,20 +206,24 @@ impl Connection {
         Ok(())
     }
 
-    async fn process_udp_packet(
+    async fn process_udp_packets(
         &mut self,
-        packet: UdpPacket,
-        tx_quic_to_tun: mpsc::Sender<Vec<u8>>,
+        packet_buf: &mut Vec<UdpPacket>,
+        num_packets: usize,
+        tx_quic_to_tun: &mpsc::Sender<Vec<u8>>,
         tx_address_updates: &mut mpsc::Sender<tun::AddressUpdate>,
     ) -> Result<()> {
-        let recv_info = quiche::RecvInfo {
-            from: packet.src,
-            to: packet.dst,
-        };
+        for i in 0..num_packets {
+            let packet = &mut packet_buf[i];
+            let recv_info = quiche::RecvInfo {
+                from: packet.src,
+                to: packet.dst,
+            };
 
-        if let Err(e) = self.conn.recv(&mut packet.data.clone(), recv_info) {
-            error!("recv failed: {:?}, recv_info: {:?}", e, recv_info);
-            return Ok(());
+            if let Err(e) = self.conn.recv(&mut packet.data, recv_info) {
+                error!("recv failed: {:?}, recv_info: {:?}", e, recv_info);
+                return Ok(());
+            }
         }
 
         // Handle HTTP/3 connection establishment and process HTTP/3 data

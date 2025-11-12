@@ -87,9 +87,11 @@ impl ClientConnection {
             .await?;
 
         let mut buf = [0; MAX_DATAGRAM_SIZE];
+        let mut packet_buf: Vec<UdpPacket> = Vec::with_capacity(10);
         let mut keepalive_interval = tokio::time::interval(std::time::Duration::from_secs(5));
 
         loop {
+            packet_buf.clear();
             let timeout = self
                 .conn
                 .timeout()
@@ -110,8 +112,8 @@ impl ClientConnection {
                 }
 
                 // Handle incoming UDP packets
-                Some(packet) = self.rx_udp_to_quic.recv() => {
-                    self.process_udp_packet(packet, &mut buf, &mut tx_quic_to_tun, &mut tx_address_updates).await?;
+                num_packets = self.rx_udp_to_quic.recv_many(&mut packet_buf, 10) => {
+                    self.process_udp_packets(&mut packet_buf, num_packets, &mut tx_quic_to_tun, &mut tx_address_updates).await?;
                 }
 
                 // Handle outgoing IP packets from TUN
@@ -167,27 +169,30 @@ impl ClientConnection {
         Ok(())
     }
 
-    async fn process_udp_packet(
+    async fn process_udp_packets(
         &mut self,
-        packet: UdpPacket,
-        buf: &mut [u8],
+        packet_buf: &mut Vec<UdpPacket>,
+        num_packets: usize,
         tx_quic_to_tun: &mut mpsc::Sender<Vec<u8>>,
         tx_address_updates: &mut mpsc::Sender<tun::AddressUpdate>,
     ) -> Result<()> {
-        let recv_info = quiche::RecvInfo {
-            from: packet.src,
-            to: packet.dst,
-        };
+        let mut buf = [0; MAX_DATAGRAM_SIZE];
+        for i in 0..num_packets {
+            let packet = &mut packet_buf[i];
+            let recv_info = quiche::RecvInfo {
+                from: packet.src,
+                to: packet.dst,
+            };
 
-        // Process the packet
-        if let Err(e) = self.conn.recv(&mut packet.data.clone(), recv_info) {
-            error!("recv failed: {:?}, recv_info: {:?}", e, recv_info);
-            return Ok(());
+            // Process the packet
+            if let Err(e) = self.conn.recv(&mut packet.data, recv_info) {
+                error!("recv failed: {:?}, recv_info: {:?}", e, recv_info);
+                return Ok(());
+            }
         }
 
         // Handle HTTP/3 connection establishment and process HTTP/3 data
-        self.handle_http3_connection(tx_address_updates, buf)
-            .await?;
+        self.handle_http3_connection(tx_address_updates).await?;
 
         // Handle initial address assignment and route advertisement
         if self.h3_conn.is_some()
@@ -208,7 +213,7 @@ impl ClientConnection {
         // Handle datagrams if connection is established
         if self.conn.is_established() && !self.conn.is_in_early_data() {
             // Receive datagrams from QUIC and forward to TUN
-            while let Ok(len) = self.conn.dgram_recv(buf) {
+            while let Ok(len) = self.conn.dgram_recv(&mut buf) {
                 let mut octets = Octets::with_slice(&buf[..len]);
                 let stream_id = octets.get_varint()? * 4;
                 let context_id = octets.get_varint()?;
@@ -317,8 +322,9 @@ impl ClientConnection {
     async fn handle_http3_connection(
         &mut self,
         tx_address_updates: &mut mpsc::Sender<tun::AddressUpdate>,
-        buf: &mut [u8],
     ) -> Result<()> {
+        let mut buf = [0; MAX_DATAGRAM_SIZE];
+
         // Setup HTTP/3 connection if not already done
         if (self.conn.is_in_early_data() || self.conn.is_established()) && self.h3_conn.is_none() {
             let mut h3_config = quiche::h3::Config::new().unwrap();
@@ -368,12 +374,11 @@ impl ClientConnection {
                             self.conn.trace_id(),
                             stream_id
                         );
-                        while let Ok(read) =
-                            self.h3_conn
-                                .as_mut()
-                                .unwrap()
-                                .recv_body(&mut self.conn, stream_id, buf)
-                        {
+                        while let Ok(read) = self.h3_conn.as_mut().unwrap().recv_body(
+                            &mut self.conn,
+                            stream_id,
+                            &mut buf,
+                        ) {
                             trace!("got {read} bytes of response data on stream {stream_id}");
                             let mut consumed = 0;
                             while consumed < read {
