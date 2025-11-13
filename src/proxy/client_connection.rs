@@ -191,6 +191,15 @@ impl ClientConnection {
             }
         }
 
+        // Quiche checks if a provided certificate is valid and aborts if not. However, we need to check if the peer provided one at all.
+        if self.conn.peer_cert().is_none() {
+            warn!("no client certificate provided by {:?}", self.scid);
+            // TODO: should we close the connection or wait for some time (~1s) before closing?
+            // At the moment we expect the client to always provide a certificate immediately.
+            self.conn.close(true, 0x100, b"peer certificate required")?;
+            return Ok(());
+        }
+
         // Handle HTTP/3 connection establishment and process HTTP/3 data
         self.handle_http3_connection(tx_address_updates).await?;
 

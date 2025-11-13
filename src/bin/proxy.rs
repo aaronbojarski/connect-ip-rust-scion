@@ -32,8 +32,9 @@ fn main() {
     let cwd = env::current_dir().unwrap();
     let config = connect_ip_rust_scion::proxy::ProxyConfig {
         listen: opt.listen,
-        cert_path: cwd.join("cert.pem"),
-        key_path: cwd.join("key.pem"),
+        ca_cert_path: cwd.join("ca-cert.pem"),
+        cert_path: cwd.join("proxy-cert.pem"),
+        key_path: cwd.join("proxy-key.pem"),
         routes: opt.routes,
         address_pool: opt.address_pool,
     };

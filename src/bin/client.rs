@@ -1,6 +1,6 @@
 use clap::Parser;
 use ipnet::IpNet;
-use std::net::SocketAddr;
+use std::{env, net::SocketAddr};
 use url::Url;
 
 #[derive(Parser, Debug)]
@@ -36,11 +36,13 @@ fn main() {
         .with_max_level(opt.log_level)
         .init();
 
+    let cwd = env::current_dir().unwrap();
     let config = connect_ip_rust_scion::client::ClientConfig {
         bind: opt.bind,
         url: opt.url.clone(),
-        cert_path: std::path::PathBuf::new(),
-        key_path: std::path::PathBuf::new(),
+        ca_cert_path: cwd.join("ca-cert.pem"),
+        cert_path: cwd.join("client-cert.pem"),
+        key_path: cwd.join("client-key.pem"),
         routes: opt.routes,
         address_pool: opt.address_pool,
         tun_name: "tun0".to_string(),

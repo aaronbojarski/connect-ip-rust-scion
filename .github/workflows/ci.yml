@@ -43,10 +43,7 @@ jobs:
         run: cargo build --bin proxy --bin client
 
       - name: Generate self-signed certificate
-        run: |
-          openssl req -x509 -newkey rsa:4096 \
-            -keyout key.pem -out cert.pem \
-            -days 365 -nodes -subj "/CN=localhost"
+        run: bash ./cryptogen.sh
 
       - name: Set up test network
         run: sudo bash ./testnet.sh up

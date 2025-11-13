@@ -40,6 +40,7 @@ pub struct Connection {
 impl Connection {
     pub fn new(
         server_name: String,
+        mut quic_config: quiche::Config,
         local_addr: SocketAddr,
         remote: SocketAddr,
         rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
@@ -48,15 +49,19 @@ impl Connection {
         available_addresses: Arc<Mutex<Vec<IpNet>>>,
         routes: Vec<IpNet>,
     ) -> Result<Self> {
-        let mut config = Self::configure_quic().unwrap();
-
         // Generate a random source connection ID for the connection.
         let mut scid = [0; quiche::MAX_CONN_ID_LEN];
         SystemRandom::new().fill(&mut scid[..]).unwrap();
         let scid = quiche::ConnectionId::from_ref(&scid);
 
         // Create a QUIC connection and initiate handshake.
-        let conn = quiche::connect(Some(&server_name), &scid, local_addr, remote, &mut config)?;
+        let conn = quiche::connect(
+            Some(&server_name),
+            &scid,
+            local_addr,
+            remote,
+            &mut quic_config,
+        )?;
 
         info!(
             "connecting to {:} from {:} with scid {:?}",
@@ -81,30 +86,6 @@ impl Connection {
             assign_address_done: false,
             request_address_done: false,
         })
-    }
-
-    fn configure_quic() -> Result<quiche::Config> {
-        // Create the configuration for the QUIC connection.
-        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
-
-        // TODO: Load certificates properly and verify server identity
-        config.verify_peer(false);
-
-        config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
-
-        config.set_max_idle_timeout(5000);
-        config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
-        config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
-        config.set_initial_max_data(10_000_000);
-        config.set_initial_max_stream_data_bidi_local(1_000_000);
-        config.set_initial_max_stream_data_bidi_remote(1_000_000);
-        config.set_initial_max_stream_data_uni(1_000_000);
-        config.set_initial_max_streams_bidi(100);
-        config.set_initial_max_streams_uni(100);
-        config.set_disable_active_migration(true);
-        config.enable_dgram(true, 30000, 30000);
-
-        Ok(config)
     }
 
     pub async fn start_connection_handling(

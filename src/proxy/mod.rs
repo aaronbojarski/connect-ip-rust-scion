@@ -19,6 +19,7 @@ const TOKEN_PREFIX: &[u8] = b"connect-ip-rust-scion";
 
 pub struct ProxyConfig {
     pub listen: SocketAddr,
+    pub ca_cert_path: std::path::PathBuf,
     pub cert_path: std::path::PathBuf,
     pub key_path: std::path::PathBuf,
     pub routes: Vec<IpNet>,
@@ -41,7 +42,11 @@ impl Proxy {
 
     #[tokio::main]
     pub async fn run(&self) -> Result<()> {
-        let mut quic_config = Self::configure_quic(&self.config.cert_path, &self.config.key_path)?;
+        let mut quic_config = Self::configure_quic(
+            &self.config.ca_cert_path,
+            &self.config.cert_path,
+            &self.config.key_path,
+        )?;
 
         let socket = tokio::net::UdpSocket::bind(self.config.listen).await?;
         let local_addr = socket.local_addr()?;
@@ -310,6 +315,7 @@ impl Proxy {
     }
 
     fn configure_quic(
+        ca_cert_path: &std::path::Path,
         cert_path: &std::path::Path,
         key_path: &std::path::Path,
     ) -> Result<quiche::Config> {
@@ -317,6 +323,8 @@ impl Proxy {
 
         info!("Loading cert from {:?}", cert_path);
         info!("Loading key from {:?}", key_path);
+        config.verify_peer(true);
+        config.load_verify_locations_from_file(ca_cert_path.to_str().unwrap())?;
         config.load_cert_chain_from_pem_file(cert_path.to_str().unwrap())?;
         config.load_priv_key_from_pem_file(key_path.to_str().unwrap())?;
 
