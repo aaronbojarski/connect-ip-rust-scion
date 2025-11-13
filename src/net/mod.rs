@@ -1,3 +1,4 @@
+pub mod quic;
 pub mod tun;
 
 use anyhow::Error;

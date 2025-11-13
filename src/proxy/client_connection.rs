@@ -14,8 +14,8 @@ use crate::connect_ip::capsule_protocol::{
     CapsuleProtocolState, assign_addresses_and_routes, handle_capsule_data,
 };
 use crate::connect_ip::request::{build_response, headers_to_strings};
+use crate::net::quic::MAX_DATAGRAM_SIZE;
 use crate::net::{UdpPacket, check_packet_src_dst, return_subnet, tun};
-use crate::proxy::MAX_DATAGRAM_SIZE;
 
 struct PartialResponse {
     headers: Option<Vec<quiche::h3::Header>>,

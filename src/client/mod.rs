@@ -9,10 +9,9 @@ use url::Url;
 
 use crate::client::connection::Connection;
 use crate::net::UdpPacket;
+use crate::net::quic::MAX_DATAGRAM_SIZE;
 
 pub mod connection;
-
-const MAX_DATAGRAM_SIZE: usize = 1350;
 
 #[derive(Clone)]
 pub struct ClientConfig {
@@ -58,7 +57,7 @@ impl Client {
 
         let available_addresses = Arc::new(Mutex::new(self.config.address_pool.clone()));
 
-        let quic_config = Self::configure_quic(
+        let quic_config = crate::net::quic::configure_quic(
             &self.config.ca_cert_path,
             &self.config.cert_path,
             &self.config.key_path,
@@ -132,34 +131,5 @@ impl Client {
 
         info!("client shutdown complete");
         result
-    }
-
-    fn configure_quic(
-        ca_cert_path: &std::path::PathBuf,
-        cert_path: &std::path::PathBuf,
-        key_path: &std::path::PathBuf,
-    ) -> Result<quiche::Config> {
-        // Create the configuration for the QUIC connection.
-        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
-
-        config.verify_peer(true);
-        config.load_cert_chain_from_pem_file(cert_path.to_str().unwrap())?;
-        config.load_priv_key_from_pem_file(key_path.to_str().unwrap())?;
-        config.load_verify_locations_from_file(ca_cert_path.to_str().unwrap())?;
-
-        config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
-        config.set_max_idle_timeout(5000);
-        config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
-        config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
-        config.set_initial_max_data(10_000_000);
-        config.set_initial_max_stream_data_bidi_local(1_000_000);
-        config.set_initial_max_stream_data_bidi_remote(1_000_000);
-        config.set_initial_max_stream_data_uni(1_000_000);
-        config.set_initial_max_streams_bidi(100);
-        config.set_initial_max_streams_uni(100);
-        config.set_disable_active_migration(true);
-        config.enable_dgram(true, 30000, 30000);
-
-        Ok(config)
     }
 }
