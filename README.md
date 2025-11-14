@@ -6,6 +6,22 @@ To build the project, use cargo.
 cargo build
 ```
 
+## Usage
+### Routes and address pools
+- `--routes` accepts CIDR prefixes (repeat the flag for multiple values). These prefixes will be advertised to the other end of the tunnel.
+- `--address-pool` accepts CIDR ranges (repeat the flag for multiple values). These ranges will be used to allocate tunnel addresses. Provide enough space for every peer.
+
+At least one route and one address pool must be provided for the proxy. For the client this is only necessary for site-to-site setups.
+
+Example:
+
+```
+connect-ip-rust-scion proxy \
+  --listen 127.0.0.1:4433 \
+  --routes 10.0.0.0/24 --routes 10.0.1.0/24 \
+  --address-pool 10.1.0.0/24
+```
+
 ## Running tests
 To run the unit tests, use cargo test.
 ```bash
