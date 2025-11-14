@@ -3,7 +3,7 @@
 ## Building
 To build the project, use cargo.
 ```bash
-cargo build --bin proxy --bin client
+cargo build
 ```
 
 ## Running tests
@@ -25,12 +25,12 @@ openssl req -x509 -newkey rsa:4096 -keyout key.der -outform DER -out cert.der -o
 
 Then start the server the corresponding namespace.
 ```bash
-sudo ip netns exec proxy_ns ./target/debug/proxy --listen 10.248.100.11:4433 --routes 10.248.2.0/24 --address-pool 10.248.2.128/25
+sudo ip netns exec proxy_ns ./target/debug/connect-ip-rust-scion proxy --listen 10.248.100.11:4433 --routes 10.248.2.0/24 --address-pool 10.248.2.128/25
 ```
 
 Then start the client in another terminal.
 ```bash
-sudo ip netns exec client_ns ./target/debug/client https://10.248.100.11:4433 --host localhost --routes 10.248.1.0/24 --address-pool 10.248.1.128/25
+sudo ip netns exec client_ns ./target/debug/connect-ip-rust-scion client https://10.248.100.11:4433 --host localhost --routes 10.248.1.0/24 --address-pool 10.248.1.128/25
 ```
 
 Enable packet forwading in the server and client namespaces.
@@ -50,9 +50,6 @@ sudo ip netns exec eh0ns ping 10.248.2.1
 ```
 
 ## TODO:
-- improve QUIC implementation
-    - certificates
-    - access logic (authentication/authorization)
 - scion integration
     - switch socket
     - translate addresses
