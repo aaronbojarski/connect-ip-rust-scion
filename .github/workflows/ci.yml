@@ -43,7 +43,7 @@ jobs:
         run: cargo build
 
       - name: Generate self-signed certificate
-        run: bash ./cryptogen.sh
+        run: bash ./generate_certs.sh
 
       - name: Set up test network
         run: sudo bash ./testnet.sh up
