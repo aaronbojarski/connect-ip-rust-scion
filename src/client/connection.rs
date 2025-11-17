@@ -12,7 +12,7 @@ use tracing::{debug, error, info, trace, warn};
 use crate::client::{CHANNEL_CAPACITY, MAX_DATAGRAM_SIZE};
 use crate::connect_ip::capsule::{AddressRequestCapsule, Capsule, RequestedAddress};
 use crate::connect_ip::capsule_protocol::{
-    CapsuleProtocolState, assign_addresses_and_routes, handle_capsule_data,
+    CapsuleProtocolState, handle_capsule_data, prepare_address_and_route_assignment,
 };
 use crate::connect_ip::request::{build_request, check_response, headers_to_strings};
 use crate::net::quic::{DEFAULT_TIMEOUT, KEEPALIVE_INTERVAL};
@@ -464,14 +464,34 @@ impl Connection {
             && self.stream_state == StreamStatus::TunnelEstablished
             && self.capsule_state.stream_id.is_some()
         {
-            assign_addresses_and_routes(
+            let mut buf = [0; 100];
+            let mut octets = OctetsMut::with_slice(&mut buf);
+            let assigned_address = prepare_address_and_route_assignment(
                 &mut self.capsule_state,
-                &mut self.conn,
-                &mut self.h3_conn,
                 self.available_addresses.clone(),
-                tx_address_updates,
+                &mut octets,
             )
             .await?;
+
+            if let Some(assigned_address) = assigned_address {
+                tx_address_updates
+                    .send(tun::AddressUpdate::AddRoute(assigned_address))
+                    .await?;
+            }
+
+            let payload_len = octets.off();
+            if payload_len == 0 {
+                error!("{} no capsule prepared, not sending", self.conn.trace_id());
+                return Ok(());
+            }
+
+            self.h3_conn.as_mut().unwrap().send_body(
+                &mut self.conn,
+                self.capsule_state.stream_id.unwrap(),
+                &buf[..payload_len],
+                false,
+            )?;
+
             self.assigned_addresses = true;
         }
         Ok(())
