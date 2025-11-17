@@ -77,10 +77,8 @@ impl Proxy {
             tokio::select! {
                 // Receive datagram from UDP socket
                 Ok((len, src)) = socket.recv_from(&mut buf) => {
-                    let mut packet_data = buf[..len].to_vec();
-
                     // Parse the QUIC packet header to identify connection
-                    let hdr = match quiche::Header::from_slice(&mut packet_data, quiche::MAX_CONN_ID_LEN) {
+                    let hdr = match quiche::Header::from_slice(&mut buf[..len], quiche::MAX_CONN_ID_LEN) {
                         Ok(v) => v,
                         Err(e) => {
                             debug!("failed to parse header: {:?}", e);
@@ -100,7 +98,7 @@ impl Proxy {
                     if let Some(client_conn) = client_conn_sender {
                         // Forward to existing connection task
                         let _ = client_conn.send(UdpPacket {
-                            data: packet_data,
+                            data: buf[..len].to_vec(),
                             src,
                             dst: local_addr,
                         }).await;
@@ -188,9 +186,9 @@ impl Proxy {
                             to: local_addr,
                         };
 
-                        match conn.recv(&mut packet_data.clone(), recv_info) {
-                            Ok(_) => {
-                                debug!("processed initial packet {} bytes", packet_data.len());
+                        match conn.recv(&mut buf[..len], recv_info) {
+                            Ok(len) => {
+                                debug!("processed initial packet {} bytes", len);
                             }
                             Err(e) => {
                                 warn!("failed to process initial packet: {:?}", e);

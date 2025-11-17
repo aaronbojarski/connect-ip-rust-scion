@@ -107,7 +107,7 @@ impl Tun {
                                 let len = len?;
                                 let packet_data = buf[..len].to_vec();
                                 trace!("TUN -> QUIC: {:?}", packet_data);
-                                if tx_tun_to_quic.send(packet_data.clone()).await.is_err() {
+                                if tx_tun_to_quic.send(packet_data).await.is_err() {
                                     error!("TUN device {} connection closed (send failed)", name);
                                     break;
                                 }

@@ -35,7 +35,7 @@ pub async fn handle_capsule_data(
     mut conn: &mut quiche::Connection,
     h3_conn: &mut Option<quiche::h3::Connection>,
     mut available_addresses: &mut Arc<Mutex<Vec<IpNet>>>,
-    tx_address_updates: &mut mpsc::Sender<tun::AddressUpdate>,
+    tx_address_updates: &mpsc::Sender<tun::AddressUpdate>,
 ) -> Result<usize> {
     if state.stream_id != Some(stream_id) {
         error!(
@@ -166,7 +166,7 @@ pub async fn assign_addresses_and_routes(
     mut conn: &mut quiche::Connection,
     h3_conn: &mut Option<quiche::h3::Connection>,
     mut available_addresses: Arc<Mutex<Vec<IpNet>>>,
-    tx_address_updates: &mut mpsc::Sender<tun::AddressUpdate>,
+    tx_address_updates: &mpsc::Sender<tun::AddressUpdate>,
 ) -> Result<()> {
     if state.stream_id.is_none() {
         return Err(anyhow!("stream id is None"));

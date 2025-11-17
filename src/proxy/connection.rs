@@ -85,12 +85,12 @@ impl Connection {
             mpsc::channel::<Vec<u8>>(CLIENT_CHANNEL_CAPACITY);
         let mut tun = tun::Tun::new(&self.tun_name, tx_tun_to_quic, 1350)?;
 
-        let (mut tx_address_updates, rx_address_updates) = mpsc::channel::<tun::AddressUpdate>(10);
+        let (tx_address_updates, rx_address_updates) = mpsc::channel::<tun::AddressUpdate>(10);
         tun.start(rx_quic_to_tun, rx_address_updates, cancel_token.clone())
             .await?;
 
         let mut buf = [0; MAX_DATAGRAM_SIZE];
-        let mut packet_buf: Vec<UdpPacket> = Vec::with_capacity(10);
+        let mut packet_buf: Vec<UdpPacket> = Vec::with_capacity(10); // buffer for incoming UDP packets. Used for processing multiple packets at once.
         let mut keepalive_interval =
             tokio::time::interval(std::time::Duration::from_millis(KEEPALIVE_INTERVAL));
 
@@ -117,7 +117,7 @@ impl Connection {
 
                 // Handle incoming UDP packets
                 num_packets = self.rx_udp_to_quic.recv_many(&mut packet_buf, 10) => {
-                    self.process_udp_packets(&mut packet_buf, num_packets, &mut tx_quic_to_tun, &mut tx_address_updates).await?;
+                    self.process_udp_packets(&mut packet_buf, num_packets, &mut tx_quic_to_tun, &tx_address_updates).await?;
                 }
 
                 // Handle outgoing IP packets from TUN
@@ -160,7 +160,7 @@ impl Connection {
         cancel_token.cancel();
 
         // Wait for TUN task to finish with timeout
-        if let Some(tun_handle) = tun.handle.take() {
+        if let Some(tun_handle) = tun.handle {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(2), tun_handle).await;
         }
 
@@ -178,7 +178,7 @@ impl Connection {
         packet_buf: &mut Vec<UdpPacket>,
         num_packets: usize,
         tx_quic_to_tun: &mut mpsc::Sender<Vec<u8>>,
-        tx_address_updates: &mut mpsc::Sender<tun::AddressUpdate>,
+        tx_address_updates: &mpsc::Sender<tun::AddressUpdate>,
     ) -> Result<()> {
         let mut buf = [0; MAX_DATAGRAM_SIZE];
         for i in 0..num_packets {
@@ -192,7 +192,7 @@ impl Connection {
             if let Err(e) = self.conn.recv(&mut packet.data, recv_info) {
                 // TODO: handle specific errors
                 error!("recv failed: {:?}, recv_info: {:?}", e, recv_info);
-                return Ok(());
+                continue;
             }
         }
 
@@ -229,6 +229,11 @@ impl Connection {
             // Receive datagrams from QUIC and forward to TUN
             while let Ok(len) = self.conn.dgram_recv(&mut buf) {
                 let mut octets = Octets::with_slice(&buf[..len]);
+
+                // The datagram format is:
+                // - varint: quarter stream id (stream_id / 4)
+                // - varint: context_id (must be 0)
+                // - bytes: IP packet
                 let stream_id = octets.get_varint()? * 4;
                 let context_id = octets.get_varint()?;
                 let packet_start = octets.off();
@@ -318,8 +323,13 @@ impl Connection {
         }
 
         if self.conn.is_established() && self.capsule_state.stream_id.is_some() {
-            let mut buf = vec![0u8; MAX_DATAGRAM_SIZE];
+            let mut buf = [0; MAX_DATAGRAM_SIZE];
             let mut octets = OctetsMut::with_slice(&mut buf);
+
+            // The datagram format is:
+            // - varint: quarter stream id (stream_id / 4)
+            // - varint: context_id (must be 0)
+            // - bytes: IP packet
             octets.put_varint(self.capsule_state.stream_id.unwrap() / 4)?;
             octets.put_varint(0)?;
             octets.put_bytes(&ip_packet)?;
@@ -335,7 +345,7 @@ impl Connection {
 
     async fn handle_http3_connection(
         &mut self,
-        tx_address_updates: &mut mpsc::Sender<tun::AddressUpdate>,
+        tx_address_updates: &mpsc::Sender<tun::AddressUpdate>,
     ) -> Result<()> {
         let mut buf = [0; MAX_DATAGRAM_SIZE];
 

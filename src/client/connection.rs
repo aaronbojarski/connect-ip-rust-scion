@@ -34,8 +34,8 @@ pub struct Connection {
     available_addresses: Arc<Mutex<Vec<IpNet>>>,
     stream_state: StreamStatus,
     capsule_state: CapsuleProtocolState,
-    assign_address_done: bool,
-    request_address_done: bool,
+    assigned_addresses: bool,
+    requested_address: bool,
 }
 
 impl Connection {
@@ -52,7 +52,9 @@ impl Connection {
     ) -> Result<Self> {
         // Generate a random source connection ID for the connection.
         let mut scid = [0; quiche::MAX_CONN_ID_LEN];
-        SystemRandom::new().fill(&mut scid[..]).unwrap();
+        if let Err(e) = SystemRandom::new().fill(&mut scid[..]) {
+            return Err(anyhow::anyhow!("failed to generate scid: {:?}", e));
+        }
         let scid = quiche::ConnectionId::from_ref(&scid);
 
         // Create a QUIC connection and initiate handshake.
@@ -84,8 +86,8 @@ impl Connection {
                 local_routes: routes,
                 remote_routes: vec![],
             },
-            assign_address_done: false,
-            request_address_done: false,
+            assigned_addresses: false,
+            requested_address: false,
         })
     }
 
@@ -100,7 +102,7 @@ impl Connection {
         let (tx_tun_to_quic, mut rx_tun_to_quic) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
 
         let mut tun = tun::Tun::new(&self.tun_name, tx_tun_to_quic.clone(), 1350)?;
-        let (mut tx_address_updates, rx_address_updates) = mpsc::channel::<tun::AddressUpdate>(100);
+        let (tx_address_updates, rx_address_updates) = mpsc::channel::<tun::AddressUpdate>(100);
         tun.start(rx_quic_to_tun, rx_address_updates, cancel_token.clone())
             .await?;
 
@@ -141,7 +143,7 @@ impl Connection {
 
                 // Incoming UDP packets (QUIC protocol packets)
                 num_packets = self.rx_udp_to_quic.recv_many(&mut packet_buf, 10) => {
-                    self.process_udp_packets(&mut packet_buf, num_packets, &tx_quic_to_tun, &mut tx_address_updates).await?;
+                    self.process_udp_packets(&mut packet_buf, num_packets, &tx_quic_to_tun, &tx_address_updates).await?;
                 }
 
                 // Outgoing IP packets from TUN
@@ -198,7 +200,7 @@ impl Connection {
         packet_buf: &mut Vec<UdpPacket>,
         num_packets: usize,
         tx_quic_to_tun: &mpsc::Sender<Vec<u8>>,
-        tx_address_updates: &mut mpsc::Sender<tun::AddressUpdate>,
+        tx_address_updates: &mpsc::Sender<tun::AddressUpdate>,
     ) -> Result<()> {
         for i in 0..num_packets {
             let packet = &mut packet_buf[i];
@@ -209,7 +211,7 @@ impl Connection {
 
             if let Err(e) = self.conn.recv(&mut packet.data, recv_info) {
                 error!("recv failed: {:?}, recv_info: {:?}", e, recv_info);
-                return Ok(());
+                continue;
             }
         }
 
@@ -222,7 +224,7 @@ impl Connection {
         // Handle datagrams and forward to TUN if tunnel is established
         if self.conn.is_established() && self.stream_state == StreamStatus::TunnelEstablished {
             // Receive datagrams from QUIC and forward to TUN
-            let mut buf = vec![0; MAX_DATAGRAM_SIZE];
+            let mut buf = [0; MAX_DATAGRAM_SIZE];
             while let Ok(len) = self.conn.dgram_recv(&mut buf) {
                 let mut octets = Octets::with_slice(&buf[..len]);
                 let stream_id = octets.get_varint()? * 4;
@@ -280,7 +282,7 @@ impl Connection {
     }
 
     async fn process_tun_packet(&mut self, ip_packet: Vec<u8>) -> Result<()> {
-        let mut buf = vec![0; MAX_DATAGRAM_SIZE];
+        let mut buf = [0; MAX_DATAGRAM_SIZE];
         if let Some(ipv4) = Ipv4Packet::new(&ip_packet) {
             let src = ipv4.get_source();
             let dest = ipv4.get_destination();
@@ -329,7 +331,7 @@ impl Connection {
 
     async fn handle_http3(
         &mut self,
-        tx_address_updates: &mut mpsc::Sender<tun::AddressUpdate>,
+        tx_address_updates: &mpsc::Sender<tun::AddressUpdate>,
     ) -> Result<()> {
         // Create a new HTTP/3 connection once the QUIC connection is established.
         if self.conn.is_established() && self.h3_conn.is_none() {
@@ -373,7 +375,7 @@ impl Connection {
                             self.conn
                                 .close(true, 0x100, b"headers on unknown stream")
                                 .unwrap();
-                            continue;
+                            break;
                         }
                         if check_response(&list) {
                             self.stream_state = StreamStatus::TunnelEstablished;
@@ -382,6 +384,7 @@ impl Connection {
                             self.conn
                                 .close(true, 0x100, b"unexpected response")
                                 .unwrap();
+                            break;
                         }
                     }
 
@@ -391,7 +394,7 @@ impl Connection {
                             self.conn.trace_id(),
                             stream_id
                         );
-                        let mut buf = vec![0; MAX_DATAGRAM_SIZE];
+                        let mut buf = [0; MAX_DATAGRAM_SIZE];
                         while let Ok(read) = self.h3_conn.as_mut().unwrap().recv_body(
                             &mut self.conn,
                             stream_id,
@@ -418,11 +421,13 @@ impl Connection {
                     Ok((_stream_id, quiche::h3::Event::Finished)) => {
                         info!("stream finished, closing connection");
                         self.conn.close(true, 0x100, b"kthxbye").unwrap();
+                        break;
                     }
 
                     Ok((_stream_id, quiche::h3::Event::Reset(e))) => {
                         error!("request was reset by peer with {e}, closing...");
                         self.conn.close(true, 0x100, b"kthxbye").unwrap();
+                        break;
                     }
 
                     Ok((_, quiche::h3::Event::PriorityUpdate)) => unreachable!(),
@@ -437,7 +442,6 @@ impl Connection {
 
                     Err(e) => {
                         error!("HTTP/3 processing failed: {e:?}");
-
                         break;
                     }
                 }
@@ -448,17 +452,15 @@ impl Connection {
 
     async fn handle_capsule_protocol(
         &mut self,
-        tx_address_updates: &mut mpsc::Sender<tun::AddressUpdate>,
+        tx_address_updates: &mpsc::Sender<tun::AddressUpdate>,
     ) -> Result<()> {
-        if self.request_address_done == false
-            && self.stream_state == StreamStatus::TunnelEstablished
-        {
+        if self.requested_address == false && self.stream_state == StreamStatus::TunnelEstablished {
             self.send_address_request()?;
             info!("sent address request capsule");
-            self.request_address_done = true;
+            self.requested_address = true;
         }
 
-        if !self.assign_address_done
+        if !self.assigned_addresses
             && self.stream_state == StreamStatus::TunnelEstablished
             && self.capsule_state.stream_id.is_some()
         {
@@ -470,7 +472,7 @@ impl Connection {
                 tx_address_updates,
             )
             .await?;
-            self.assign_address_done = true;
+            self.assigned_addresses = true;
         }
         Ok(())
     }
@@ -485,9 +487,9 @@ impl Connection {
             }],
         };
         let capsule = Capsule::AddressRequest(addr_req);
-        let mut buf = vec![0u8; 100];
+        let mut buf = [0u8; 100];
         let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
-        capsule.append(&mut octets_mut).unwrap();
+        capsule.append(&mut octets_mut)?;
         let payload_len = octets_mut.off();
         self.h3_conn
             .as_mut()
