@@ -475,7 +475,7 @@ impl Connection {
             stream_id
         );
 
-        let (headers, body) = build_response(headers);
+        let headers = build_response(headers);
         let http3_conn = self.h3_conn.as_mut().unwrap();
 
         match http3_conn.send_response(&mut self.conn, stream_id, &headers, false) {
@@ -484,7 +484,7 @@ impl Connection {
             Err(quiche::h3::Error::StreamBlocked) => {
                 let response = PartialResponse {
                     headers: Some(headers),
-                    body,
+                    body: vec![],
                     written: 0,
                 };
 
@@ -496,27 +496,6 @@ impl Connection {
                 error!("{} stream send failed {:?}", self.conn.trace_id(), e);
                 return;
             }
-        }
-
-        let written = match http3_conn.send_body(&mut self.conn, stream_id, &body, false) {
-            Ok(v) => v,
-
-            Err(quiche::h3::Error::Done) => 0,
-
-            Err(e) => {
-                error!("{} stream send failed {:?}", self.conn.trace_id(), e);
-                return;
-            }
-        };
-
-        if written < body.len() {
-            let response = PartialResponse {
-                headers: None,
-                body,
-                written,
-            };
-
-            self.partial_responses.insert(stream_id, response);
         }
         self.capsule_state.stream_id = Some(stream_id);
     }

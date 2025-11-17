@@ -1,4 +1,5 @@
 use quiche::h3::NameValue;
+use tracing::debug;
 
 /// Builds an HTTP/3 CONNECT request for the connect-ip protocol.
 pub fn build_request(authority: String, path: String) -> Vec<quiche::h3::Header> {
@@ -16,7 +17,7 @@ pub fn build_request(authority: String, path: String) -> Vec<quiche::h3::Header>
 }
 
 /// Builds an HTTP/3 response given a request.
-pub fn build_response(request: &[quiche::h3::Header]) -> (Vec<quiche::h3::Header>, Vec<u8>) {
+pub fn build_response(request: &[quiche::h3::Header]) -> Vec<quiche::h3::Header> {
     let mut method = None;
     let mut protocol = None;
 
@@ -30,9 +31,15 @@ pub fn build_response(request: &[quiche::h3::Header]) -> (Vec<quiche::h3::Header
         }
     }
 
-    let (status, body) = match (method, protocol) {
-        (Some(b"CONNECT"), Some(b"connect-ip")) => (200, Vec::new()),
-        _ => (405, Vec::new()),
+    let status = match (method, protocol) {
+        (Some(b"CONNECT"), Some(b"connect-ip")) => 200,
+        _ => {
+            debug!(
+                "Unsupported request: method={:?}, protocol={:?}",
+                method, protocol
+            );
+            405
+        }
     };
 
     let headers = vec![
@@ -40,7 +47,7 @@ pub fn build_response(request: &[quiche::h3::Header]) -> (Vec<quiche::h3::Header
         quiche::h3::Header::new(b"capsule-protocol", "?1".as_bytes()),
     ];
 
-    (headers, body)
+    headers
 }
 
 /// Checks if the response headers indicate a successful CONNECT response.
