@@ -1,4 +1,4 @@
-pub mod client_connection;
+pub mod connection;
 
 use anyhow::Result;
 use ipnet::IpNet;
@@ -13,9 +13,11 @@ use tracing::{debug, error, info, trace};
 
 use crate::net::UdpPacket;
 use crate::net::quic::MAX_DATAGRAM_SIZE;
-use crate::proxy::client_connection::ClientConnection;
+use crate::proxy::connection::Connection;
 
 const TOKEN_PREFIX: &[u8] = b"connect-ip-rust-scion";
+const MAIN_CHANNEL_CAPACITY: usize = 10000;
+const CLIENT_CHANNEL_CAPACITY: usize = 1000;
 
 pub struct ProxyConfig {
     pub listen: SocketAddr,
@@ -53,7 +55,8 @@ impl Proxy {
         info!("listening on {}", local_addr);
 
         // Channel for sending UDP packets
-        let (tx_quic_to_udp, mut rx_quic_to_udp) = mpsc::channel::<UdpPacket>(1000);
+        let (tx_quic_to_udp, mut rx_quic_to_udp) =
+            mpsc::channel::<UdpPacket>(MAIN_CHANNEL_CAPACITY);
 
         // Track active connections
         let connections: Arc<
@@ -212,7 +215,7 @@ impl Proxy {
                         }
 
                         // Create channel for this connection
-                        let (tx_to_connection, rx_from_main) = mpsc::channel::<UdpPacket>(1000);
+                        let (tx_to_connection, rx_from_main) = mpsc::channel::<UdpPacket>(CLIENT_CHANNEL_CAPACITY);
 
                         // Allocate TUN name for this client
                         let tun_name = format!("tun{}", next_client);
@@ -220,7 +223,7 @@ impl Proxy {
 
                         // Store connection info
                         let client_conn =
-                            ClientConnection::new(
+                            Connection::new(
                                 conn,
                                 scid.clone().into_owned(),
                                 src,

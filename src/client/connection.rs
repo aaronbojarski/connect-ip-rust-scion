@@ -9,12 +9,13 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::client::MAX_DATAGRAM_SIZE;
+use crate::client::{CHANNEL_CAPACITY, MAX_DATAGRAM_SIZE};
 use crate::connect_ip::capsule::{AddressRequestCapsule, Capsule, RequestedAddress};
 use crate::connect_ip::capsule_protocol::{
     CapsuleProtocolState, assign_addresses_and_routes, handle_capsule_data,
 };
 use crate::connect_ip::request::{build_request, check_response, headers_to_strings};
+use crate::net::quic::{DEFAULT_TIMEOUT, KEEPALIVE_INTERVAL};
 use crate::net::{UdpPacket, check_packet_src_dst, tun};
 
 #[derive(Debug, Eq, PartialEq)]
@@ -95,8 +96,8 @@ impl Connection {
         let mut buf = [0; MAX_DATAGRAM_SIZE];
 
         // Channels between TUN and QUIC tasks. Contents are IP packets.
-        let (tx_quic_to_tun, rx_quic_to_tun) = mpsc::channel::<Vec<u8>>(1000);
-        let (tx_tun_to_quic, mut rx_tun_to_quic) = mpsc::channel::<Vec<u8>>(1000);
+        let (tx_quic_to_tun, rx_quic_to_tun) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
+        let (tx_tun_to_quic, mut rx_tun_to_quic) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
 
         let mut tun = tun::Tun::new(&self.tun_name, tx_tun_to_quic.clone(), 1350)?;
         let (mut tx_address_updates, rx_address_updates) = mpsc::channel::<tun::AddressUpdate>(100);
@@ -114,13 +115,18 @@ impl Connection {
             .await?;
 
         let mut packet_buf: Vec<UdpPacket> = Vec::with_capacity(10);
-        let mut keepalive_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        let mut keepalive_interval =
+            tokio::time::interval(std::time::Duration::from_millis(KEEPALIVE_INTERVAL));
         loop {
-            let timeout = self.conn.timeout();
             packet_buf.clear();
+            let timeout = self
+                .conn
+                .timeout()
+                .unwrap_or(std::time::Duration::from_millis(DEFAULT_TIMEOUT));
+
             tokio::select! {
                 // Connection timeout
-                _ = tokio::time::sleep(timeout.unwrap_or(std::time::Duration::from_secs(24 * 60 * 60))) => {
+                _ = tokio::time::sleep(timeout) => {
                     debug!("connection timeout");
                     self.conn.on_timeout();
                 }
@@ -460,7 +466,7 @@ impl Connection {
                 &mut self.capsule_state,
                 &mut self.conn,
                 &mut self.h3_conn,
-                &mut self.available_addresses,
+                self.available_addresses.clone(),
                 tx_address_updates,
             )
             .await?;

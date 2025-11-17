@@ -165,7 +165,7 @@ pub async fn assign_addresses_and_routes(
     state: &mut CapsuleProtocolState,
     mut conn: &mut quiche::Connection,
     h3_conn: &mut Option<quiche::h3::Connection>,
-    mut available_addresses: &mut Arc<Mutex<Vec<IpNet>>>,
+    mut available_addresses: Arc<Mutex<Vec<IpNet>>>,
     tx_address_updates: &mut mpsc::Sender<tun::AddressUpdate>,
 ) -> Result<()> {
     if state.stream_id.is_none() {

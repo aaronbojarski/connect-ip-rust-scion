@@ -14,8 +14,9 @@ use crate::connect_ip::capsule_protocol::{
     CapsuleProtocolState, assign_addresses_and_routes, handle_capsule_data,
 };
 use crate::connect_ip::request::{build_response, headers_to_strings};
-use crate::net::quic::MAX_DATAGRAM_SIZE;
+use crate::net::quic::{DEFAULT_TIMEOUT, KEEPALIVE_INTERVAL, MAX_DATAGRAM_SIZE};
 use crate::net::{UdpPacket, check_packet_src_dst, return_subnet, tun};
+use crate::proxy::CLIENT_CHANNEL_CAPACITY;
 
 struct PartialResponse {
     headers: Option<Vec<quiche::h3::Header>>,
@@ -23,7 +24,7 @@ struct PartialResponse {
     written: usize,
 }
 
-pub struct ClientConnection {
+pub struct Connection {
     pub conn: quiche::Connection,
     pub scid: quiche::ConnectionId<'static>,
     pub h3_conn: Option<quiche::h3::Connection>,
@@ -37,7 +38,7 @@ pub struct ClientConnection {
     capsule_state: CapsuleProtocolState,
 }
 
-impl ClientConnection {
+impl Connection {
     pub fn new(
         conn: quiche::Connection,
         scid: quiche::ConnectionId<'static>,
@@ -48,7 +49,7 @@ impl ClientConnection {
         available_addresses: Arc<Mutex<Vec<IpNet>>>,
         routes: Vec<IpNet>,
     ) -> Self {
-        ClientConnection {
+        Connection {
             conn,
             scid,
             h3_conn: None,
@@ -78,24 +79,27 @@ impl ClientConnection {
         let cancel_token = CancellationToken::new();
 
         // Create TUN interface for this connection
-        let (mut tx_quic_to_tun, rx_quic_to_tun) = mpsc::channel::<Vec<u8>>(1000);
-        let (tx_tun_to_quic, mut rx_tun_to_quic) = mpsc::channel::<Vec<u8>>(1000);
+        let (mut tx_quic_to_tun, rx_quic_to_tun) =
+            mpsc::channel::<Vec<u8>>(CLIENT_CHANNEL_CAPACITY);
+        let (tx_tun_to_quic, mut rx_tun_to_quic) =
+            mpsc::channel::<Vec<u8>>(CLIENT_CHANNEL_CAPACITY);
         let mut tun = tun::Tun::new(&self.tun_name, tx_tun_to_quic, 1350)?;
 
-        let (mut tx_address_updates, rx_address_updates) = mpsc::channel::<tun::AddressUpdate>(100);
+        let (mut tx_address_updates, rx_address_updates) = mpsc::channel::<tun::AddressUpdate>(10);
         tun.start(rx_quic_to_tun, rx_address_updates, cancel_token.clone())
             .await?;
 
         let mut buf = [0; MAX_DATAGRAM_SIZE];
         let mut packet_buf: Vec<UdpPacket> = Vec::with_capacity(10);
-        let mut keepalive_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        let mut keepalive_interval =
+            tokio::time::interval(std::time::Duration::from_millis(KEEPALIVE_INTERVAL));
 
         loop {
             packet_buf.clear();
             let timeout = self
                 .conn
                 .timeout()
-                .unwrap_or(std::time::Duration::from_secs(60));
+                .unwrap_or(std::time::Duration::from_millis(DEFAULT_TIMEOUT));
 
             tokio::select! {
                 // Handle connection timeout
@@ -186,6 +190,7 @@ impl ClientConnection {
 
             // Process the packet
             if let Err(e) = self.conn.recv(&mut packet.data, recv_info) {
+                // TODO: handle specific errors
                 error!("recv failed: {:?}, recv_info: {:?}", e, recv_info);
                 return Ok(());
             }
@@ -205,14 +210,14 @@ impl ClientConnection {
 
         // Handle initial address assignment and route advertisement
         if self.h3_conn.is_some()
-            && !self.capsule_state.stream_id.is_none()
+            && self.capsule_state.stream_id.is_some()
             && !self.assign_addresses_and_routes_done
         {
             assign_addresses_and_routes(
                 &mut self.capsule_state,
                 &mut self.conn,
                 &mut self.h3_conn,
-                &mut self.available_addresses,
+                self.available_addresses.clone(),
                 tx_address_updates,
             )
             .await?;

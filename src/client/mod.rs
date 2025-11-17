@@ -13,6 +13,8 @@ use crate::net::quic::MAX_DATAGRAM_SIZE;
 
 pub mod connection;
 
+pub const CHANNEL_CAPACITY: usize = 1000;
+
 #[derive(Clone)]
 pub struct ClientConfig {
     pub bind: SocketAddr,
@@ -52,8 +54,8 @@ impl Client {
         let local_addr = socket.local_addr().unwrap();
 
         // Channels between UDP and QUIC tasks. Contents are UDP datagrams (usually encrypted QUIC packets) with source address.
-        let (tx_udp_to_quic, rx_udp_to_quic) = mpsc::channel::<UdpPacket>(1000);
-        let (tx_quic_to_udp, mut rx_quic_to_udp) = mpsc::channel::<UdpPacket>(1000);
+        let (tx_udp_to_quic, rx_udp_to_quic) = mpsc::channel::<UdpPacket>(CHANNEL_CAPACITY);
+        let (tx_quic_to_udp, mut rx_quic_to_udp) = mpsc::channel::<UdpPacket>(CHANNEL_CAPACITY);
 
         let available_addresses = Arc::new(Mutex::new(self.config.address_pool.clone()));
 
