@@ -11,6 +11,7 @@ octets = "0.3.3"
 pnet = "0.35.0"
 quiche = "0.24.6"
 ring = "0.17.14"
+thiserror = "2.0.17"
 tokio = { version = "1.28.1", features = ["full"] }
 tokio-util = "0.7.16"
 tracing = "0.1.41"

@@ -1,9 +1,28 @@
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use anyhow::Error;
+use anyhow::Error as AnyhowError;
 use ipnet::IpNet;
+use thiserror::Error;
 
 use crate::net::ip_range_to_net;
+
+#[derive(Debug, Error)]
+pub enum CapsuleError {
+    #[error("unknown capsule type {0}")]
+    UnknownCapsuleType(u64),
+    #[error("invalid IP version {0}")]
+    InvalidIpVersion(u8),
+    #[error("start and end IP addresses must be of the same version")]
+    IpVersionMismatch,
+    #[error(transparent)]
+    Buffer(#[from] octets::BufferTooShortError),
+    #[error(transparent)]
+    PrefixLen(#[from] ipnet::PrefixLenError),
+    #[error(transparent)]
+    RouteConversion(#[from] AnyhowError),
+}
+
+pub type CapsuleResult<T> = Result<T, CapsuleError>;
 
 pub const CAPSULE_PROTOCOL_EMPTY_ADDRESS: IpNet =
     IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 32);
@@ -24,14 +43,14 @@ pub enum Capsule {
 }
 
 impl Capsule {
-    pub fn parse(octets: &mut octets::Octets) -> Result<Capsule, Error> {
+    pub fn parse(octets: &mut octets::Octets) -> CapsuleResult<Capsule> {
         let capsule_type = octets.get_varint()?;
 
         let capsule_type = match capsule_type {
             0x01 => CapsuleType::AddressAssign,
             0x02 => CapsuleType::AddressRequest,
             0x03 => CapsuleType::RouteAdvertisement,
-            _ => return Err(anyhow::anyhow!("Unknown capsule type")),
+            _ => return Err(CapsuleError::UnknownCapsuleType(capsule_type)),
         };
 
         let length = octets.get_varint()?;
@@ -40,23 +59,20 @@ impl Capsule {
 
         let capsule = match capsule_type {
             CapsuleType::AddressAssign => {
-                let addr_capsule = AddressAssignCapsule::parse(&mut payload_octets)?;
-                Capsule::AddressAssign(addr_capsule)
+                Capsule::AddressAssign(AddressAssignCapsule::parse(&mut payload_octets)?)
             }
             CapsuleType::AddressRequest => {
-                let addr_capsule = AddressRequestCapsule::parse(&mut payload_octets)?;
-                Capsule::AddressRequest(addr_capsule)
+                Capsule::AddressRequest(AddressRequestCapsule::parse(&mut payload_octets)?)
             }
             CapsuleType::RouteAdvertisement => {
-                let addr_capsule = RouteAdvertisementCapsule::parse(&mut payload_octets)?;
-                Capsule::RouteAdvertisement(addr_capsule)
+                Capsule::RouteAdvertisement(RouteAdvertisementCapsule::parse(&mut payload_octets)?)
             }
         };
 
         Ok(capsule)
     }
 
-    pub fn append(&self, octets: &mut octets::OctetsMut) -> Result<(), Error> {
+    pub fn append(&self, octets: &mut octets::OctetsMut) -> CapsuleResult<()> {
         match self {
             Capsule::AddressAssign(capsule) => {
                 octets.put_varint(CapsuleType::AddressAssign as u64)?;
@@ -88,21 +104,21 @@ pub struct AssignedAddress {
 }
 
 impl AssignedAddress {
-    pub fn parse(octets: &mut octets::Octets) -> Result<AssignedAddress, Error> {
+    pub fn parse(octets: &mut octets::Octets) -> CapsuleResult<AssignedAddress> {
         let request_id = octets.get_varint()?;
 
         let ip_version = octets.get_u8()?;
 
         let address = if ip_version == 4 {
             let addr_bytes = octets.get_u32()?;
-            IpAddr::V4(std::net::Ipv4Addr::from(addr_bytes.to_be_bytes()))
+            IpAddr::V4(Ipv4Addr::from(addr_bytes))
         } else if ip_version == 6 {
             let addr_bytes = octets.get_bytes(16)?;
             let mut bytes = [0u8; 16];
             bytes.copy_from_slice(addr_bytes.as_ref());
-            IpAddr::V6(std::net::Ipv6Addr::from(bytes))
+            IpAddr::V6(Ipv6Addr::from(bytes))
         } else {
-            return Err(anyhow::anyhow!("Invalid IP version"));
+            return Err(CapsuleError::InvalidIpVersion(ip_version));
         };
 
         let prefix_len = octets.get_u8()?;
@@ -112,7 +128,7 @@ impl AssignedAddress {
         Ok(AssignedAddress { request_id, ip_net })
     }
 
-    pub fn append(&self, octets: &mut octets::OctetsMut) -> Result<(), Error> {
+    pub fn append(&self, octets: &mut octets::OctetsMut) -> CapsuleResult<()> {
         octets.put_varint(self.request_id)?;
 
         match self.ip_net.addr() {
@@ -149,7 +165,7 @@ impl AddressAssignCapsule {
         AddressAssignCapsule { addresses }
     }
 
-    pub fn parse(octets: &mut octets::Octets) -> Result<AddressAssignCapsule, Error> {
+    pub fn parse(octets: &mut octets::Octets) -> CapsuleResult<AddressAssignCapsule> {
         let mut addresses = Vec::new();
         while octets.cap() > 0 {
             let address = AssignedAddress::parse(octets)?;
@@ -158,7 +174,7 @@ impl AddressAssignCapsule {
         Ok(AddressAssignCapsule { addresses })
     }
 
-    pub fn append(&self, octets: &mut octets::OctetsMut) -> Result<(), Error> {
+    pub fn append(&self, octets: &mut octets::OctetsMut) -> CapsuleResult<()> {
         for address in &self.addresses {
             address.append(octets)?;
         }
@@ -177,21 +193,21 @@ pub struct RequestedAddress {
 }
 
 impl RequestedAddress {
-    pub fn parse(octets: &mut octets::Octets) -> Result<RequestedAddress, Error> {
+    pub fn parse(octets: &mut octets::Octets) -> CapsuleResult<RequestedAddress> {
         let request_id = octets.get_varint()?;
 
         let ip_version = octets.get_u8()?;
 
         let address = if ip_version == 4 {
             let addr_bytes = octets.get_u32()?;
-            IpAddr::V4(std::net::Ipv4Addr::from(addr_bytes))
+            IpAddr::V4(Ipv4Addr::from(addr_bytes))
         } else if ip_version == 6 {
             let addr_bytes = octets.get_bytes(16)?;
             let mut bytes = [0u8; 16];
             bytes.copy_from_slice(addr_bytes.as_ref());
-            IpAddr::V6(std::net::Ipv6Addr::from(bytes))
+            IpAddr::V6(Ipv6Addr::from(bytes))
         } else {
-            return Err(anyhow::anyhow!("Invalid IP version"));
+            return Err(CapsuleError::InvalidIpVersion(ip_version));
         };
 
         let prefix_len = octets.get_u8()?;
@@ -201,7 +217,7 @@ impl RequestedAddress {
         Ok(RequestedAddress { request_id, ip_net })
     }
 
-    pub fn append(&self, octets: &mut octets::OctetsMut) -> Result<(), Error> {
+    pub fn append(&self, octets: &mut octets::OctetsMut) -> CapsuleResult<()> {
         octets.put_varint(self.request_id)?;
 
         match self.ip_net.addr() {
@@ -234,7 +250,7 @@ pub struct AddressRequestCapsule {
 }
 
 impl AddressRequestCapsule {
-    pub fn parse(octets: &mut octets::Octets) -> Result<AddressRequestCapsule, Error> {
+    pub fn parse(octets: &mut octets::Octets) -> CapsuleResult<AddressRequestCapsule> {
         let mut addresses = Vec::new();
         while octets.cap() > 0 {
             let address = RequestedAddress::parse(octets)?;
@@ -243,7 +259,7 @@ impl AddressRequestCapsule {
         Ok(AddressRequestCapsule { addresses })
     }
 
-    pub fn append(&self, octets: &mut octets::OctetsMut) -> Result<(), Error> {
+    pub fn append(&self, octets: &mut octets::OctetsMut) -> CapsuleResult<()> {
         for address in &self.addresses {
             address.append(octets)?;
         }
@@ -262,15 +278,15 @@ pub struct RouteAdvertisement {
 }
 
 impl RouteAdvertisement {
-    pub fn parse(octets: &mut octets::Octets) -> Result<RouteAdvertisement, Error> {
+    pub fn parse(octets: &mut octets::Octets) -> CapsuleResult<RouteAdvertisement> {
         let ip_version = octets.get_u8()?;
 
         let (start, end) = if ip_version == 4 {
             let start_bytes = octets.get_u32()?;
             let end_bytes = octets.get_u32()?;
             (
-                IpAddr::V4(std::net::Ipv4Addr::from(start_bytes.to_be_bytes())),
-                IpAddr::V4(std::net::Ipv4Addr::from(end_bytes.to_be_bytes())),
+                IpAddr::V4(Ipv4Addr::from(start_bytes)),
+                IpAddr::V4(Ipv4Addr::from(end_bytes)),
             )
         } else if ip_version == 6 {
             let start_bytes = octets.get_bytes(16)?;
@@ -280,21 +296,21 @@ impl RouteAdvertisement {
             let mut end_arr = [0u8; 16];
             end_arr.copy_from_slice(end_bytes.buf());
             (
-                IpAddr::V6(std::net::Ipv6Addr::from(start_arr)),
-                IpAddr::V6(std::net::Ipv6Addr::from(end_arr)),
+                IpAddr::V6(Ipv6Addr::from(start_arr)),
+                IpAddr::V6(Ipv6Addr::from(end_arr)),
             )
         } else {
-            return Err(anyhow::anyhow!("Invalid IP version"));
+            return Err(CapsuleError::InvalidIpVersion(ip_version));
         };
 
         let proto = octets.get_u8()?;
 
-        let ip_net = ip_range_to_net(start, end)?;
+        let ip_net = ip_range_to_net(start, end).map_err(CapsuleError::RouteConversion)?;
 
         Ok(RouteAdvertisement { ip_net, proto })
     }
 
-    pub fn append(&self, octets: &mut octets::OctetsMut) -> Result<(), Error> {
+    pub fn append(&self, octets: &mut octets::OctetsMut) -> CapsuleResult<()> {
         let start = self.ip_net.network();
         let end = self.ip_net.broadcast();
         match (start, end) {
@@ -309,9 +325,7 @@ impl RouteAdvertisement {
                 octets.put_bytes(&end_addr.octets())?;
             }
             _ => {
-                return Err(anyhow::anyhow!(
-                    "Start and end IP addresses must be of the same version"
-                ));
+                return Err(CapsuleError::IpVersionMismatch);
             }
         }
 
@@ -334,7 +348,7 @@ pub struct RouteAdvertisementCapsule {
 }
 
 impl RouteAdvertisementCapsule {
-    pub fn parse(octets: &mut octets::Octets) -> Result<RouteAdvertisementCapsule, Error> {
+    pub fn parse(octets: &mut octets::Octets) -> CapsuleResult<RouteAdvertisementCapsule> {
         let mut routes = Vec::new();
         while octets.cap() > 0 {
             let route = RouteAdvertisement::parse(octets)?;
@@ -343,7 +357,7 @@ impl RouteAdvertisementCapsule {
         Ok(RouteAdvertisementCapsule { routes })
     }
 
-    pub fn append(&self, octets: &mut octets::OctetsMut) -> Result<(), Error> {
+    pub fn append(&self, octets: &mut octets::OctetsMut) -> CapsuleResult<()> {
         for route in &self.routes {
             route.append(octets)?;
         }
@@ -359,7 +373,6 @@ impl RouteAdvertisementCapsule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, Ipv6Addr};
     #[test]
     fn test_address_assign_capsule() {
         let addresses = vec![
