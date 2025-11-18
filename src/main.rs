@@ -1,6 +1,6 @@
 use clap::{Args, Parser, Subcommand};
 use ipnet::IpNet;
-use std::{net::SocketAddr, path::PathBuf};
+use std::path::PathBuf;
 use url::Url;
 
 #[derive(Parser, Debug)]
@@ -24,8 +24,12 @@ enum Command {
 #[derive(Args, Debug)]
 struct ProxyOpt {
     /// Address to listen on
-    #[clap(long, default_value = "127.0.0.1:4433")]
-    listen: SocketAddr,
+    #[clap(long, default_value = "[0-0,127.0.0.1]:4433")]
+    listen: scion_proto::address::SocketAddr,
+
+    /// Address of the endhost API to connect to for scion path resolution. Required when using SCION.
+    #[clap(long = "endhost-api")]
+    endhost_api_address: Option<Url>,
 
     /// CA certificate used to verify peers
     #[clap(long = "ca-cert", value_name = "FILE", default_value = "ca-cert.pem")]
@@ -54,16 +58,24 @@ struct ProxyOpt {
 
 #[derive(Args, Debug)]
 struct ClientOpt {
-    /// URL of proxy to connect to (must include scheme and port, e.g. https://host:4433)
-    url: Url,
+    /// Address of proxy to connect to (e.g. [0-0,proxy.example.com]:4433)
+    remote: scion_proto::address::SocketAddr,
 
     /// Override hostname used for certificate verification (defaults to the host from --url)
     #[clap(long = "host")]
     host: Option<String>,
 
     /// Local address to bind to
-    #[clap(long = "bind", default_value = "0.0.0.0:0")]
-    bind: SocketAddr,
+    #[clap(long = "bind", default_value = "[0-0,0.0.0.0]:0")]
+    bind: scion_proto::address::SocketAddr,
+
+    /// Address of the endhost API to connect to for scion path resolution. Required when using SCION.
+    #[clap(long = "endhost-api")]
+    endhost_api_address: Option<Url>,
+
+    /// Path to the Snap token file for authentication with the endhost API
+    #[clap(long = "snap-token", value_name = "FILE")]
+    snap_token_path: Option<PathBuf>,
 
     /// Routes to advertise to the proxy (repeat --routes for each CIDR, e.g. 192.0.2.0/24)
     #[clap(long)]
@@ -109,6 +121,7 @@ fn run_proxy(opt: ProxyOpt) -> i32 {
         .init();
     let config = connect_ip_rust_scion::proxy::ProxyConfig {
         listen: opt.listen,
+        endhost_api_address: opt.endhost_api_address,
         ca_cert_path: opt.ca_cert_path,
         cert_path: opt.cert_path,
         key_path: opt.key_path,
@@ -130,7 +143,10 @@ fn run_client(opt: ClientOpt) -> i32 {
         .init();
     let config = connect_ip_rust_scion::client::ClientConfig {
         bind: opt.bind,
-        url: opt.url,
+        remote: opt.remote,
+        host: opt.host,
+        endhost_api_address: opt.endhost_api_address,
+        snap_token_path: opt.snap_token_path,
         ca_cert_path: opt.ca_cert_path,
         cert_path: opt.cert_path,
         key_path: opt.key_path,

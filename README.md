@@ -2,7 +2,6 @@
 
 connect-ip-rust-scion is an implementation of Connect-IP ([RFC 9484](https://www.rfc-editor.org/rfc/rfc9484)) in Rust using SCION as underlying transport protocol. It provides a client and a proxy component to establish secure tunnels over SCION networks. It allows tunnerling of arbitrary IP traffic over SCION.
 
-NOTE: SCION is not yet integrated. It uses regular UDP sockets for now.
 
 ## Building
 To build the project, use cargo.
@@ -27,7 +26,7 @@ Example:
 
 ```
 connect-ip-rust-scion proxy \
-  --listen 127.0.0.1:4433 \
+  --listen [0-0,127.0.0.1]:4433 \
   --routes 10.0.0.0/24 --routes 10.0.1.0/24 \
   --address-pool 10.1.0.0/24
 ```
@@ -46,12 +45,12 @@ bash ./generate_certs.sh
 
 Then start the server the corresponding namespace.
 ```bash
-sudo ip netns exec proxy_ns ./target/debug/connect-ip-rust-scion proxy --listen 10.248.100.11:4433 --routes 10.248.2.0/24 --address-pool 10.248.2.128/25
+sudo ip netns exec proxy_ns ./target/debug/connect-ip-rust-scion proxy --listen [0-0,10.248.100.11]:4433 --routes 10.248.2.0/24 --address-pool 10.248.2.128/25
 ```
 
 Then start the client in another terminal.
 ```bash
-sudo ip netns exec client_ns ./target/debug/connect-ip-rust-scion client https://10.248.100.11:4433 --host localhost --routes 10.248.1.0/24 --address-pool 10.248.1.128/25
+sudo ip netns exec client_ns ./target/debug/connect-ip-rust-scion client [0-0,10.248.100.11]:4433 --host localhost --routes 10.248.1.0/24 --address-pool 10.248.1.128/25
 ```
 
 Enable packet forwading in the server and client namespaces.
@@ -77,6 +76,3 @@ sudo bash ./testnet.sh down
 ```
 
 ## TODO:
-- scion integration
-    - switch socket
-    - translate addresses

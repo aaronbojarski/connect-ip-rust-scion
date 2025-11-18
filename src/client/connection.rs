@@ -3,7 +3,7 @@ use ipnet::IpNet;
 use octets::{Octets, OctetsMut};
 use pnet::packet::ipv4::Ipv4Packet;
 use ring::rand::{SecureRandom, SystemRandom};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -26,6 +26,8 @@ enum StreamStatus {
 }
 
 pub struct Connection {
+    local: scion_proto::address::SocketAddr,
+    remote: scion_proto::address::SocketAddr,
     conn: quiche::Connection,
     h3_conn: Option<quiche::h3::Connection>,
     rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
@@ -42,8 +44,8 @@ impl Connection {
     pub fn new(
         server_name: String,
         mut quic_config: quiche::Config,
-        local_addr: SocketAddr,
-        remote: SocketAddr,
+        local: scion_proto::address::SocketAddr,
+        remote: scion_proto::address::SocketAddr,
         rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
         tx_quic_to_udp: mpsc::Sender<UdpPacket>,
         tun_name: String,
@@ -61,17 +63,19 @@ impl Connection {
         let conn = quiche::connect(
             Some(&server_name),
             &scid,
-            local_addr,
-            remote,
+            local.local_address().unwrap(),
+            remote.local_address().unwrap(),
             &mut quic_config,
         )?;
 
         info!(
             "connecting to {:} from {:} with scid {:?}",
-            remote, local_addr, scid
+            remote, local, scid
         );
 
         Ok(Connection {
+            local,
+            remote,
             conn,
             h3_conn: None,
             rx_udp_to_quic,
@@ -111,8 +115,14 @@ impl Connection {
         self.tx_quic_to_udp
             .send(UdpPacket {
                 data: buf[..write].to_vec(),
-                src: send_info.from,
-                dst: send_info.to,
+                src: scion_proto::address::SocketAddr::from_std(
+                    self.local.isd_asn(),
+                    send_info.from,
+                ),
+                dst: scion_proto::address::SocketAddr::from_std(
+                    self.remote.isd_asn(),
+                    send_info.to,
+                ),
             })
             .await?;
 
@@ -173,8 +183,14 @@ impl Connection {
                     .tx_quic_to_udp
                     .send(UdpPacket {
                         data: buf[..write].to_vec(),
-                        src: send_info.from,
-                        dst: send_info.to,
+                        src: scion_proto::address::SocketAddr::from_std(
+                            self.local.isd_asn(),
+                            send_info.from,
+                        ),
+                        dst: scion_proto::address::SocketAddr::from_std(
+                            self.remote.isd_asn(),
+                            send_info.to,
+                        ),
                     })
                     .await
                     .is_err()
@@ -205,8 +221,8 @@ impl Connection {
         for i in 0..num_packets {
             let packet = &mut packet_buf[i];
             let recv_info = quiche::RecvInfo {
-                from: packet.src,
-                to: packet.dst,
+                from: packet.src.local_address().unwrap(),
+                to: packet.dst.local_address().unwrap(),
             };
 
             if let Err(e) = self.conn.recv(&mut packet.data, recv_info) {

@@ -2,8 +2,38 @@
 
 set -Eeuo pipefail
 
-# include network variables
-source "$(dirname "$0")/testnet_vars.sh"
+# end-host addresses
+eh0_address="10.248.1.1"
+eh1_address="10.248.2.1"
+
+# client and proxy addresses
+client00_address="10.248.1.10"
+client01_address="10.248.100.10"
+proxy10_address="10.248.2.10"
+proxy11_address="10.248.100.11"
+
+# mac addresses of interfaces
+eh0mac="00:76:65:74:68:13"
+client00mac="00:76:65:74:68:12"
+client01mac="00:76:65:74:68:11"
+eh1mac="00:76:65:74:68:23"
+proxy10mac="00:76:65:74:68:22"
+proxy11mac="00:76:65:74:68:21"
+
+# namespaces representing the different machines
+client_ns="client_ns"
+eh0ns="eh0ns"
+eh1ns="eh1ns"
+proxy_ns="proxy_ns"
+
+# interface names
+eh0="eh0"
+client00="client00"
+client01="client01"
+eh1="eh1"
+proxy10="proxy10"
+proxy11="proxy11"
+
 
 # setup test network for one side
 function net_up() {
@@ -73,13 +103,6 @@ function testnet_up() {
 
     sudo ip -n $client_ns address add $client01_address/24 dev $client01
     sudo ip -n $proxy_ns address add $proxy11_address/24 dev $proxy11
-
-    # add route to the address given by the connect-ip server
-    sudo ip -n eh1ns route add 10.248.2.128/28 via 10.248.2.10 dev eh1
-
-    # add routes between the two node namespaces
-    #sudo ip -n $client_ns route add $proxy11_address/32 dev $client01
-    #sudo ip -n $proxy_ns route add $client01_address/32 dev $proxy11
 }
 
 function net_down() {

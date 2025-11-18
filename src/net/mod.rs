@@ -3,17 +3,13 @@ pub mod tun;
 
 use anyhow::Error;
 use ipnet::IpNet;
-use std::{
-    net::{IpAddr, SocketAddr},
-    process::Command,
-    sync::Arc,
-};
+use std::{net::IpAddr, process::Command, sync::Arc};
 use tokio::sync::Mutex;
 
 pub struct UdpPacket {
+    pub src: scion_proto::address::SocketAddr,
+    pub dst: scion_proto::address::SocketAddr,
     pub data: Vec<u8>,
-    pub src: SocketAddr,
-    pub dst: SocketAddr,
 }
 
 pub fn ip_range_to_net(start: IpAddr, end: IpAddr) -> Result<IpNet, Error> {

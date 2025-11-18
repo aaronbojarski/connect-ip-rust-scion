@@ -2,8 +2,9 @@ use anyhow::Result;
 use ipnet::IpNet;
 use octets::{Octets, OctetsMut};
 use pnet::packet::ipv4::Ipv4Packet;
+use scion_proto::address::IsdAsn;
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::vec;
 use tokio::sync::{Mutex, mpsc};
@@ -28,7 +29,8 @@ pub struct Connection {
     pub conn: quiche::Connection,
     pub scid: quiche::ConnectionId<'static>,
     pub h3_conn: Option<quiche::h3::Connection>,
-    pub remote_addr: SocketAddr,
+    pub local_isd_as: IsdAsn,
+    pub remote_isd_as: IsdAsn,
     pub rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
     pub tx_quic_to_udp: mpsc::Sender<UdpPacket>,
     pub tun_name: String,
@@ -42,7 +44,8 @@ impl Connection {
     pub fn new(
         conn: quiche::Connection,
         scid: quiche::ConnectionId<'static>,
-        remote_addr: SocketAddr,
+        local_isd_as: IsdAsn,
+        remote_isd_as: IsdAsn,
         rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
         tx_quic_to_udp: mpsc::Sender<UdpPacket>,
         tun_name: String,
@@ -53,7 +56,8 @@ impl Connection {
             conn,
             scid,
             h3_conn: None,
-            remote_addr,
+            local_isd_as,
+            remote_isd_as,
             rx_udp_to_quic,
             tx_quic_to_udp,
             tun_name,
@@ -143,11 +147,16 @@ impl Connection {
                     }
                 };
 
+                let src =
+                    scion_proto::address::SocketAddr::from_std(self.local_isd_as, send_info.from);
+                let dst =
+                    scion_proto::address::SocketAddr::from_std(self.remote_isd_as, send_info.to);
+
                 self.tx_quic_to_udp
                     .send(UdpPacket {
                         data: buf[..write].to_vec(),
-                        src: send_info.from,
-                        dst: send_info.to,
+                        src: src,
+                        dst: dst,
                     })
                     .await?;
             }
@@ -183,9 +192,11 @@ impl Connection {
         let mut buf = [0; MAX_DATAGRAM_SIZE];
         for i in 0..num_packets {
             let packet = &mut packet_buf[i];
+            let src_ip_addr = packet.src.local_address().unwrap();
+            let dst_ip_addr = packet.dst.local_address().unwrap();
             let recv_info = quiche::RecvInfo {
-                from: packet.src,
-                to: packet.dst,
+                from: src_ip_addr,
+                to: dst_ip_addr,
             };
 
             // Process the packet

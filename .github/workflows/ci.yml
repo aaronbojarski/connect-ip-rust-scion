@@ -56,7 +56,7 @@ jobs:
       - name: Start proxy in background
         run: |
           sudo ip netns exec proxy_ns ./target/debug/connect-ip-rust-scion proxy \
-            --listen 10.248.100.11:4433 \
+            --listen [0-0,10.248.100.11]:4433 \
             --routes 10.248.2.0/24 \
             --address-pool 10.248.2.128/25 \
             --log info > proxy.log 2>&1 &
@@ -66,7 +66,7 @@ jobs:
       - name: Start client in background
         run: |
           sudo ip netns exec client_ns ./target/debug/connect-ip-rust-scion client \
-            https://10.248.100.11:4433 \
+            [0-0,10.248.100.11]:4433 \
             --host localhost \
             --routes 10.248.1.0/24 \
             --address-pool 10.248.1.128/25 \
