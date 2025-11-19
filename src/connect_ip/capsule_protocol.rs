@@ -62,6 +62,10 @@ pub async fn handle_capsule_data(
 
             // Add new addresses
             for addr in assign_capsule.addresses {
+                if addr.ip_net == CAPSULE_PROTOCOL_EMPTY_ADDRESS {
+                    warn!("received empty address from peer");
+                    continue;
+                }
                 tx_address_updates
                     .send(tun::AddressUpdate::AddAddress(addr.ip_net))
                     .await?;
@@ -82,6 +86,7 @@ pub async fn handle_capsule_data(
         Capsule::AddressRequest(request_capsule) => {
             info!("received AddressRequest capsule: {:?}", request_capsule);
 
+            // Keep previous assigned addresses
             let mut assigned_addresses = state
                 .remote_addresses
                 .clone()

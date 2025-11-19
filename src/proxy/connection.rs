@@ -87,7 +87,11 @@ impl Connection {
             mpsc::channel::<Vec<u8>>(CLIENT_CHANNEL_CAPACITY);
         let (tx_tun_to_quic, mut rx_tun_to_quic) =
             mpsc::channel::<Vec<u8>>(CLIENT_CHANNEL_CAPACITY);
-        let mut tun = tun::Tun::new(&self.tun_name, tx_tun_to_quic, 1350)?;
+        let mut tun = tun::Tun::new(
+            &self.tun_name,
+            tx_tun_to_quic,
+            (MAX_DATAGRAM_SIZE - 50).try_into().unwrap(), // 12 bytes QUIC header, 16 bytes aead, at most 16 bytes datagram format
+        )?;
 
         let (tx_address_updates, rx_address_updates) = mpsc::channel::<tun::AddressUpdate>(10);
         tun.start(rx_quic_to_tun, rx_address_updates, cancel_token.clone())

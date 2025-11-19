@@ -38,6 +38,7 @@ pub struct Connection {
     capsule_state: CapsuleProtocolState,
     assigned_addresses: bool,
     requested_address: bool,
+    address_request_timer: std::time::Instant,
 }
 
 impl Connection {
@@ -92,6 +93,7 @@ impl Connection {
             },
             assigned_addresses: false,
             requested_address: false,
+            address_request_timer: std::time::Instant::now(),
         })
     }
 
@@ -105,7 +107,11 @@ impl Connection {
         let (tx_quic_to_tun, rx_quic_to_tun) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
         let (tx_tun_to_quic, mut rx_tun_to_quic) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
 
-        let mut tun = tun::Tun::new(&self.tun_name, tx_tun_to_quic.clone(), 1350)?;
+        let mut tun = tun::Tun::new(
+            &self.tun_name,
+            tx_tun_to_quic.clone(),
+            (MAX_DATAGRAM_SIZE - 50).try_into().unwrap(), // 12 bytes QUIC header, 16 bytes aead, at most 16 bytes datagram format
+        )?;
         let (tx_address_updates, rx_address_updates) = mpsc::channel::<tun::AddressUpdate>(100);
         tun.start(rx_quic_to_tun, rx_address_updates, cancel_token.clone())
             .await?;
@@ -470,10 +476,16 @@ impl Connection {
         &mut self,
         tx_address_updates: &mpsc::Sender<tun::AddressUpdate>,
     ) -> Result<()> {
-        if self.requested_address == false && self.stream_state == StreamStatus::TunnelEstablished {
-            self.send_address_request()?;
-            info!("sent address request capsule");
-            self.requested_address = true;
+        if self.capsule_state.local_addresses.is_empty()
+            && self.requested_address == false
+            && self.stream_state == StreamStatus::TunnelEstablished
+        {
+            // Send request only if no address has been assigned within first second
+            if self.address_request_timer.elapsed().as_millis() > 1000 {
+                self.send_address_request()?;
+                info!("sent address request capsule");
+                self.requested_address = true;
+            }
         }
 
         if !self.assigned_addresses
