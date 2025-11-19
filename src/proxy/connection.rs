@@ -75,10 +75,7 @@ impl Connection {
     }
 
     pub async fn handle_client_connection(mut self) -> Result<()> {
-        info!(
-            "starting connection handler for {:?} with TUN {}",
-            self.scid, self.tun_name
-        );
+        info!("starting connection handler with TUN {}", self.tun_name);
         // Create cancellation token for clean shutdown
         let cancel_token = CancellationToken::new();
 
@@ -136,7 +133,19 @@ impl Connection {
 
             // Check if connection was closed while processing packets
             if self.conn.is_closed() {
-                info!("connection {:?} closed", self.scid);
+                info!("connection closed");
+                if self.conn.is_timed_out() {
+                    warn!("connection hit local idle-timeout");
+                }
+                if let Some(err) = self.conn.peer_error() {
+                    warn!(
+                        "peer closed connection (is_app={}, code={}, reason={:?})",
+                        err.is_app,
+                        err.error_code,
+                        String::from_utf8_lossy(&err.reason)
+                    );
+                }
+                debug!("connection stats, {:?}", self.conn.stats());
                 break;
             }
 
@@ -483,7 +492,7 @@ impl Connection {
 
     /// Handles incoming HTTP/3 requests.
     fn handle_request(&mut self, stream_id: u64, headers: &[quiche::h3::Header]) {
-        info!(
+        debug!(
             "{} got request {:?} on stream id {}",
             self.conn.trace_id(),
             headers_to_strings(headers),

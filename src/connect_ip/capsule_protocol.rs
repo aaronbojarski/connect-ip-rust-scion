@@ -10,7 +10,7 @@ use anyhow::{Result, anyhow};
 use ipnet::IpNet;
 use octets::Octets;
 use tokio::sync::{Mutex, mpsc};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::connect_ip::capsule::{AddressAssignCapsule, AssignedAddress, Capsule};
 
@@ -51,7 +51,7 @@ pub async fn handle_capsule_data(
     let capsule = Capsule::parse(&mut octets)?;
     match capsule {
         Capsule::AddressAssign(assign_capsule) => {
-            info!("received AddressAssign capsule: {:?}", assign_capsule);
+            debug!("received AddressAssign capsule: {:?}", assign_capsule);
             // Remove old addresses as they are no longer valid
             for addr in state.local_addresses.iter() {
                 tx_address_updates
@@ -66,6 +66,7 @@ pub async fn handle_capsule_data(
                     warn!("received empty address from peer");
                     continue;
                 }
+                info!("received address from peer: {}", addr.ip_net);
                 tx_address_updates
                     .send(tun::AddressUpdate::AddAddress(addr.ip_net))
                     .await?;
@@ -84,7 +85,7 @@ pub async fn handle_capsule_data(
             }
         }
         Capsule::AddressRequest(request_capsule) => {
-            info!("received AddressRequest capsule: {:?}", request_capsule);
+            debug!("received AddressRequest capsule: {:?}", request_capsule);
 
             // Keep previous assigned addresses
             let mut assigned_addresses = state
@@ -144,7 +145,7 @@ pub async fn handle_capsule_data(
             )?;
         }
         Capsule::RouteAdvertisement(route_capsule) => {
-            info!("received RouteAdvertisement capsule: {:?}", route_capsule);
+            debug!("received RouteAdvertisement capsule: {:?}", route_capsule);
             // TODO: add some validation here
 
             // remove old routes
@@ -157,6 +158,7 @@ pub async fn handle_capsule_data(
 
             // add new routes
             for route in route_capsule.routes {
+                info!("received route advertisement from peer: {}", route.ip_net);
                 tx_address_updates
                     .send(tun::AddressUpdate::AddRoute(route.ip_net.clone()))
                     .await?;

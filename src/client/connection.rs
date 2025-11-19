@@ -170,7 +170,19 @@ impl Connection {
 
             // Check if connection is closed
             if self.conn.is_closed() {
-                info!("connection closed, {:?}", self.conn.stats());
+                info!("connection closed");
+                if self.conn.is_timed_out() {
+                    warn!("connection hit local idle-timeout");
+                }
+                if let Some(err) = self.conn.peer_error() {
+                    warn!(
+                        "peer closed connection (is_app={}, code={}, reason={:?})",
+                        err.is_app,
+                        err.error_code,
+                        String::from_utf8_lossy(&err.reason)
+                    );
+                }
+                debug!("connection stats, {:?}", self.conn.stats());
                 break;
             }
 
@@ -369,10 +381,10 @@ impl Connection {
         if let Some(h3_conn) = &mut self.h3_conn {
             if self.stream_state == StreamStatus::Initialized {
                 let req = build_request("localhost".to_string(), "/vpn".to_string());
-                info!("sending HTTP request {req:?}");
+                debug!("sending HTTP request {req:?}");
                 let stream_id = h3_conn.send_request(&mut self.conn, &req, false).unwrap();
                 self.capsule_state.stream_id = Some(stream_id);
-                info!("sent CONNECT request on stream {}", stream_id);
+                debug!("sent CONNECT request on stream {}", stream_id);
                 self.stream_state = StreamStatus::RequestSent;
             }
         }
@@ -383,7 +395,7 @@ impl Connection {
                 let http3_conn = self.h3_conn.as_mut().unwrap();
                 match http3_conn.poll(&mut self.conn) {
                     Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
-                        info!(
+                        debug!(
                             "got response headers {:?} on stream id {}",
                             headers_to_strings(&list),
                             stream_id
@@ -401,6 +413,7 @@ impl Connection {
                         }
                         if check_response(&list) {
                             self.stream_state = StreamStatus::TunnelEstablished;
+                            info!("connected");
                         } else {
                             error!("unexpected response from server, closing connection");
                             self.conn

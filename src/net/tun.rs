@@ -5,7 +5,7 @@ use ipnet::IpNet;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, info_span, trace};
+use tracing::{debug, error, info_span, trace, warn};
 use tracing_futures::Instrument as _;
 use tun_rs::DeviceBuilder;
 
@@ -57,7 +57,7 @@ impl Tun {
                         tokio::select! {
                             // Check for cancellation signal
                             _ = cancel_token.cancelled() => {
-                                info!("TUN device {} received shutdown signal", name);
+                                debug!("TUN device {} received shutdown signal", name);
                                 break;
                             }
 
@@ -73,16 +73,16 @@ impl Tun {
                                                 dev.add_address_v6(address, ipnet.prefix_len())?;
                                             }
                                         }
-                                        info!("Added address {} to TUN device {}", ipnet, name);
+                                        debug!("Added address {} to TUN device {}", ipnet, name);
                                     }
                                     AddressUpdate::RemoveAddress(ipnet) => {
                                         dev.remove_address(ipnet.addr())?;
-                                        info!("Removed address {} from TUN device {}", ipnet, name);
+                                        debug!("Removed address {} from TUN device {}", ipnet, name);
                                     }
                                     AddressUpdate::AddRoute(ipnet) => {
                                         match add_route(&ipnet, name.clone()) {
                                             Ok(true) => {
-                                                info!("Added route {} via TUN device {}", ipnet, name);
+                                                debug!("Added route {} via TUN device {}", ipnet, name);
                                             }
                                             Ok(false) => {
                                                 debug!("Route {} already exists, not adding again", ipnet);
@@ -96,7 +96,7 @@ impl Tun {
                                         if let Err(e) = remove_route(&ipnet, name.clone()) {
                                             error!("Failed to remove route {}: {}", ipnet, e);
                                         } else {
-                                            info!("Removed route {} via TUN device {}", ipnet, name);
+                                            debug!("Removed route {} via TUN device {}", ipnet, name);
                                         }
                                     }
                                 }
@@ -107,10 +107,8 @@ impl Tun {
                                 let len = len?;
                                 let packet_data = buf[..len].to_vec();
                                 trace!("TUN -> QUIC: {:?}", packet_data);
-                                if tx_tun_to_quic.send(packet_data).await.is_err() {
-                                    error!("TUN device {} connection closed (send failed)", name);
-                                    break;
-                                }
+                                tx_tun_to_quic.send(packet_data).await
+                                    .map_err(|_| anyhow!("failed to send packet from TUN"))?;
                             }
 
                             // Receive from main task and write to TUN device
@@ -122,13 +120,13 @@ impl Tun {
 
                             // Channel closed
                             else => {
-                                info!("TUN device {} channel closed", name);
+                                warn!("TUN device {} channel closed", name);
                                 break;
                             }
                         }
                     }
 
-                    info!("TUN device {} shutting down cleanly", name);
+                    debug!("TUN device {} shutting down cleanly", name);
                     Ok(())
                 }
                 .await;
@@ -137,7 +135,7 @@ impl Tun {
                     error!("TUN device task failed: {}", e);
                 }
             }
-            .instrument(info_span!("tap_device_handler")),
+            .instrument(info_span!("tun_device_handler")),
         );
 
         self.handle = Some(handle);

@@ -349,7 +349,11 @@ impl Proxy {
             let scid_owned = scid.clone().into_owned();
             let connections_clone = self.connections.clone();
             tokio::spawn(async move {
-                if let Err(e) = client_conn.handle_client_connection().await {
+                if let Err(e) = client_conn
+                    .handle_client_connection()
+                    .instrument(tracing::info_span!("connection", scid = ?scid_owned))
+                    .await
+                {
                     error!("connection {:?} error: {:?}", scid_owned, e);
                 }
                 connections_clone.lock().await.remove(&scid_owned);
