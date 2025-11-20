@@ -5,15 +5,12 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, error, info, warn};
 
-use crate::{
-    connect_ip::capsule::{
-        AddressAssignCapsule, AssignedAddress, Capsule, RouteAdvertisement,
-        RouteAdvertisementCapsule,
-    },
-    net::{
-        ZERO_IPV4_ADDRESS, ZERO_IPV6_ADDRESS, get_next_avail_subnet, get_specific_subnet, is_ipv4,
-        is_zero_address, tun,
-    },
+use crate::connect_ip::capsule::{
+    AddressAssignCapsule, AssignedAddress, Capsule, RouteAdvertisement, RouteAdvertisementCapsule,
+};
+use crate::net::{
+    ZERO_IPV4_ADDRESS, ZERO_IPV6_ADDRESS, get_next_avail_subnet, get_specific_subnet, is_ipv4,
+    is_zero_address, tun,
 };
 
 /// State for the capsule protocol.

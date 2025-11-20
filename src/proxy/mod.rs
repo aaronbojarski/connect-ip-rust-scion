@@ -1,7 +1,6 @@
 pub mod connection;
 
-use anyhow::Context;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ipnet::IpNet;
 use ring::rand::SystemRandom;
 use scion_proto::address::IsdAsn;
@@ -9,11 +8,9 @@ use scion_stack::scionstack::ScionStackBuilder;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::Mutex;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tracing::instrument::Instrument;
-use tracing::warn;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::net::UdpPacket;
 use crate::net::quic::MAX_DATAGRAM_SIZE;

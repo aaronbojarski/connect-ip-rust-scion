@@ -1,3 +1,5 @@
+pub mod connection;
+
 use anyhow::{Context, Result, anyhow};
 use ipnet::IpNet;
 use scion_proto::address::IsdAsn;
@@ -11,8 +13,6 @@ use tracing::{debug, info, trace};
 use crate::client::connection::Connection;
 use crate::net::UdpPacket;
 use crate::net::quic::MAX_DATAGRAM_SIZE;
-
-pub mod connection;
 
 pub const CHANNEL_CAPACITY: usize = 1000;
 

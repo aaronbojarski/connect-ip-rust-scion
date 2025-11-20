@@ -1,7 +1,6 @@
-use std::net::IpAddr;
-
 use anyhow::{Result, anyhow};
 use ipnet::IpNet;
+use std::net::IpAddr;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;

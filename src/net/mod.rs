@@ -3,11 +3,9 @@ pub mod tun;
 
 use anyhow::Error;
 use ipnet::IpNet;
-use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    process::Command,
-    sync::Arc,
-};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::process::Command;
+use std::sync::Arc;
 use tokio::sync::Mutex;
 
 pub const ZERO_IPV4_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
