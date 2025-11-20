@@ -325,11 +325,9 @@ impl Connection {
                 ) {
                     tx_quic_to_tun.send(buf[packet_start..len].to_vec()).await?;
                 } else {
-                    warn!(
-                        "{} dropping packet from peer with invalid src/dst: {} -> {}",
-                        self.conn.trace_id(),
-                        src,
-                        dst
+                    debug!(
+                        "dropping packet from peer with invalid src/dst: {} -> {}",
+                        src, dst
                     );
                 }
             }
@@ -359,6 +357,13 @@ impl Connection {
             return Ok(());
         };
 
+        debug!(
+            "received IP packet from TUN: {} -> {}, {} bytes",
+            src,
+            dst,
+            ip_packet.len()
+        );
+
         if !check_packet_src_dst(
             src,
             dst,
@@ -367,7 +372,7 @@ impl Connection {
             &self.capsule_state.remote_addresses,
             &self.capsule_state.remote_routes,
         ) {
-            warn!(
+            debug!(
                 "dropping packet from TUN with invalid src/dst: {} -> {}",
                 src, dst
             );
