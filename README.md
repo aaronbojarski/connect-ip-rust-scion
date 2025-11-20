@@ -76,3 +76,9 @@ sudo bash ./testnet.sh down
 ```
 
 ## TODO:
+- SCION
+  - Path selection
+  - SNAP on server side
+- Connect-IP
+  - Better error handling
+  - MTU

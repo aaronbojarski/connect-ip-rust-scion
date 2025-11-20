@@ -1,0 +1,7 @@
+[build]
+# Install protoc, see <https://github.com/cross-rs/cross/blob/main/docs/custom_images.md#adding-dependencies-to-existing-images>
+pre-build = [
+    "dpkg --add-architecture $CROSS_DEB_ARCH",
+    "apt-get update && apt-get --assume-yes install unzip",
+    "PROTOBUF_VERSION=3.20.3 && curl -L -o /tmp/protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOBUF_VERSION}/protoc-${PROTOBUF_VERSION}-linux-x86_64.zip && unzip -o /tmp/protoc.zip -d /usr/local && rm /tmp/protoc.zip"
+]

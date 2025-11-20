@@ -1,7 +1,7 @@
 use anyhow::Result;
 use tracing::info;
 
-pub const MAX_DATAGRAM_SIZE: usize = 1200;
+pub const MAX_DATAGRAM_SIZE: usize = 1350;
 pub const KEEPALIVE_INTERVAL: u64 = 5000; // in milliseconds
 pub const DEFAULT_TIMEOUT: u64 = 60_000; // in milliseconds
 

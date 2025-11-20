@@ -2,8 +2,9 @@ use anyhow::Result;
 use ipnet::IpNet;
 use octets::{Octets, OctetsMut};
 use pnet::packet::ipv4::Ipv4Packet;
+use pnet::packet::ipv6::Ipv6Packet;
 use ring::rand::{SecureRandom, SystemRandom};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -16,7 +17,7 @@ use crate::connect_ip::capsule_protocol::{
 };
 use crate::connect_ip::request::{build_request, check_response, headers_to_strings};
 use crate::net::quic::{DEFAULT_TIMEOUT, KEEPALIVE_INTERVAL};
-use crate::net::{UdpPacket, check_packet_src_dst, tun};
+use crate::net::{UdpPacket, ZERO_IPV4_ADDRESS, check_packet_src_dst, tun};
 
 #[derive(Debug, Eq, PartialEq)]
 enum StreamStatus {
@@ -64,8 +65,14 @@ impl Connection {
         let conn = quiche::connect(
             Some(&server_name),
             &scid,
-            local.local_address().unwrap(),
-            remote.local_address().unwrap(),
+            local.local_address().ok_or(anyhow::anyhow!(
+                "failed to get local address from {:?}",
+                local
+            ))?,
+            remote.local_address().ok_or(anyhow::anyhow!(
+                "failed to get remote address from {:?}",
+                remote
+            ))?,
             &mut quic_config,
         )?;
 
@@ -152,7 +159,7 @@ impl Connection {
                 // Connection keepalive
                 _ = keepalive_interval.tick() => {
                     if self.conn.is_established() {
-                        self.conn.send_ack_eliciting().unwrap();
+                        self.conn.send_ack_eliciting()?;
                         trace!("keepalive tick. time until timeout: {:?}", self.conn.timeout());
                     }
                 }
@@ -283,31 +290,48 @@ impl Connection {
                     continue;
                 }
 
-                if let Some(ipv4) = Ipv4Packet::new(&buf[packet_start..len]) {
-                    let src = ipv4.get_source();
-                    let dest = ipv4.get_destination();
-                    debug!(
-                        "received IP packet from QUIC: {} -> {}, {} bytes",
-                        src,
-                        dest,
-                        len - packet_start
-                    );
+                let (src, dst) = if let Some(ipv4) = Ipv4Packet::new(&buf[packet_start..len])
+                    && ipv4.get_version() == 4
+                {
+                    (
+                        IpAddr::V4(ipv4.get_source()),
+                        IpAddr::V4(ipv4.get_destination()),
+                    )
+                } else if let Some(ipv6) = Ipv6Packet::new(&buf[packet_start..len])
+                    && ipv6.get_version() == 6
+                {
+                    (
+                        IpAddr::V6(ipv6.get_source()),
+                        IpAddr::V6(ipv6.get_destination()),
+                    )
+                } else {
+                    error!("received non-IP packet in datagram, dropping");
+                    continue;
+                };
 
-                    if check_packet_src_dst(
-                        IpAddr::V4(src),
-                        IpAddr::V4(dest),
-                        &self.capsule_state.remote_addresses,
-                        &self.capsule_state.remote_routes,
-                        &self.capsule_state.local_addresses,
-                        &self.capsule_state.local_routes,
-                    ) {
-                        tx_quic_to_tun.send(buf[packet_start..len].to_vec()).await?;
-                    } else {
-                        warn!(
-                            "dropping packet from peer with invalid src/dst: {} -> {}",
-                            src, dest
-                        );
-                    }
+                debug!(
+                    "received IP packet from QUIC connection: {} -> {}, {} bytes",
+                    src,
+                    dst,
+                    len - packet_start
+                );
+
+                if check_packet_src_dst(
+                    src,
+                    dst,
+                    &self.capsule_state.remote_addresses,
+                    &self.capsule_state.remote_routes,
+                    &self.capsule_state.local_addresses,
+                    &self.capsule_state.local_routes,
+                ) {
+                    tx_quic_to_tun.send(buf[packet_start..len].to_vec()).await?;
+                } else {
+                    warn!(
+                        "{} dropping packet from peer with invalid src/dst: {} -> {}",
+                        self.conn.trace_id(),
+                        src,
+                        dst
+                    );
                 }
             }
         }
@@ -317,33 +341,36 @@ impl Connection {
 
     async fn process_tun_packet(&mut self, ip_packet: Vec<u8>) -> Result<()> {
         let mut buf = [0; MAX_DATAGRAM_SIZE];
-        if let Some(ipv4) = Ipv4Packet::new(&ip_packet) {
-            let src = ipv4.get_source();
-            let dest = ipv4.get_destination();
-            debug!(
-                "received IP packet from TUN: {} -> {}, {} bytes",
-                src,
-                dest,
-                ip_packet.len()
-            );
-            if !check_packet_src_dst(
-                IpAddr::V4(src),
-                IpAddr::V4(dest),
-                &self.capsule_state.local_addresses,
-                &self.capsule_state.local_routes,
-                &self.capsule_state.remote_addresses,
-                &self.capsule_state.remote_routes,
-            ) {
-                warn!(
-                    "dropping packet from TUN with invalid src/dst: {} -> {}",
-                    src, dest
-                );
-                return Ok(());
-            }
+        let (src, dst) = if let Some(ipv4) = Ipv4Packet::new(&ip_packet)
+            && ipv4.get_version() == 4
+        {
+            (
+                IpAddr::V4(ipv4.get_source()),
+                IpAddr::V4(ipv4.get_destination()),
+            )
+        } else if let Some(ipv6) = Ipv6Packet::new(&ip_packet)
+            && ipv6.get_version() == 6
+        {
+            (
+                IpAddr::V6(ipv6.get_source()),
+                IpAddr::V6(ipv6.get_destination()),
+            )
         } else {
-            debug!(
-                "received non-IPv4 packet from TUN, {} bytes",
-                ip_packet.len()
+            error!("received non-IP packet from tun, dropping");
+            return Ok(());
+        };
+
+        if !check_packet_src_dst(
+            src,
+            dst,
+            &self.capsule_state.local_addresses,
+            &self.capsule_state.local_routes,
+            &self.capsule_state.remote_addresses,
+            &self.capsule_state.remote_routes,
+        ) {
+            warn!(
+                "dropping packet from TUN with invalid src/dst: {} -> {}",
+                src, dst
             );
             return Ok(());
         }
@@ -369,7 +396,7 @@ impl Connection {
     ) -> Result<()> {
         // Create a new HTTP/3 connection once the QUIC connection is established.
         if self.conn.is_established() && self.h3_conn.is_none() {
-            let mut h3_config = quiche::h3::Config::new().unwrap();
+            let mut h3_config = quiche::h3::Config::new()?;
             h3_config.enable_extended_connect(true);
             self.h3_conn = Some(
                 quiche::h3::Connection::with_transport(&mut self.conn, &h3_config)
@@ -382,7 +409,7 @@ impl Connection {
             if self.stream_state == StreamStatus::Initialized {
                 let req = build_request("localhost".to_string(), "/vpn".to_string());
                 debug!("sending HTTP request {req:?}");
-                let stream_id = h3_conn.send_request(&mut self.conn, &req, false).unwrap();
+                let stream_id = h3_conn.send_request(&mut self.conn, &req, false)?;
                 self.capsule_state.stream_id = Some(stream_id);
                 debug!("sent CONNECT request on stream {}", stream_id);
                 self.stream_state = StreamStatus::RequestSent;
@@ -406,9 +433,7 @@ impl Connection {
                                 self.conn.trace_id(),
                                 stream_id
                             );
-                            self.conn
-                                .close(true, 0x100, b"headers on unknown stream")
-                                .unwrap();
+                            self.conn.close(true, 0x100, b"headers on unknown stream")?;
                             break;
                         }
                         if check_response(&list) {
@@ -416,9 +441,7 @@ impl Connection {
                             info!("connected");
                         } else {
                             error!("unexpected response from server, closing connection");
-                            self.conn
-                                .close(true, 0x100, b"unexpected response")
-                                .unwrap();
+                            self.conn.close(true, 0x100, b"unexpected response")?;
                             break;
                         }
                     }
@@ -455,13 +478,13 @@ impl Connection {
 
                     Ok((_stream_id, quiche::h3::Event::Finished)) => {
                         info!("stream finished, closing connection");
-                        self.conn.close(true, 0x100, b"kthxbye").unwrap();
+                        self.conn.close(true, 0x100, b"kthxbye")?;
                         break;
                     }
 
                     Ok((_stream_id, quiche::h3::Event::Reset(e))) => {
                         error!("request was reset by peer with {e}, closing...");
-                        self.conn.close(true, 0x100, b"kthxbye").unwrap();
+                        self.conn.close(true, 0x100, b"kthxbye")?;
                         break;
                     }
 
@@ -540,11 +563,12 @@ impl Connection {
 
     fn send_address_request(&mut self) -> Result<()> {
         let stream_id = self.capsule_state.stream_id.unwrap();
-        // Send Address Request capsule
+        // At the moment we just request one /32 IPv4 address
+        let zero_ipnet = IpNet::new_assert(ZERO_IPV4_ADDRESS, 32);
         let addr_req = AddressRequestCapsule {
             addresses: vec![RequestedAddress {
                 request_id: 1,
-                ip_net: IpNet::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 32).unwrap(),
+                ip_net: zero_ipnet,
             }],
         };
         let capsule = Capsule::AddressRequest(addr_req);
@@ -552,11 +576,12 @@ impl Connection {
         let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
         capsule.append(&mut octets_mut)?;
         let payload_len = octets_mut.off();
-        self.h3_conn
-            .as_mut()
-            .unwrap()
-            .send_body(&mut self.conn, stream_id, &buf[..payload_len], false)
-            .unwrap();
+        self.h3_conn.as_mut().unwrap().send_body(
+            &mut self.conn,
+            stream_id,
+            &buf[..payload_len],
+            false,
+        )?;
         Ok(())
     }
 }

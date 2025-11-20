@@ -2,6 +2,7 @@ use anyhow::Result;
 use ipnet::IpNet;
 use octets::{Octets, OctetsMut};
 use pnet::packet::ipv4::Ipv4Packet;
+use pnet::packet::ipv6::Ipv6Packet;
 use scion_proto::address::IsdAsn;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -298,33 +299,46 @@ impl Connection {
                     continue;
                 }
 
-                if let Some(ipv4) = Ipv4Packet::new(&buf[packet_start..len]) {
-                    let src = ipv4.get_source();
-                    let dest = ipv4.get_destination();
-                    debug!(
-                        "received IP packet from QUIC connection: {} -> {}, {} bytes",
-                        src,
-                        dest,
-                        len - packet_start
-                    );
+                let (src, dst) = if let Some(ipv4) = Ipv4Packet::new(&buf[packet_start..len])
+                    && ipv4.get_version() == 4
+                {
+                    (
+                        IpAddr::V4(ipv4.get_source()),
+                        IpAddr::V4(ipv4.get_destination()),
+                    )
+                } else if let Some(ipv6) = Ipv6Packet::new(&buf[packet_start..len]) {
+                    (
+                        IpAddr::V6(ipv6.get_source()),
+                        IpAddr::V6(ipv6.get_destination()),
+                    )
+                } else {
+                    error!("received non-IP packet in datagram, dropping");
+                    continue;
+                };
 
-                    if check_packet_src_dst(
-                        IpAddr::V4(src),
-                        IpAddr::V4(dest),
-                        &self.capsule_state.remote_addresses,
-                        &self.capsule_state.remote_routes,
-                        &self.capsule_state.local_addresses,
-                        &self.capsule_state.local_routes,
-                    ) {
-                        tx_quic_to_tun.send(buf[packet_start..len].to_vec()).await?;
-                    } else {
-                        warn!(
-                            "{} dropping packet from peer with invalid src/dst: {} -> {}",
-                            self.conn.trace_id(),
-                            src,
-                            dest
-                        );
-                    }
+                debug!(
+                    "received IP packet from QUIC connection: {} -> {}, {} bytes",
+                    src,
+                    dst,
+                    len - packet_start
+                );
+
+                if check_packet_src_dst(
+                    src,
+                    dst,
+                    &self.capsule_state.remote_addresses,
+                    &self.capsule_state.remote_routes,
+                    &self.capsule_state.local_addresses,
+                    &self.capsule_state.local_routes,
+                ) {
+                    tx_quic_to_tun.send(buf[packet_start..len].to_vec()).await?;
+                } else {
+                    warn!(
+                        "{} dropping packet from peer with invalid src/dst: {} -> {}",
+                        self.conn.trace_id(),
+                        src,
+                        dst
+                    );
                 }
             }
         }
@@ -332,34 +346,36 @@ impl Connection {
     }
 
     async fn process_tun_packet(&mut self, ip_packet: Vec<u8>) -> Result<()> {
-        if let Some(ipv4) = Ipv4Packet::new(&ip_packet) {
-            let src = ipv4.get_source();
-            let dest = ipv4.get_destination();
-            debug!(
-                "received IP packet from TUN: {} -> {}, {} bytes",
-                src,
-                dest,
-                ip_packet.len()
-            );
-
-            if !check_packet_src_dst(
-                IpAddr::V4(src),
-                IpAddr::V4(dest),
-                &self.capsule_state.local_addresses,
-                &self.capsule_state.local_routes,
-                &self.capsule_state.remote_addresses,
-                &self.capsule_state.remote_routes,
-            ) {
-                warn!(
-                    "dropping packet from TUN with invalid src/dst: {} -> {}",
-                    src, dest
-                );
-                return Ok(());
-            }
+        let (src, dst) = if let Some(ipv4) = Ipv4Packet::new(&ip_packet)
+            && ipv4.get_version() == 4
+        {
+            (
+                IpAddr::V4(ipv4.get_source()),
+                IpAddr::V4(ipv4.get_destination()),
+            )
+        } else if let Some(ipv6) = Ipv6Packet::new(&ip_packet)
+            && ipv6.get_version() == 6
+        {
+            (
+                IpAddr::V6(ipv6.get_source()),
+                IpAddr::V6(ipv6.get_destination()),
+            )
         } else {
-            debug!(
-                "received non-IPv4 packet from TUN, {} bytes",
-                ip_packet.len()
+            error!("received non-IP packet from tun, dropping");
+            return Ok(());
+        };
+
+        if !check_packet_src_dst(
+            src,
+            dst,
+            &self.capsule_state.local_addresses,
+            &self.capsule_state.local_routes,
+            &self.capsule_state.remote_addresses,
+            &self.capsule_state.remote_routes,
+        ) {
+            warn!(
+                "dropping packet from TUN with invalid src/dst: {} -> {}",
+                src, dst
             );
             return Ok(());
         }

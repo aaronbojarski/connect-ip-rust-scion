@@ -1,18 +1,20 @@
-use std::sync::Arc;
-
-use crate::{
-    connect_ip::capsule::{
-        CAPSULE_PROTOCOL_EMPTY_ADDRESS, RouteAdvertisement, RouteAdvertisementCapsule,
-    },
-    net::{get_next_avail_subnet, get_specific_subnet, tun},
-};
 use anyhow::{Result, anyhow};
 use ipnet::IpNet;
 use octets::Octets;
+use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, error, info, warn};
 
-use crate::connect_ip::capsule::{AddressAssignCapsule, AssignedAddress, Capsule};
+use crate::{
+    connect_ip::capsule::{
+        AddressAssignCapsule, AssignedAddress, Capsule, RouteAdvertisement,
+        RouteAdvertisementCapsule,
+    },
+    net::{
+        ZERO_IPV4_ADDRESS, ZERO_IPV6_ADDRESS, get_next_avail_subnet, get_specific_subnet, is_ipv4,
+        is_zero_address, tun,
+    },
+};
 
 /// State for the capsule protocol.
 pub struct CapsuleProtocolState {
@@ -61,16 +63,16 @@ pub async fn handle_capsule_data(
             state.local_addresses.clear();
 
             // Add new addresses
-            for addr in assign_capsule.addresses {
-                if addr.ip_net == CAPSULE_PROTOCOL_EMPTY_ADDRESS {
+            for assigned_address in assign_capsule.addresses {
+                if is_zero_address(&assigned_address.ip_net) {
                     warn!("received empty address from peer");
                     continue;
                 }
-                info!("received address from peer: {}", addr.ip_net);
+                info!("received address from peer: {}", assigned_address.ip_net);
                 tx_address_updates
-                    .send(tun::AddressUpdate::AddAddress(addr.ip_net))
+                    .send(tun::AddressUpdate::AddAddress(assigned_address.ip_net))
                     .await?;
-                state.local_addresses.push(addr.ip_net);
+                state.local_addresses.push(assigned_address.ip_net);
             }
 
             // Removing addresses can have the effect that routes are removed aswell. Re-add all routes.
@@ -97,16 +99,21 @@ pub async fn handle_capsule_data(
                     ip_net,
                 })
                 .collect::<Vec<AssignedAddress>>();
-            for addr in request_capsule.addresses {
-                let assigned_net = if addr.ip_net == CAPSULE_PROTOCOL_EMPTY_ADDRESS {
-                    get_next_avail_subnet(available_addresses, 32).await
+            for requested_address in request_capsule.addresses {
+                let assigned_net = if is_zero_address(&requested_address.ip_net) {
+                    get_next_avail_subnet(
+                        available_addresses,
+                        is_ipv4(&requested_address.ip_net),
+                        requested_address.ip_net.prefix_len(),
+                    )
+                    .await
                 } else {
-                    get_specific_subnet(available_addresses, addr.ip_net).await
+                    get_specific_subnet(available_addresses, requested_address.ip_net).await
                 };
                 if let Some(assigned_subnet) = assigned_net {
                     info!("assigning requested address to client: {}", assigned_subnet);
                     let assigned_address = AssignedAddress {
-                        request_id: addr.request_id,
+                        request_id: requested_address.request_id,
                         ip_net: assigned_subnet.clone(),
                     };
                     assigned_addresses.push(assigned_address);
@@ -116,11 +123,18 @@ pub async fn handle_capsule_data(
                         .await?;
                     state.remote_addresses.push(assigned_subnet);
                 } else {
+                    let zero_ipnet = match requested_address.ip_net {
+                        IpNet::V4(_) => IpNet::new_assert(ZERO_IPV4_ADDRESS, 32),
+                        IpNet::V6(_) => IpNet::new_assert(ZERO_IPV6_ADDRESS, 128),
+                    };
                     assigned_addresses.push(AssignedAddress {
-                        request_id: addr.request_id,
-                        ip_net: CAPSULE_PROTOCOL_EMPTY_ADDRESS,
+                        request_id: requested_address.request_id,
+                        ip_net: zero_ipnet,
                     });
-                    warn!("requested address {} not available", addr.ip_net);
+                    warn!(
+                        "requested address {} not available",
+                        requested_address.ip_net
+                    );
                 }
             }
 
@@ -180,7 +194,10 @@ pub async fn prepare_address_and_route_assignment<'a>(
 
     // Assign a /32 address from the address pool to peer
     let mut assigned_addresses = vec![];
-    if let Some(addr) = get_next_avail_subnet(&mut available_addresses, 32).await {
+    if let Some(addr) = get_next_avail_subnet(&mut available_addresses, false, 128)
+        .await
+        .or(get_next_avail_subnet(&mut available_addresses, true, 32).await)
+    {
         info!("assigning address to peer: {}", addr);
         assigned_address = Some(addr.clone());
         state.remote_addresses.push(addr.clone());

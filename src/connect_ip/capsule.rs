@@ -24,9 +24,6 @@ pub enum CapsuleError {
 
 pub type CapsuleResult<T> = Result<T, CapsuleError>;
 
-pub const CAPSULE_PROTOCOL_EMPTY_ADDRESS: IpNet =
-    IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 32);
-
 // Capsule types
 #[derive(Clone, Debug)]
 pub enum CapsuleType {

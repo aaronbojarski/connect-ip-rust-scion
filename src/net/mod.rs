@@ -3,8 +3,30 @@ pub mod tun;
 
 use anyhow::Error;
 use ipnet::IpNet;
-use std::{net::IpAddr, process::Command, sync::Arc};
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    process::Command,
+    sync::Arc,
+};
 use tokio::sync::Mutex;
+
+pub const ZERO_IPV4_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
+pub const ZERO_IPV6_ADDRESS: IpAddr = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0));
+
+pub fn is_zero_address(ip_net: &IpNet) -> bool {
+    match ip_net.addr() {
+        IpAddr::V4(addr) => addr == ZERO_IPV4_ADDRESS,
+        IpAddr::V6(addr) => addr == ZERO_IPV6_ADDRESS,
+    }
+}
+
+pub fn is_ipv4(ip_net: &IpNet) -> bool {
+    matches!(ip_net, IpNet::V4(_))
+}
+
+pub fn is_ipv6(ip_net: &IpNet) -> bool {
+    matches!(ip_net, IpNet::V6(_))
+}
 
 pub struct UdpPacket {
     pub src: scion_proto::address::SocketAddr,
@@ -38,11 +60,16 @@ pub fn ip_range_to_net(start: IpAddr, end: IpAddr) -> Result<IpNet, Error> {
 
 pub async fn get_next_avail_subnet(
     available_nets: &Arc<Mutex<Vec<IpNet>>>,
+    ipv4: bool,
     prefix_len: u8,
 ) -> Option<IpNet> {
     let mut available_nets = available_nets.lock().await;
 
     for net in available_nets.iter() {
+        match (ipv4, net) {
+            (true, IpNet::V4(_)) | (false, IpNet::V6(_)) => {}
+            _ => continue,
+        }
         if net.prefix_len() <= prefix_len {
             let net_clone = net.clone();
             let subnets = net.subnets(prefix_len).ok()?;
