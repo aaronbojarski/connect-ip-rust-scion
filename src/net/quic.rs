@@ -6,9 +6,9 @@ pub const KEEPALIVE_INTERVAL: u64 = 5000; // in milliseconds
 pub const DEFAULT_TIMEOUT: u64 = 60_000; // in milliseconds
 
 pub fn configure_quic(
-    ca_cert_path: &std::path::PathBuf,
-    cert_path: &std::path::PathBuf,
-    key_path: &std::path::PathBuf,
+    ca_cert_path: &std::path::Path,
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
 ) -> Result<quiche::Config> {
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
 

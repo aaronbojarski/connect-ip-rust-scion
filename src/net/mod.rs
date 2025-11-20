@@ -71,7 +71,7 @@ pub async fn get_next_avail_subnet(
             _ => continue,
         }
         if net.prefix_len() <= prefix_len {
-            let net_clone = net.clone();
+            let net_clone = *net;
             let subnets = net.subnets(prefix_len).ok()?;
             let first_subnet = subnets.into_iter().next()?;
 
@@ -118,7 +118,7 @@ pub async fn get_specific_subnet(
                 .collect();
 
             // Update available_nets
-            let net_clone = net.clone();
+            let net_clone = *net;
             available_nets.retain(|n| n != &net_clone);
             available_nets.extend(remaining_nets);
             *available_nets = IpNet::aggregate(&available_nets);
@@ -134,10 +134,10 @@ pub fn add_route(destination: &IpNet, dev: String) -> Result<bool, Error> {
     // check if the route already exists
     let existing_routes = match destination {
         IpNet::V4(_) => Command::new("ip")
-            .args(&["route", "show", &destination.to_string(), "dev", &dev])
+            .args(["route", "show", &destination.to_string(), "dev", &dev])
             .output()?,
         IpNet::V6(_) => Command::new("ip")
-            .args(&["-6", "route", "show", &destination.to_string(), "dev", &dev])
+            .args(["-6", "route", "show", &destination.to_string(), "dev", &dev])
             .output()?,
     };
 
@@ -147,10 +147,10 @@ pub fn add_route(destination: &IpNet, dev: String) -> Result<bool, Error> {
 
     let status = match destination {
         IpNet::V4(_) => Command::new("ip")
-            .args(&["route", "add", &destination.to_string(), "dev", &dev])
+            .args(["route", "add", &destination.to_string(), "dev", &dev])
             .status()?,
         IpNet::V6(_) => Command::new("ip")
-            .args(&["-6", "route", "add", &destination.to_string(), "dev", &dev])
+            .args(["-6", "route", "add", &destination.to_string(), "dev", &dev])
             .status()?,
     };
 
@@ -164,10 +164,10 @@ pub fn add_route(destination: &IpNet, dev: String) -> Result<bool, Error> {
 pub fn remove_route(destination: &IpNet, dev: String) -> Result<(), Error> {
     let status = match destination {
         IpNet::V4(_) => Command::new("ip")
-            .args(&["route", "del", &destination.to_string(), "dev", &dev])
+            .args(["route", "del", &destination.to_string(), "dev", &dev])
             .status()?,
         IpNet::V6(_) => Command::new("ip")
-            .args(&["-6", "route", "del", &destination.to_string(), "dev", &dev])
+            .args(["-6", "route", "del", &destination.to_string(), "dev", &dev])
             .status()?,
     };
 
@@ -181,10 +181,10 @@ pub fn remove_route(destination: &IpNet, dev: String) -> Result<(), Error> {
 pub fn check_packet_src_dst(
     packet_src: IpAddr,
     packet_dst: IpAddr,
-    allowed_src_1: &Vec<IpNet>,
-    allowed_src_2: &Vec<IpNet>,
-    allowed_dst_1: &Vec<IpNet>,
-    allowed_dst_2: &Vec<IpNet>,
+    allowed_src_1: &[IpNet],
+    allowed_src_2: &[IpNet],
+    allowed_dst_1: &[IpNet],
+    allowed_dst_2: &[IpNet],
 ) -> bool {
     let src_valid = allowed_src_1.iter().any(|net| net.contains(&packet_src))
         || allowed_src_2.iter().any(|net| net.contains(&packet_src));

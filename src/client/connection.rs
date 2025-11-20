@@ -238,13 +238,12 @@ impl Connection {
 
     async fn process_udp_packets(
         &mut self,
-        packet_buf: &mut Vec<UdpPacket>,
+        packet_buf: &mut [UdpPacket],
         num_packets: usize,
         tx_quic_to_tun: &mpsc::Sender<Vec<u8>>,
         tx_address_updates: &mpsc::Sender<tun::AddressUpdate>,
     ) -> Result<()> {
-        for i in 0..num_packets {
-            let packet = &mut packet_buf[i];
+        for packet in packet_buf.iter_mut().take(num_packets) {
             let recv_info = quiche::RecvInfo {
                 from: packet.src.local_address().unwrap(),
                 to: packet.dst.local_address().unwrap(),
@@ -405,15 +404,15 @@ impl Connection {
         }
 
         // Send HTTP requests.
-        if let Some(h3_conn) = &mut self.h3_conn {
-            if self.stream_state == StreamStatus::Initialized {
-                let req = build_request("localhost".to_string(), "/vpn".to_string());
-                debug!("sending HTTP request {req:?}");
-                let stream_id = h3_conn.send_request(&mut self.conn, &req, false)?;
-                self.capsule_state.stream_id = Some(stream_id);
-                debug!("sent CONNECT request on stream {}", stream_id);
-                self.stream_state = StreamStatus::RequestSent;
-            }
+        if let Some(h3_conn) = &mut self.h3_conn
+            && self.stream_state == StreamStatus::Initialized
+        {
+            let req = build_request("localhost".to_string(), "/vpn".to_string());
+            debug!("sending HTTP request {req:?}");
+            let stream_id = h3_conn.send_request(&mut self.conn, &req, false)?;
+            self.capsule_state.stream_id = Some(stream_id);
+            debug!("sent CONNECT request on stream {}", stream_id);
+            self.stream_state = StreamStatus::RequestSent;
         }
 
         // Process HTTP/3 events.
@@ -464,11 +463,11 @@ impl Connection {
                             while consumed < read {
                                 consumed += handle_capsule_data(
                                     stream_id,
-                                    &buf[consumed..read].to_vec(),
+                                    &buf[consumed..read],
                                     &mut self.capsule_state,
                                     &mut self.conn,
                                     &mut self.h3_conn,
-                                    &mut self.available_addresses,
+                                    &self.available_addresses,
                                     tx_address_updates,
                                 )
                                 .await?;
@@ -513,7 +512,7 @@ impl Connection {
         tx_address_updates: &mpsc::Sender<tun::AddressUpdate>,
     ) -> Result<()> {
         if self.capsule_state.local_addresses.is_empty()
-            && self.requested_address == false
+            && !self.requested_address
             && self.stream_state == StreamStatus::TunnelEstablished
         {
             // Send request only if no address has been assigned within first second

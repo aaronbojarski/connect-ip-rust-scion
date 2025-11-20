@@ -45,13 +45,13 @@ impl Proxy {
     pub fn new(config: ProxyConfig) -> Self {
         let available_addresses = Arc::new(Mutex::new(config.address_pool.clone()));
         Proxy {
-            config: config,
+            config,
             token_key: ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &SystemRandom::new())
                 .unwrap(),
             conn_id_seed: ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &SystemRandom::new())
                 .unwrap(),
             connections: Arc::new(Mutex::new(HashMap::new())),
-            available_addresses: available_addresses,
+            available_addresses,
         }
     }
 

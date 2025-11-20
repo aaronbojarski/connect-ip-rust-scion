@@ -169,8 +169,8 @@ impl Connection {
                 self.tx_quic_to_udp
                     .send(UdpPacket {
                         data: buf[..write].to_vec(),
-                        src: src,
-                        dst: dst,
+                        src,
+                        dst,
                     })
                     .await?;
             }
@@ -198,14 +198,13 @@ impl Connection {
 
     async fn process_udp_packets(
         &mut self,
-        packet_buf: &mut Vec<UdpPacket>,
+        packet_buf: &mut [UdpPacket],
         num_packets: usize,
         tx_quic_to_tun: &mut mpsc::Sender<Vec<u8>>,
         tx_address_updates: &mpsc::Sender<tun::AddressUpdate>,
     ) -> Result<()> {
         let mut buf = [0; MAX_DATAGRAM_SIZE];
-        for i in 0..num_packets {
-            let packet = &mut packet_buf[i];
+        for packet in packet_buf.iter_mut().take(num_packets) {
             let src_ip_addr = packet.src.local_address().unwrap();
             let dst_ip_addr = packet.dst.local_address().unwrap();
             let recv_info = quiche::RecvInfo {
@@ -466,11 +465,11 @@ impl Connection {
                             while consumed < read {
                                 consumed += handle_capsule_data(
                                     stream_id,
-                                    &buf[consumed..read].to_vec(),
+                                    &buf[consumed..read],
                                     &mut self.capsule_state,
                                     &mut self.conn,
                                     &mut self.h3_conn,
-                                    &mut self.available_addresses,
+                                    &self.available_addresses,
                                     tx_address_updates,
                                 )
                                 .await?;
