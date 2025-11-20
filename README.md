@@ -1,7 +1,8 @@
 # connect-ip-rust-scion
 
-connect-ip-rust-scion is an implementation of Connect-IP ([RFC 9484](https://www.rfc-editor.org/rfc/rfc9484)) in Rust using SCION as underlying transport protocol. It provides a client and a proxy component to establish secure tunnels over SCION networks. It allows tunnerling of arbitrary IP traffic over SCION.
+connect-ip-rust-scion is an implementation of Connect-IP ([RFC 9484](https://www.rfc-editor.org/rfc/rfc9484)) in Rust using SCION as the underlying transport protocol. It provides a client and a proxy component to establish secure tunnels over SCION networks. It allows tunnerling of arbitrary IP traffic over SCION.
 
+This project used the scion-sdk. It does therefore not require the scion-daemon to be running.
 
 ## Building
 To build the project, use cargo.
