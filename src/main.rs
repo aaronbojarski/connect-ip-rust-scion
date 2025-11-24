@@ -1,3 +1,4 @@
+use anyhow::anyhow;
 use clap::{Args, Parser, Subcommand};
 use ipnet::IpNet;
 use std::path::PathBuf;
@@ -106,19 +107,24 @@ struct ClientOpt {
     log_level: tracing::Level,
 }
 
-fn main() {
+fn main() -> Result<(), anyhow::Error> {
     let cli = Cli::parse();
-    let exit_code = match cli.command {
+    let result = match cli.command {
         Command::Proxy(opt) => run_proxy(opt),
         Command::Client(opt) => run_client(opt),
     };
-    ::std::process::exit(exit_code);
+    if let Err(ref err) = result {
+        tracing::error!(error = %err, "command failed");
+    }
+    result
 }
 
-fn run_proxy(opt: ProxyOpt) -> i32 {
+#[tokio::main]
+async fn run_proxy(opt: ProxyOpt) -> Result<(), anyhow::Error> {
     tracing_subscriber::fmt()
         .with_max_level(opt.log_level)
-        .init();
+        .try_init()
+        .map_err(|err| anyhow!("failed to init tracing: {err}"))?;
     let config = connect_ip_rust_scion::proxy::ProxyConfig {
         listen: opt.listen,
         endhost_api_address: opt.endhost_api_address,
@@ -129,18 +135,16 @@ fn run_proxy(opt: ProxyOpt) -> i32 {
         address_pool: opt.address_pool,
     };
     let proxy = connect_ip_rust_scion::proxy::Proxy::new(config);
-    if let Err(e) = proxy.run() {
-        eprintln!("ERROR: {e}");
-        1
-    } else {
-        0
-    }
+    proxy.run().await?;
+    Ok(())
 }
 
-fn run_client(opt: ClientOpt) -> i32 {
+#[tokio::main]
+async fn run_client(opt: ClientOpt) -> Result<(), anyhow::Error> {
     tracing_subscriber::fmt()
         .with_max_level(opt.log_level)
-        .init();
+        .try_init()
+        .map_err(|err| anyhow!("failed to init tracing: {err}"))?;
     let config = connect_ip_rust_scion::client::ClientConfig {
         bind: opt.bind,
         remote: opt.remote,
@@ -155,10 +159,6 @@ fn run_client(opt: ClientOpt) -> i32 {
         tun_name: opt.tun_name,
     };
     let client = connect_ip_rust_scion::client::Client::new(config);
-    if let Err(e) = client.run() {
-        eprintln!("ERROR: {e}");
-        1
-    } else {
-        0
-    }
+    client.run().await?;
+    Ok(())
 }

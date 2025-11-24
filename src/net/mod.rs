@@ -1,7 +1,7 @@
 pub mod quic;
 pub mod tun;
 
-use anyhow::Error;
+use anyhow::{Context, Error};
 use ipnet::IpNet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::Command;
@@ -33,6 +33,7 @@ pub struct UdpPacket {
 }
 
 pub fn ip_range_to_net(start: IpAddr, end: IpAddr) -> Result<IpNet, Error> {
+    // TODO: currently we assume that start and end define a valid CIDR block. This should be validated or handled properly.
     match (start, end) {
         (IpAddr::V4(start_v4), IpAddr::V4(end_v4)) => {
             let start_u32 = u32::from(start_v4);
@@ -61,32 +62,26 @@ pub async fn get_next_avail_subnet(
     ipv4: bool,
     prefix_len: u8,
 ) -> Option<IpNet> {
-    let mut available_nets = available_nets.lock().await;
+    let mut pool = available_nets.lock().await;
+    let mut idx = 0;
 
-    for net in available_nets.iter() {
-        match (ipv4, net) {
-            (true, IpNet::V4(_)) | (false, IpNet::V6(_)) => {}
-            _ => continue,
+    while idx < pool.len() {
+        let net = pool[idx];
+        let family_matches = (ipv4 && is_ipv4(&net)) || (!ipv4 && is_ipv6(&net));
+        if !family_matches || net.prefix_len() > prefix_len {
+            idx += 1;
+            continue;
         }
-        if net.prefix_len() <= prefix_len {
-            let net_clone = *net;
-            let subnets = net.subnets(prefix_len).ok()?;
-            let first_subnet = subnets.into_iter().next()?;
 
-            // Remove the allocated subnet from the candidate net
-            let remaining_nets: Vec<IpNet> = net
-                .subnets(prefix_len)
-                .ok()?
-                .filter(|n| *n != first_subnet)
-                .collect();
+        let mut subnets = net.subnets(prefix_len).ok()?;
+        let first = subnets.next()?;
+        let rest: Vec<IpNet> = subnets.collect();
 
-            // Update available_nets
-            available_nets.retain(|n| n != &net_clone);
-            available_nets.extend(remaining_nets);
-            *available_nets = IpNet::aggregate(&available_nets);
+        pool.remove(idx);
+        pool.splice(idx..idx, rest);
+        *pool = IpNet::aggregate(&pool);
 
-            return Some(first_subnet);
-        }
+        return Some(first);
     }
 
     None
@@ -102,78 +97,110 @@ pub async fn get_specific_subnet(
     available_nets: &Arc<Mutex<Vec<IpNet>>>,
     desired_subnet: IpNet,
 ) -> Option<IpNet> {
-    let mut available_nets = available_nets.lock().await;
+    let mut pool = available_nets.lock().await;
+    let mut idx = 0;
 
-    for net in available_nets.iter() {
-        if net.contains(&desired_subnet.network())
-            && net.prefix_len() <= desired_subnet.prefix_len()
-        {
-            // Remove the allocated subnet from the candidate net
-            let remaining_nets: Vec<IpNet> = net
-                .subnets(desired_subnet.prefix_len())
-                .ok()?
-                .filter(|n| *n != desired_subnet)
-                .collect();
-
-            // Update available_nets
-            let net_clone = *net;
-            available_nets.retain(|n| n != &net_clone);
-            available_nets.extend(remaining_nets);
-            *available_nets = IpNet::aggregate(&available_nets);
-
-            return Some(desired_subnet);
+    while idx < pool.len() {
+        let net = pool[idx];
+        if !net.contains(&desired_subnet) {
+            idx += 1;
+            continue;
         }
+
+        let rest: Vec<IpNet> = net
+            .subnets(desired_subnet.prefix_len())
+            .ok()?
+            .filter(|n| *n != desired_subnet)
+            .collect();
+
+        pool.remove(idx);
+        pool.splice(idx..idx, rest);
+        *pool = IpNet::aggregate(&pool);
+
+        return Some(desired_subnet);
     }
 
     None
 }
 
-pub fn add_route(destination: &IpNet, dev: String) -> Result<bool, Error> {
-    // check if the route already exists
-    let existing_routes = match destination {
-        IpNet::V4(_) => Command::new("ip")
-            .args(["route", "show", &destination.to_string(), "dev", &dev])
-            .output()?,
-        IpNet::V6(_) => Command::new("ip")
-            .args(["-6", "route", "show", &destination.to_string(), "dev", &dev])
-            .output()?,
+pub fn add_route(destination: &IpNet, dev: &str) -> Result<bool, Error> {
+    let existing_routes = {
+        let mut cmd = Command::new("ip");
+        match destination {
+            IpNet::V4(_) => {
+                cmd.args(["route", "show"]);
+            }
+            IpNet::V6(_) => {
+                cmd.args(["-6", "route", "show"]);
+            }
+        };
+        let dest = destination.to_string();
+        cmd.arg(&dest).args(["dev", dev]);
+        run_ip_command(cmd)?
     };
 
     if !existing_routes.stdout.is_empty() {
         return Ok(false);
     }
 
-    let status = match destination {
-        IpNet::V4(_) => Command::new("ip")
-            .args(["route", "add", &destination.to_string(), "dev", &dev])
-            .status()?,
-        IpNet::V6(_) => Command::new("ip")
-            .args(["-6", "route", "add", &destination.to_string(), "dev", &dev])
-            .status()?,
+    let mut add_cmd = Command::new("ip");
+    match destination {
+        IpNet::V4(_) => {
+            add_cmd.args(["route", "add"]);
+        }
+        IpNet::V6(_) => {
+            add_cmd.args(["-6", "route", "add"]);
+        }
     };
-
-    if status.success() {
-        Ok(true)
-    } else {
-        Err(anyhow::anyhow!("ExitStatus: {}", status))
-    }
+    let dest = destination.to_string();
+    add_cmd.arg(&dest).args(["dev", dev]);
+    run_ip_command(add_cmd)?;
+    Ok(true)
 }
 
-pub fn remove_route(destination: &IpNet, dev: String) -> Result<(), Error> {
-    let status = match destination {
-        IpNet::V4(_) => Command::new("ip")
-            .args(["route", "del", &destination.to_string(), "dev", &dev])
-            .status()?,
-        IpNet::V6(_) => Command::new("ip")
-            .args(["-6", "route", "del", &destination.to_string(), "dev", &dev])
-            .status()?,
+pub fn remove_route(destination: &IpNet, dev: &str) -> Result<(), Error> {
+    let mut del_cmd = Command::new("ip");
+    match destination {
+        IpNet::V4(_) => {
+            del_cmd.args(["route", "del"]);
+        }
+        IpNet::V6(_) => {
+            del_cmd.args(["-6", "route", "del"]);
+        }
+    };
+    let dest = destination.to_string();
+    del_cmd.arg(&dest).args(["dev", dev]);
+    run_ip_command(del_cmd)?;
+    Ok(())
+}
+
+fn run_ip_command(mut cmd: Command) -> Result<std::process::Output, Error> {
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    let args = cmd
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let display_cmd = if args.is_empty() {
+        program.clone()
+    } else {
+        format!("{} {}", program, args.join(" "))
     };
 
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("ExitStatus: {}", status))
+    let output = cmd
+        .output()
+        .with_context(|| format!("failed to execute `{}`", display_cmd))?;
+
+    if !output.status.success() {
+        return Err(anyhow::anyhow!(
+            "`{}` exited with {}.\nstderr: {}\nstdout: {}",
+            display_cmd,
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        ));
     }
+
+    Ok(output)
 }
 
 pub fn check_packet_src_dst(
@@ -184,11 +211,15 @@ pub fn check_packet_src_dst(
     allowed_dst_1: &[IpNet],
     allowed_dst_2: &[IpNet],
 ) -> bool {
-    let src_valid = allowed_src_1.iter().any(|net| net.contains(&packet_src))
-        || allowed_src_2.iter().any(|net| net.contains(&packet_src));
+    let src_valid = allowed_src_1
+        .iter()
+        .chain(allowed_src_2.iter())
+        .any(|net| net.contains(&packet_src));
 
-    let dst_valid = allowed_dst_1.iter().any(|net| net.contains(&packet_dst))
-        || allowed_dst_2.iter().any(|net| net.contains(&packet_dst));
+    let dst_valid = allowed_dst_1
+        .iter()
+        .chain(allowed_dst_2.iter())
+        .any(|net| net.contains(&packet_dst));
 
     src_valid && dst_valid
 }

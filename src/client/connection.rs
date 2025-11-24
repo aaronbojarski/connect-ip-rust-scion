@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use ipnet::IpNet;
 use octets::{Octets, OctetsMut};
 use pnet::packet::ipv4::Ipv4Packet;
@@ -19,13 +19,6 @@ use crate::connect_ip::request::{build_request, check_response, headers_to_strin
 use crate::net::quic::{DEFAULT_TIMEOUT, KEEPALIVE_INTERVAL};
 use crate::net::{UdpPacket, ZERO_IPV4_ADDRESS, check_packet_src_dst, tun};
 
-#[derive(Debug, Eq, PartialEq)]
-enum StreamStatus {
-    Initialized,
-    RequestSent,
-    TunnelEstablished,
-}
-
 pub struct Connection {
     local: scion_proto::address::SocketAddr,
     remote: scion_proto::address::SocketAddr,
@@ -35,8 +28,8 @@ pub struct Connection {
     tx_quic_to_udp: mpsc::Sender<UdpPacket>,
     tun_name: String,
     available_addresses: Arc<Mutex<Vec<IpNet>>>,
-    stream_state: StreamStatus,
     capsule_state: CapsuleProtocolState,
+    tunnel_established: bool,
     assigned_addresses: bool,
     requested_address: bool,
     address_request_timer: std::time::Instant,
@@ -90,7 +83,6 @@ impl Connection {
             tx_quic_to_udp,
             tun_name,
             available_addresses,
-            stream_state: StreamStatus::Initialized,
             capsule_state: CapsuleProtocolState {
                 stream_id: None,
                 remote_addresses: vec![],
@@ -98,6 +90,7 @@ impl Connection {
                 local_routes: routes,
                 remote_routes: vec![],
             },
+            tunnel_established: false,
             assigned_addresses: false,
             requested_address: false,
             address_request_timer: std::time::Instant::now(),
@@ -124,7 +117,7 @@ impl Connection {
             .await?;
 
         // Send initial packet
-        let (write, send_info) = self.conn.send(&mut buf).expect("initial send failed");
+        let (write, send_info) = self.conn.send(&mut buf)?;
         self.tx_quic_to_udp
             .send(UdpPacket {
                 data: buf[..write].to_vec(),
@@ -245,14 +238,17 @@ impl Connection {
     ) -> Result<()> {
         for packet in packet_buf.iter_mut().take(num_packets) {
             let recv_info = quiche::RecvInfo {
-                from: packet.src.local_address().unwrap(),
-                to: packet.dst.local_address().unwrap(),
+                from: packet
+                    .src
+                    .local_address()
+                    .ok_or_else(|| anyhow!("invalid src address"))?,
+                to: packet
+                    .dst
+                    .local_address()
+                    .ok_or_else(|| anyhow!("invalid dst address"))?,
             };
 
-            if let Err(e) = self.conn.recv(&mut packet.data, recv_info) {
-                error!("recv failed: {:?}, recv_info: {:?}", e, recv_info);
-                continue;
-            }
+            self.conn.recv(&mut packet.data, recv_info)?;
         }
 
         // Handle HTTP/3 connection establishment and process HTTP/3 data
@@ -262,7 +258,7 @@ impl Connection {
         self.handle_capsule_protocol(tx_address_updates).await?;
 
         // Handle datagrams and forward to TUN if tunnel is established
-        if self.conn.is_established() && self.stream_state == StreamStatus::TunnelEstablished {
+        if self.conn.is_established() && self.tunnel_established {
             // Receive datagrams from QUIC and forward to TUN
             let mut buf = [0; MAX_DATAGRAM_SIZE];
             while let Ok(len) = self.conn.dgram_recv(&mut buf) {
@@ -379,9 +375,11 @@ impl Connection {
             return Ok(());
         }
 
-        if self.conn.is_established() && self.capsule_state.stream_id.is_some() {
+        if self.conn.is_established()
+            && let Some(stream_id) = self.capsule_state.stream_id
+        {
             let mut octets = OctetsMut::with_slice(&mut buf);
-            octets.put_varint(self.capsule_state.stream_id.unwrap() / 4)?;
+            octets.put_varint(stream_id / 4)?;
             octets.put_varint(0)?;
             octets.put_bytes(&ip_packet)?;
             let len = octets.off();
@@ -402,22 +400,21 @@ impl Connection {
         if self.conn.is_established() && self.h3_conn.is_none() {
             let mut h3_config = quiche::h3::Config::new()?;
             h3_config.enable_extended_connect(true);
-            self.h3_conn = Some(
-                quiche::h3::Connection::with_transport(&mut self.conn, &h3_config)
-                    .expect("Unable to create HTTP/3 connection, check the server's uni stream limit and window size"),
-            );
+            self.h3_conn = Some(quiche::h3::Connection::with_transport(
+                &mut self.conn,
+                &h3_config,
+            )?);
         }
 
         // Send HTTP requests.
         if let Some(h3_conn) = &mut self.h3_conn
-            && self.stream_state == StreamStatus::Initialized
+            && self.capsule_state.stream_id.is_none()
         {
             let req = build_request("localhost".to_string(), "/vpn".to_string());
             debug!("sending HTTP request {req:?}");
             let stream_id = h3_conn.send_request(&mut self.conn, &req, false)?;
             self.capsule_state.stream_id = Some(stream_id);
             debug!("sent CONNECT request on stream {}", stream_id);
-            self.stream_state = StreamStatus::RequestSent;
         }
 
         // Process HTTP/3 events.
@@ -441,7 +438,7 @@ impl Connection {
                             break;
                         }
                         if check_response(&list) {
-                            self.stream_state = StreamStatus::TunnelEstablished;
+                            self.tunnel_established = true;
                             info!("connected");
                         } else {
                             error!("unexpected response from server, closing connection");
@@ -504,6 +501,7 @@ impl Connection {
 
                     Err(e) => {
                         error!("HTTP/3 processing failed: {e:?}");
+                        self.conn.close(true, 0x100, b"HTTP/3 error")?;
                         break;
                     }
                 }
@@ -518,7 +516,7 @@ impl Connection {
     ) -> Result<()> {
         if self.capsule_state.local_addresses.is_empty()
             && !self.requested_address
-            && self.stream_state == StreamStatus::TunnelEstablished
+            && self.tunnel_established
         {
             // Send request only if no address has been assigned within first second
             if self.address_request_timer.elapsed().as_millis() > 1000 {
@@ -529,7 +527,7 @@ impl Connection {
         }
 
         if !self.assigned_addresses
-            && self.stream_state == StreamStatus::TunnelEstablished
+            && self.tunnel_established
             && self.capsule_state.stream_id.is_some()
         {
             let mut buf = [0; 100];
@@ -553,12 +551,11 @@ impl Connection {
                 return Ok(());
             }
 
-            self.h3_conn.as_mut().unwrap().send_body(
-                &mut self.conn,
-                self.capsule_state.stream_id.unwrap(),
-                &buf[..payload_len],
-                false,
-            )?;
+            if let Some(h3_conn) = &mut self.h3_conn
+                && let Some(stream_id) = self.capsule_state.stream_id
+            {
+                h3_conn.send_body(&mut self.conn, stream_id, &buf[..payload_len], false)?;
+            }
 
             self.assigned_addresses = true;
         }
@@ -566,26 +563,26 @@ impl Connection {
     }
 
     fn send_address_request(&mut self) -> Result<()> {
-        let stream_id = self.capsule_state.stream_id.unwrap();
-        // At the moment we just request one /32 IPv4 address
-        let zero_ipnet = IpNet::new_assert(ZERO_IPV4_ADDRESS, 32);
-        let addr_req = AddressRequestCapsule {
-            addresses: vec![RequestedAddress {
-                request_id: 1,
-                ip_net: zero_ipnet,
-            }],
-        };
-        let capsule = Capsule::AddressRequest(addr_req);
-        let mut buf = [0u8; 100];
-        let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
-        capsule.append(&mut octets_mut)?;
-        let payload_len = octets_mut.off();
-        self.h3_conn.as_mut().unwrap().send_body(
-            &mut self.conn,
-            stream_id,
-            &buf[..payload_len],
-            false,
-        )?;
+        if let Some(h3_conn) = &mut self.h3_conn
+            && let Some(stream_id) = self.capsule_state.stream_id
+        {
+            // At the moment we just request one /32 IPv4 address
+            let zero_ipnet = IpNet::new_assert(ZERO_IPV4_ADDRESS, 32);
+            let addr_req = AddressRequestCapsule {
+                addresses: vec![RequestedAddress {
+                    request_id: 1,
+                    ip_net: zero_ipnet,
+                }],
+            };
+            let capsule = Capsule::AddressRequest(addr_req);
+            let mut buf = [0u8; 100];
+            let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
+            capsule.append(&mut octets_mut)?;
+            let payload_len = octets_mut.off();
+            h3_conn.send_body(&mut self.conn, stream_id, &buf[..payload_len], false)?;
+        } else {
+            error!("cannot send address request, HTTP/3 connection not established");
+        }
         Ok(())
     }
 }

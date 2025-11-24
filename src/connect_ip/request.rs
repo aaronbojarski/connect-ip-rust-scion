@@ -20,6 +20,7 @@ pub fn build_request(authority: String, path: String) -> Vec<quiche::h3::Header>
 pub fn build_response(request: &[quiche::h3::Header]) -> Vec<quiche::h3::Header> {
     let mut method = None;
     let mut protocol = None;
+    let mut capsule_protocol = None;
 
     for hdr in request {
         match hdr.name() {
@@ -27,16 +28,18 @@ pub fn build_response(request: &[quiche::h3::Header]) -> Vec<quiche::h3::Header>
 
             b":method" => method = Some(hdr.value()),
 
+            b"capsule-protocol" => capsule_protocol = Some(hdr.value()),
+
             _ => (),
         }
     }
 
-    let status = match (method, protocol) {
-        (Some(b"CONNECT"), Some(b"connect-ip")) => 200,
+    let status = match (method, protocol, capsule_protocol) {
+        (Some(b"CONNECT"), Some(b"connect-ip"), Some(b"?1")) => 200,
         _ => {
             debug!(
-                "Unsupported request: method={:?}, protocol={:?}",
-                method, protocol
+                "Unsupported request: method={:?}, protocol={:?}, capsule_protocol={:?}",
+                method, protocol, capsule_protocol
             );
             405
         }
@@ -63,13 +66,7 @@ pub fn check_response(headers: &[quiche::h3::Header]) -> bool {
         }
     }
 
-    match (status, capsule_protocol) {
-        (Some(b"200"), Some(b"?1")) => (),
-        _ => {
-            return false;
-        }
-    };
-    true
+    matches!((status, capsule_protocol), (Some(b"200"), Some(b"?1")))
 }
 
 pub fn headers_to_strings(hdrs: &[quiche::h3::Header]) -> Vec<(String, String)> {

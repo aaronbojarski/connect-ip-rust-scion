@@ -147,7 +147,7 @@ impl AssignedAddress {
             IpAddr::V4(_) => 4,
             IpAddr::V6(_) => 16,
         };
-        1 + addr_len + 1 + octets::varint_len(self.request_id)
+        octets::varint_len(self.request_id) + 1 + addr_len + 1
     }
 }
 
@@ -236,7 +236,7 @@ impl RequestedAddress {
             IpAddr::V4(_) => 4,
             IpAddr::V6(_) => 16,
         };
-        1 + addr_len + 1 + octets::varint_len(self.request_id)
+        octets::varint_len(self.request_id) + 1 + addr_len + 1
     }
 }
 

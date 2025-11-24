@@ -40,7 +40,6 @@ impl Client {
         Client { config }
     }
 
-    #[tokio::main]
     pub async fn run(&self) -> Result<()> {
         let mut buf = [0; 65535];
         let quic_config = crate::net::quic::configure_quic(
@@ -58,8 +57,12 @@ impl Client {
         let cancel_token = CancellationToken::new();
 
         let result = if self.config.remote.isd_asn() == IsdAsn::WILDCARD {
-            let socket =
-                tokio::net::UdpSocket::bind(self.config.bind.local_address().unwrap()).await?;
+            let addr = self
+                .config
+                .bind
+                .local_address()
+                .ok_or_else(|| anyhow!("invalid local address in bind socket addr"))?;
+            let socket = tokio::net::UdpSocket::bind(addr).await?;
             // Get local address.
             let local_addr = socket.local_addr()?;
 
@@ -99,7 +102,8 @@ impl Client {
                     }
                     // Send datagram from QUIC to UDP socket
                     Some(packet_data) = rx_quic_to_udp.recv() => {
-                        socket.send_to(&packet_data.data, packet_data.dst.local_address().unwrap()).await?;
+                        let dst = packet_data.dst.local_address().ok_or_else(|| anyhow!("invalid dst address"))?;
+                        socket.send_to(&packet_data.data, dst).await?;
                         trace!("sent {} bytes to {}", packet_data.data.len(), packet_data.dst);
                     }
                     // Connection handler exited

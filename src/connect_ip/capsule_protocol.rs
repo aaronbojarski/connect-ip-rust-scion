@@ -37,7 +37,7 @@ pub async fn handle_capsule_data(
     tx_address_updates: &mpsc::Sender<tun::AddressUpdate>,
 ) -> Result<usize> {
     if state.stream_id != Some(stream_id) {
-        error!(
+        warn!(
             "{} received capsule data on unknown stream id {}",
             conn.trace_id(),
             stream_id
@@ -139,13 +139,14 @@ pub async fn handle_capsule_data(
                 "sending AddressAssign capsule with addresses: {:?}",
                 assigned_addresses
             );
-
             let address_assign_capsule = AddressAssignCapsule {
                 addresses: assigned_addresses,
             };
-            let capsule = Capsule::AddressAssign(address_assign_capsule);
-            let mut buf = vec![0u8; 1000];
+
+            let mut buf = vec![0u8; address_assign_capsule.len() + 16];
             let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
+
+            let capsule = Capsule::AddressAssign(address_assign_capsule);
             capsule.append(&mut octets_mut)?;
             let payload_len = octets_mut.off();
             h3_conn

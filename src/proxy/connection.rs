@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use ipnet::IpNet;
 use octets::{Octets, OctetsMut};
 use pnet::packet::ipv4::Ipv4Packet;
@@ -116,7 +116,7 @@ impl Connection {
                 // Periodic keepalive
                 _ = keepalive_interval.tick() => {
                     if self.conn.is_established() {
-                        self.conn.send_ack_eliciting().unwrap();
+                        self.conn.send_ack_eliciting()?;
                         trace!("sending keepalive for connection {:?}", self.scid);
                     }
                 }
@@ -202,8 +202,14 @@ impl Connection {
     ) -> Result<()> {
         let mut buf = [0; MAX_DATAGRAM_SIZE];
         for packet in packet_buf.iter_mut().take(num_packets) {
-            let src_ip_addr = packet.src.local_address().unwrap();
-            let dst_ip_addr = packet.dst.local_address().unwrap();
+            let src_ip_addr = packet
+                .src
+                .local_address()
+                .ok_or_else(|| anyhow!("Invalid src address."))?;
+            let dst_ip_addr = packet
+                .dst
+                .local_address()
+                .ok_or_else(|| anyhow!("Invalid dst address."))?;
             let recv_info = quiche::RecvInfo {
                 from: src_ip_addr,
                 to: dst_ip_addr,
@@ -230,8 +236,8 @@ impl Connection {
         self.handle_http3_connection(tx_address_updates).await?;
 
         // Handle initial address assignment and route advertisement
-        if self.h3_conn.is_some()
-            && self.capsule_state.stream_id.is_some()
+        if let Some(h3_conn) = &mut self.h3_conn
+            && let Some(stream_id) = self.capsule_state.stream_id
             && !self.assign_addresses_and_routes_done
         {
             let mut octets = OctetsMut::with_slice(&mut buf);
@@ -253,12 +259,7 @@ impl Connection {
                 error!("{} no capsule prepared, not sending", self.conn.trace_id());
                 return Ok(());
             }
-            self.h3_conn.as_mut().unwrap().send_body(
-                &mut self.conn,
-                self.capsule_state.stream_id.unwrap(),
-                &buf[..payload_len],
-                false,
-            )?;
+            h3_conn.send_body(&mut self.conn, stream_id, &buf[..payload_len], false)?;
 
             self.assign_addresses_and_routes_done = true;
         }
@@ -381,7 +382,9 @@ impl Connection {
             return Ok(());
         }
 
-        if self.conn.is_established() && self.capsule_state.stream_id.is_some() {
+        if self.conn.is_established()
+            && let Some(stream_id) = self.capsule_state.stream_id
+        {
             let mut buf = [0; MAX_DATAGRAM_SIZE];
             let mut octets = OctetsMut::with_slice(&mut buf);
 
@@ -389,7 +392,7 @@ impl Connection {
             // - varint: quarter stream id (stream_id / 4)
             // - varint: context_id (must be 0)
             // - bytes: IP packet
-            octets.put_varint(self.capsule_state.stream_id.unwrap() / 4)?;
+            octets.put_varint(stream_id / 4)?;
             octets.put_varint(0)?;
             octets.put_bytes(&ip_packet)?;
             let len = octets.off();
@@ -410,7 +413,7 @@ impl Connection {
 
         // Setup HTTP/3 connection if not already done
         if (self.conn.is_in_early_data() || self.conn.is_established()) && self.h3_conn.is_none() {
-            let mut h3_config = quiche::h3::Config::new().unwrap();
+            let mut h3_config = quiche::h3::Config::new()?;
             h3_config.enable_extended_connect(true);
             let h3_conn = match quiche::h3::Connection::with_transport(&mut self.conn, &h3_config) {
                 Ok(v) => v,
@@ -443,9 +446,7 @@ impl Connection {
                                 self.conn.trace_id(),
                                 stream_id
                             );
-                            self.conn
-                                .close(true, 0x100, b"headers on unknown stream")
-                                .unwrap();
+                            self.conn.close(true, 0x100, b"headers on unknown stream")?;
                             continue;
                         }
                         self.handle_request(stream_id, &list);
@@ -481,12 +482,12 @@ impl Connection {
 
                     Ok((_stream_id, quiche::h3::Event::Finished)) => {
                         info!("stream finished, closing connection");
-                        self.conn.close(true, 0x100, b"kthxbye").unwrap();
+                        self.conn.close(true, 0x100, b"kthxbye")?;
                     }
 
                     Ok((_stream_id, quiche::h3::Event::Reset(e))) => {
                         error!("request was reset by peer with {e}, closing...");
-                        self.conn.close(true, 0x100, b"kthxbye").unwrap();
+                        self.conn.close(true, 0x100, b"kthxbye")?;
                     }
 
                     Ok((_prioritized_element_id, quiche::h3::Event::PriorityUpdate)) => (),
@@ -516,29 +517,30 @@ impl Connection {
             stream_id
         );
 
-        let headers = build_response(headers);
-        let http3_conn = self.h3_conn.as_mut().unwrap();
+        if let Some(http3_conn) = &mut self.h3_conn {
+            let headers = build_response(headers);
 
-        match http3_conn.send_response(&mut self.conn, stream_id, &headers, false) {
-            Ok(v) => v,
+            match http3_conn.send_response(&mut self.conn, stream_id, &headers, false) {
+                Ok(v) => v,
 
-            Err(quiche::h3::Error::StreamBlocked) => {
-                let response = PartialResponse {
-                    headers: Some(headers),
-                    body: vec![],
-                    written: 0,
-                };
+                Err(quiche::h3::Error::StreamBlocked) => {
+                    let response = PartialResponse {
+                        headers: Some(headers),
+                        body: vec![],
+                        written: 0,
+                    };
 
-                self.partial_responses.insert(stream_id, response);
-                return;
+                    self.partial_responses.insert(stream_id, response);
+                    return;
+                }
+
+                Err(e) => {
+                    error!("{} stream send failed {:?}", self.conn.trace_id(), e);
+                    return;
+                }
             }
-
-            Err(e) => {
-                error!("{} stream send failed {:?}", self.conn.trace_id(), e);
-                return;
-            }
+            self.capsule_state.stream_id = Some(stream_id);
         }
-        self.capsule_state.stream_id = Some(stream_id);
     }
 
     /// Handles newly writable streams. This is quiche boilerplate for handling partial writes.
@@ -556,11 +558,13 @@ impl Connection {
             }
         };
 
-        if !self.partial_responses.contains_key(&stream_id) {
-            return;
-        }
+        let resp = match self.partial_responses.get_mut(&stream_id) {
+            Some(v) => v,
 
-        let resp = self.partial_responses.get_mut(&stream_id).unwrap();
+            None => {
+                return;
+            }
+        };
 
         if let Some(ref headers) = resp.headers {
             match http3_conn.send_response(&mut self.conn, stream_id, headers, false) {

@@ -1,10 +1,10 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result};
 use ipnet::IpNet;
 use std::net::IpAddr;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info_span, trace, warn};
+use tracing::{debug, error, info_span, warn};
 use tracing_futures::Instrument as _;
 use tun_rs::DeviceBuilder;
 
@@ -79,7 +79,7 @@ impl Tun {
                                         debug!("Removed address {} from TUN device {}", ipnet, name);
                                     }
                                     AddressUpdate::AddRoute(ipnet) => {
-                                        match add_route(&ipnet, name.clone()) {
+                                        match add_route(&ipnet, &name) {
                                             Ok(true) => {
                                                 debug!("Added route {} via TUN device {}", ipnet, name);
                                             }
@@ -92,7 +92,7 @@ impl Tun {
                                         }
                                     }
                                     AddressUpdate::RemoveRoute(ipnet) => {
-                                        if let Err(e) = remove_route(&ipnet, name.clone()) {
+                                        if let Err(e) = remove_route(&ipnet, &name) {
                                             error!("Failed to remove route {}: {}", ipnet, e);
                                         } else {
                                             debug!("Removed route {} via TUN device {}", ipnet, name);
@@ -104,17 +104,12 @@ impl Tun {
                             // Read from TUN device and send to main task
                             len = dev.recv(&mut buf) => {
                                 let len = len?;
-                                let packet_data = buf[..len].to_vec();
-                                trace!("TUN -> QUIC: {:?}", packet_data);
-                                tx_tun_to_quic.send(packet_data).await
-                                    .map_err(|_| anyhow!("failed to send packet from TUN"))?;
+                                tx_tun_to_quic.send(buf[..len].to_vec()).await.context("failed to send on TUN to QUIC channel")?;
                             }
 
                             // Receive from main task and write to TUN device
                             Some(packet) = rx_in_tun.recv() => {
-                                trace!("QUIC -> TUN: {:?}", packet);
-                                dev.send(&packet).await
-                                    .map_err(|_| anyhow!("failed to send packet to TUN"))?;
+                                dev.send(&packet).await.context("failed to send packet to TUN device")?;
                             }
 
                             // Channel closed
@@ -145,5 +140,6 @@ impl Tun {
         if let Some(handle) = &self.handle {
             handle.abort();
         }
+        self.handle = None;
     }
 }

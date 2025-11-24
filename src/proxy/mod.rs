@@ -1,6 +1,6 @@
 pub mod connection;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use ipnet::IpNet;
 use ring::rand::SystemRandom;
 use scion_proto::address::IsdAsn;
@@ -52,7 +52,6 @@ impl Proxy {
         }
     }
 
-    #[tokio::main]
     pub async fn run(&self) -> Result<()> {
         let mut quic_config = crate::net::quic::configure_quic(
             &self.config.ca_cert_path,
@@ -68,7 +67,11 @@ impl Proxy {
         let mut next_client = 0u32;
 
         if self.config.listen.isd_asn() == IsdAsn::WILDCARD {
-            let local_addr = self.config.listen.local_address().unwrap();
+            let local_addr = self
+                .config
+                .listen
+                .local_address()
+                .ok_or_else(|| anyhow!("invalid local address"))?;
             let socket = tokio::net::UdpSocket::bind(local_addr).await?;
             info!("listening on {}", local_addr);
             loop {
@@ -79,12 +82,17 @@ impl Proxy {
                             IsdAsn::WILDCARD,
                             src,
                         );
-                        self.handle_udp_packet(&mut buf, len, src, src_scion, local_addr, self.config.listen, &tx_quic_to_udp, &mut quic_config, &mut next_client).await;
+                        self.handle_udp_packet(&mut buf, len, src, src_scion, local_addr, self.config.listen, &tx_quic_to_udp, &mut quic_config, &mut next_client).await?;
                     }
 
                     // Send QUIC packets over UDP socket
                     Some(packet_data) = rx_quic_to_udp.recv() => {
-                        let dst = packet_data.dst.local_address().unwrap();
+                        let dst = if let Some(addr) = packet_data.dst.local_address() {
+                            addr
+                        } else {
+                            warn!("Could not get destination address from SCION SocketAddr. Skipping packet.");
+                            continue;
+                        };
                         socket.send_to(&packet_data.data, dst).await?;
                         trace!("sent {} bytes to {}", packet_data.data.len(), dst);
                     }
@@ -116,7 +124,9 @@ impl Proxy {
 
             let local_scion_addr = socket.local_addr();
             info!("listening on {}", local_scion_addr);
-            let local_addr = local_scion_addr.local_address().unwrap();
+            let local_addr = local_scion_addr
+                .local_address()
+                .ok_or_else(|| anyhow!("invalid local address"))?;
 
             // Main loop: handle UDP socket
             loop {
@@ -130,7 +140,7 @@ impl Proxy {
                                 continue;
                             }
                         };
-                        self.handle_udp_packet(&mut buf, len, src_ip_addr, src, local_addr, local_scion_addr, &tx_quic_to_udp, &mut quic_config, &mut next_client).await;
+                        self.handle_udp_packet(&mut buf, len, src_ip_addr, src, local_addr, local_scion_addr, &tx_quic_to_udp, &mut quic_config, &mut next_client).await?;
                     }
 
                     // Send QUIC packets over UDP socket
@@ -154,13 +164,13 @@ impl Proxy {
         tx_quic_to_udp: &mpsc::Sender<UdpPacket>,
         quic_config: &mut quiche::Config,
         next_client: &mut u32,
-    ) {
+    ) -> Result<()> {
         // Parse the QUIC packet header to identify connection
         let hdr = match quiche::Header::from_slice(&mut buf[..len], quiche::MAX_CONN_ID_LEN) {
             Ok(v) => v,
             Err(e) => {
-                debug!("failed to parse header: {:?}", e);
-                return;
+                warn!("failed to parse header: {:?}", e);
+                return Ok(());
             }
         };
 
@@ -192,7 +202,7 @@ impl Proxy {
             if !quiche::version_is_supported(hdr.version) {
                 debug!("Doing version negotiation");
 
-                let len = quiche::negotiate_version(&hdr.scid, &hdr.dcid, &mut out).unwrap();
+                let len = quiche::negotiate_version(&hdr.scid, &hdr.dcid, &mut out)?;
                 let out = &out[..len];
 
                 let packet = UdpPacket {
@@ -201,8 +211,8 @@ impl Proxy {
                     dst: src_scion_socket,
                 };
 
-                tx_quic_to_udp.send(packet).await.unwrap();
-                return;
+                tx_quic_to_udp.send(packet).await?;
+                return Ok(());
             }
 
             let mut scid = [0; quiche::MAX_CONN_ID_LEN];
@@ -210,7 +220,10 @@ impl Proxy {
             let scid = quiche::ConnectionId::from_ref(&scid);
 
             // Token is always present in Initial packets.
-            let token = hdr.token.as_ref().unwrap();
+            let token = hdr
+                .token
+                .as_ref()
+                .ok_or(anyhow!("Token should be available."))?;
 
             // Do stateless retry if the client didn't send a token.
             if token.is_empty() {
@@ -225,8 +238,7 @@ impl Proxy {
                     &new_token,
                     hdr.version,
                     &mut out,
-                )
-                .unwrap();
+                )?;
 
                 let out = &out[..len];
 
@@ -236,8 +248,8 @@ impl Proxy {
                     dst: src_scion_socket,
                 };
 
-                tx_quic_to_udp.send(packet).await.unwrap();
-                return;
+                tx_quic_to_udp.send(packet).await?;
+                return Ok(());
             }
 
             let odcid = self.validate_token(&src_ip_socket, token);
@@ -246,12 +258,12 @@ impl Proxy {
             // drop the packet.
             if odcid.is_none() {
                 warn!("Invalid address validation token");
-                return;
+                return Ok(());
             }
 
             if scid.len() != hdr.dcid.len() {
                 warn!("Invalid destination connection ID");
-                return;
+                return Ok(());
             }
 
             // Reuse the source connection ID we sent in the Retry packet,
@@ -274,7 +286,7 @@ impl Proxy {
                 Ok(c) => c,
                 Err(e) => {
                     warn!("failed to create connection: {:?}", e);
-                    return;
+                    return Ok(());
                 }
             };
 
@@ -290,7 +302,7 @@ impl Proxy {
                 }
                 Err(e) => {
                     warn!("failed to process initial packet: {:?}", e);
-                    return;
+                    return Ok(());
                 }
             }
 
@@ -314,7 +326,7 @@ impl Proxy {
                     ),
                 };
 
-                tx_quic_to_udp.send(packet).await.unwrap();
+                tx_quic_to_udp.send(packet).await?;
             }
 
             // Create channel for this connection
@@ -358,6 +370,7 @@ impl Proxy {
         } else {
             debug!("packet for unknown connection with dcid {:?}", hdr.dcid);
         }
+        Ok(())
     }
 
     fn mint_token(&self, hdr: &quiche::Header, src: &SocketAddr) -> Vec<u8> {
