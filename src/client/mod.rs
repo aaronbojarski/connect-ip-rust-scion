@@ -151,7 +151,16 @@ impl Client {
                 .context("client did not get any address assigned")?;
 
             let socket_address = scion_proto::address::SocketAddr::new(assigned_addr.into(), 10111);
-            let socket = client_network_stack.bind(Some(socket_address)).await?;
+            let mut socket_config = scion_stack::scionstack::SocketConfig::new();
+            let policy =
+                scion_proto::path::policy::acl::AclPolicy::parse("+ 64-2:0:13 - 64-12350 +")
+                    .unwrap();
+            info!("Policy: {:?}", policy);
+            socket_config = socket_config.with_path_policy(policy);
+
+            let socket = client_network_stack
+                .bind_with_config(Some(socket_address), socket_config)
+                .await?;
 
             // Get local address.
             let local_addr = socket.local_addr();

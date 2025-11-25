@@ -90,7 +90,7 @@ impl Proxy {
                         let dst = if let Some(addr) = packet_data.dst.local_address() {
                             addr
                         } else {
-                            warn!("Could not get destination address from SCION SocketAddr. Skipping packet.");
+                            warn!("Invalid destination address. Skipping packet. {}", packet_data.dst);
                             continue;
                         };
                         socket.send_to(&packet_data.data, dst).await?;
@@ -120,7 +120,14 @@ impl Proxy {
 
             let socket_address = scion_proto::address::SocketAddr::new(proxy_addr.into(), 4433);
 
-            let socket = scion_network_stack.bind(Some(socket_address)).await?;
+            let mut socket_config = scion_stack::scionstack::SocketConfig::new();
+            let policy = scion_proto::path::policy::acl::AclPolicy::parse("+ 64 +").unwrap();
+            info!("Policy: {:?}", policy);
+            socket_config = socket_config.with_path_policy(policy);
+
+            let socket = scion_network_stack
+                .bind_with_config(Some(socket_address), socket_config)
+                .await?;
 
             let local_scion_addr = socket.local_addr();
             info!("listening on {}", local_scion_addr);
