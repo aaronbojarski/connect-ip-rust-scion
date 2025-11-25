@@ -53,10 +53,10 @@ jobs:
         run: cargo build
 
       - name: Generate self-signed certificate
-        run: bash ./generate_certs.sh
+        run: bash ./testnet/generate_certs.sh
 
       - name: Set up test network
-        run: sudo bash ./testnet.sh up
+        run: sudo bash ./testnet/testnet.sh up
 
       - name: Enable IP forwarding
         run: |
@@ -140,7 +140,7 @@ jobs:
           fi
 
           # Tear down test network
-          sudo bash ./testnet.sh down || true
+          sudo bash ./testnet/testnet.sh down || true
 
           # Clean up any remaining processes
           sudo pkill -f "target/debug/proxy" || true
