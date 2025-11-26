@@ -6,6 +6,7 @@ use ring::rand::SystemRandom;
 use scion_proto::address::IsdAsn;
 use scion_stack::scionstack::ScionStackBuilder;
 use std::collections::HashMap;
+use std::fs;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
@@ -23,6 +24,7 @@ const CLIENT_CHANNEL_CAPACITY: usize = 1000;
 pub struct ProxyConfig {
     pub listen: scion_proto::address::SocketAddr,
     pub endhost_api_address: Option<url::Url>,
+    pub snap_token_path: Option<std::path::PathBuf>,
     pub ca_cert_path: std::path::PathBuf,
     pub cert_path: std::path::PathBuf,
     pub key_path: std::path::PathBuf,
@@ -103,9 +105,18 @@ impl Proxy {
                 "endhost API address must be provided when using SCION (with --endhost-api)",
             )?;
 
-            info!("Building proxy SCION stack...");
-
-            let scion_network_stack = ScionStackBuilder::new(endhost_api_url)
+            let mut builder = ScionStackBuilder::new(endhost_api_url);
+            if let Some(token_path) = &self.config.snap_token_path {
+                let snap_token = fs::read_to_string(token_path)
+                    .with_context(|| format!("failed to read token file {:?}", token_path))?
+                    .trim()
+                    .to_string();
+                if snap_token.is_empty() {
+                    anyhow::bail!("token file {:?} is empty", token_path);
+                }
+                builder = builder.with_auth_token(snap_token);
+            }
+            let scion_network_stack = builder
                 .build()
                 .in_current_span()
                 .await

@@ -32,6 +32,10 @@ struct ProxyOpt {
     #[clap(long = "endhost-api")]
     endhost_api_address: Option<Url>,
 
+    /// Path to the Snap token file for authentication with the endhost API
+    #[clap(long = "snap-token", value_name = "FILE")]
+    snap_token_path: Option<PathBuf>,
+
     /// CA certificate used to verify peers
     #[clap(long = "ca-cert", value_name = "FILE", default_value = "ca-cert.pem")]
     ca_cert_path: PathBuf,
@@ -128,6 +132,7 @@ async fn run_proxy(opt: ProxyOpt) -> Result<(), anyhow::Error> {
     let config = connect_ip_rust_scion::proxy::ProxyConfig {
         listen: opt.listen,
         endhost_api_address: opt.endhost_api_address,
+        snap_token_path: opt.snap_token_path,
         ca_cert_path: opt.ca_cert_path,
         cert_path: opt.cert_path,
         key_path: opt.key_path,
