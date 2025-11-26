@@ -38,6 +38,7 @@ pub struct Connection {
     available_addresses: Arc<Mutex<Vec<IpNet>>>,
     partial_responses: HashMap<u64, PartialResponse>,
     assign_addresses_and_routes_done: bool,
+    client_cert_timer: std::time::Instant,
     capsule_state: CapsuleProtocolState,
 }
 
@@ -65,6 +66,7 @@ impl Connection {
             available_addresses,
             partial_responses: HashMap::new(),
             assign_addresses_and_routes_done: false,
+            client_cert_timer: std::time::Instant::now(),
             capsule_state: CapsuleProtocolState {
                 stream_id: None,
                 local_addresses: vec![],
@@ -225,10 +227,11 @@ impl Connection {
 
         // Quiche checks if a provided certificate is valid and aborts if not. However, we need to check if the peer provided one at all.
         if self.conn.peer_cert().is_none() {
-            warn!("no client certificate provided by {:?}", self.scid);
-            // TODO: should we close the connection or wait for some time (~1s) before closing?
-            // At the moment we expect the client to always provide a certificate immediately.
-            self.conn.close(true, 0x100, b"peer certificate required")?;
+            debug!("no client certificate provided yet");
+            if self.client_cert_timer.elapsed() > std::time::Duration::from_secs(5) {
+                warn!("closing connection due to missing client certificate");
+                self.conn.close(true, 0x100, b"no client certificate")?;
+            }
             return Ok(());
         }
 
