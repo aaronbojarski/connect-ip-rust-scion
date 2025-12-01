@@ -35,7 +35,7 @@ pub async fn handle_capsule_data(
     data: &[u8],
     state: &mut RoutingState,
     available_addresses: &Arc<Mutex<Vec<IpNet>>>,
-    tx_address_updates: &mpsc::Sender<tun::AddressUpdate>,
+    tx_tun_configuration: &mpsc::Sender<tun::TunConfiguration>,
     tx_quic_to_tun: &mpsc::Sender<Vec<u8>>,
     send_stream_buffer: &mut Vec<u8>,
 ) -> Result<usize> {
@@ -117,8 +117,8 @@ pub async fn handle_capsule_data(
             debug!("received AddressAssign capsule: {:?}", assign_capsule);
             // Remove old addresses as they are no longer valid
             for addr in state.local_addresses.iter() {
-                tx_address_updates
-                    .send(tun::AddressUpdate::RemoveAddress(*addr))
+                tx_tun_configuration
+                    .send(tun::TunConfiguration::RemoveAddress(*addr))
                     .await?;
             }
             state.local_addresses.clear();
@@ -130,8 +130,8 @@ pub async fn handle_capsule_data(
                     continue;
                 }
                 info!("received address from peer: {}", assigned_address.ip_net);
-                tx_address_updates
-                    .send(tun::AddressUpdate::AddAddress(assigned_address.ip_net))
+                tx_tun_configuration
+                    .send(tun::TunConfiguration::AddAddress(assigned_address.ip_net))
                     .await?;
                 state.local_addresses.push(assigned_address.ip_net);
             }
@@ -142,8 +142,8 @@ pub async fn handle_capsule_data(
                 .iter()
                 .chain(state.remote_routes.iter())
             {
-                tx_address_updates
-                    .send(tun::AddressUpdate::AddRoute(*route))
+                tx_tun_configuration
+                    .send(tun::TunConfiguration::AddRoute(*route))
                     .await?;
             }
         }
@@ -179,8 +179,8 @@ pub async fn handle_capsule_data(
                     };
                     assigned_addresses.push(assigned_address);
 
-                    tx_address_updates
-                        .send(tun::AddressUpdate::AddRoute(assigned_subnet))
+                    tx_tun_configuration
+                        .send(tun::TunConfiguration::AddRoute(assigned_subnet))
                         .await?;
                     state.remote_addresses.push(assigned_subnet);
                 } else {
@@ -221,8 +221,8 @@ pub async fn handle_capsule_data(
 
             // remove old routes
             for route in state.remote_routes.iter() {
-                tx_address_updates
-                    .send(tun::AddressUpdate::RemoveRoute(*route))
+                tx_tun_configuration
+                    .send(tun::TunConfiguration::RemoveRoute(*route))
                     .await?;
             }
             state.remote_routes.clear();
@@ -230,8 +230,8 @@ pub async fn handle_capsule_data(
             // add new routes
             for route in route_capsule.routes {
                 info!("received route advertisement from peer: {}", route.ip_net);
-                tx_address_updates
-                    .send(tun::AddressUpdate::AddRoute(route.ip_net))
+                tx_tun_configuration
+                    .send(tun::TunConfiguration::AddRoute(route.ip_net))
                     .await?;
 
                 state.remote_routes.push(route.ip_net);

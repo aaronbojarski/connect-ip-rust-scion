@@ -123,9 +123,9 @@ impl Connection {
         let (tx_tun_to_quic, mut rx_tun_to_quic) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
 
         let mut tun = tun::Tun::new(&self.tun_name, tx_tun_to_quic.clone(), self.tun_mtu)?;
-        let (tx_address_updates, rx_address_updates) =
-            mpsc::channel::<tun::AddressUpdate>(CHANNEL_CAPACITY);
-        tun.start(rx_quic_to_tun, rx_address_updates, cancel_token.clone())
+        let (tx_tun_configuration, rx_tun_configuration) =
+            mpsc::channel::<tun::TunConfiguration>(CHANNEL_CAPACITY);
+        tun.start(rx_quic_to_tun, rx_tun_configuration, cancel_token.clone())
             .await?;
 
         // Send initial packet
@@ -174,7 +174,7 @@ impl Connection {
 
                 // Incoming UDP packets (QUIC protocol packets)
                 num_packets = self.rx_udp_to_quic.recv_many(&mut udp_packet_buf, RCV_MANY_CAPACITY) => {
-                    self.process_udp_packets(&mut udp_packet_buf, num_packets, &mut tx_quic_to_tun, &tx_address_updates).await?;
+                    self.process_udp_packets(&mut udp_packet_buf, num_packets, &mut tx_quic_to_tun, &tx_tun_configuration).await?;
                 }
 
                 // Handle outgoing IP packets from TUN
@@ -285,7 +285,7 @@ impl Connection {
         packet_buf: &mut [UdpPacket],
         num_packets: usize,
         tx_quic_to_tun: &mut mpsc::Sender<Vec<u8>>,
-        tx_address_updates: &mpsc::Sender<tun::AddressUpdate>,
+        tx_tun_configuration: &mpsc::Sender<tun::TunConfiguration>,
     ) -> Result<()> {
         for packet in packet_buf.iter_mut().take(num_packets) {
             let recv_info = quiche::RecvInfo {
@@ -303,11 +303,12 @@ impl Connection {
         }
 
         // Handle HTTP/3 connection establishment and process HTTP/3 data
-        self.handle_http3(tx_address_updates, tx_quic_to_tun)
+        self.handle_http3(tx_tun_configuration, tx_quic_to_tun)
             .await?;
 
         // Handle address negotiation (initial address assignment and route advertisement)
-        self.handle_address_negotiation(tx_address_updates).await?;
+        self.handle_address_negotiation(tx_tun_configuration)
+            .await?;
 
         // Handle datagrams and forward to TUN if tunnel is established
         if self.conn.is_established() && self.tunnel_established {
@@ -471,7 +472,7 @@ impl Connection {
 
     async fn handle_http3(
         &mut self,
-        tx_address_updates: &mpsc::Sender<tun::AddressUpdate>,
+        tx_tun_configuration: &mpsc::Sender<tun::TunConfiguration>,
         tx_quic_to_tun: &mut mpsc::Sender<Vec<u8>>,
     ) -> Result<()> {
         // Create a new HTTP/3 connection once the QUIC connection is established.
@@ -488,7 +489,7 @@ impl Connection {
         if let Some(h3_conn) = &mut self.h3_conn
             && self.capsule_state.stream_id.is_none()
         {
-            let req = build_request("localhost".to_string(), "/vpn".to_string());
+            let req = build_request("localhost".to_string(), "/vpn".to_string(), self.tun_mtu);
             debug!("sending HTTP request {req:?}");
             let stream_id = h3_conn.send_request(&mut self.conn, &req, false)?;
             self.capsule_state.stream_id = Some(stream_id);
@@ -515,9 +516,16 @@ impl Connection {
                             self.conn.close(true, 0x100, b"headers on unknown stream")?;
                             break;
                         }
-                        if check_response(&list) {
+                        let (valid, tun_mtu) = check_response(&list);
+                        if valid {
                             self.tunnel_established = true;
-                            info!("connected");
+                            if let Some(mtu) = tun_mtu {
+                                self.tun_mtu = mtu;
+                            }
+                            tx_tun_configuration
+                                .send(tun::TunConfiguration::SetMTU(self.tun_mtu))
+                                .await?;
+                            info!("connected. negotiated TUN MTU: {}", self.tun_mtu);
                         } else {
                             error!("unexpected response from server, closing connection");
                             self.conn.close(true, 0x100, b"unexpected response")?;
@@ -549,7 +557,7 @@ impl Connection {
                                     &self.remaining_data[consumed..],
                                     &mut self.capsule_state,
                                     &self.available_addresses,
-                                    tx_address_updates,
+                                    tx_tun_configuration,
                                     tx_quic_to_tun,
                                     &mut self.remaining_sending_data,
                                 )
@@ -619,7 +627,7 @@ impl Connection {
 
     async fn handle_address_negotiation(
         &mut self,
-        tx_address_updates: &mpsc::Sender<tun::AddressUpdate>,
+        tx_tun_configuration: &mpsc::Sender<tun::TunConfiguration>,
     ) -> Result<()> {
         if self.capsule_state.local_addresses.is_empty()
             && !self.requested_address
@@ -647,8 +655,8 @@ impl Connection {
             .await?;
 
             if let Some(assigned_address) = assigned_address {
-                tx_address_updates
-                    .send(tun::AddressUpdate::AddRoute(assigned_address))
+                tx_tun_configuration
+                    .send(tun::TunConfiguration::AddRoute(assigned_address))
                     .await?;
             }
 

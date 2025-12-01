@@ -122,7 +122,8 @@ impl Connection {
             mpsc::channel::<Vec<u8>>(CLIENT_CHANNEL_CAPACITY);
         let mut tun = tun::Tun::new(&self.tun_name, tx_tun_to_quic, self.tun_mtu)?;
 
-        let (tx_address_updates, rx_address_updates) = mpsc::channel::<tun::AddressUpdate>(10);
+        let (tx_tun_configuration, rx_address_updates) =
+            mpsc::channel::<tun::TunConfiguration>(CLIENT_CHANNEL_CAPACITY);
         tun.start(rx_quic_to_tun, rx_address_updates, cancel_token.clone())
             .await?;
 
@@ -155,7 +156,7 @@ impl Connection {
 
                 // Handle incoming UDP packets
                 num_packets = self.rx_udp_to_quic.recv_many(&mut udp_packet_buf, RCV_MANY_CAPACITY) => {
-                    self.process_udp_packets(&mut udp_packet_buf, num_packets, &mut tx_quic_to_tun, &tx_address_updates).await?;
+                    self.process_udp_packets(&mut udp_packet_buf, num_packets, &mut tx_quic_to_tun, &tx_tun_configuration).await?;
                 }
 
                 // Handle outgoing IP packets from TUN
@@ -272,7 +273,7 @@ impl Connection {
         packet_buf: &mut [UdpPacket],
         num_packets: usize,
         tx_quic_to_tun: &mut mpsc::Sender<Vec<u8>>,
-        tx_address_updates: &mpsc::Sender<tun::AddressUpdate>,
+        tx_tun_configuration: &mpsc::Sender<tun::TunConfiguration>,
     ) -> Result<()> {
         let mut buf = [0; MAX_DATAGRAM_SIZE];
         for packet in packet_buf.iter_mut().take(num_packets) {
@@ -307,7 +308,7 @@ impl Connection {
         }
 
         // Handle HTTP/3 connection establishment and process HTTP/3 data
-        self.handle_http3_connection(tx_address_updates, tx_quic_to_tun)
+        self.handle_http3_connection(tx_tun_configuration, tx_quic_to_tun)
             .await?;
 
         // Handle initial address assignment and route advertisement
@@ -321,8 +322,8 @@ impl Connection {
             .await?;
 
             if let Some(assigned_address) = assigned_address {
-                tx_address_updates
-                    .send(tun::AddressUpdate::AddRoute(assigned_address))
+                tx_tun_configuration
+                    .send(tun::TunConfiguration::AddRoute(assigned_address))
                     .await?;
             }
 
@@ -500,7 +501,7 @@ impl Connection {
 
     async fn handle_http3_connection(
         &mut self,
-        tx_address_updates: &mpsc::Sender<tun::AddressUpdate>,
+        tx_tun_configuration: &mpsc::Sender<tun::TunConfiguration>,
         tx_quic_to_tun: &mut mpsc::Sender<Vec<u8>>,
     ) -> Result<()> {
         let mut buf = [0; RCV_MANY_CAPACITY * MAX_DATAGRAM_SIZE];
@@ -543,7 +544,8 @@ impl Connection {
                             self.conn.close(true, 0x100, b"headers on unknown stream")?;
                             continue;
                         }
-                        self.handle_request(stream_id, &list);
+                        self.handle_request(stream_id, &list, tx_tun_configuration)
+                            .await;
                     }
 
                     Ok((stream_id, quiche::h3::Event::Data)) => {
@@ -563,7 +565,7 @@ impl Connection {
                                     &self.remaining_data[consumed..],
                                     &mut self.capsule_state,
                                     &self.available_addresses,
-                                    tx_address_updates,
+                                    tx_tun_configuration,
                                     tx_quic_to_tun,
                                     &mut self.remaining_sending_data,
                                 )
@@ -627,7 +629,12 @@ impl Connection {
     }
 
     /// Handles incoming HTTP/3 requests.
-    fn handle_request(&mut self, stream_id: u64, headers: &[quiche::h3::Header]) {
+    async fn handle_request(
+        &mut self,
+        stream_id: u64,
+        headers: &[quiche::h3::Header],
+        tx_tun_configuration: &tokio::sync::mpsc::Sender<tun::TunConfiguration>,
+    ) {
         debug!(
             "{} got request {:?} on stream id {}",
             self.conn.trace_id(),
@@ -636,7 +643,15 @@ impl Connection {
         );
 
         if let Some(http3_conn) = &mut self.h3_conn {
-            let headers = build_response(headers);
+            let (headers, negotiated_mtu) = build_response(headers, self.tun_mtu);
+            self.tun_mtu = negotiated_mtu;
+
+            if let Err(e) = tx_tun_configuration
+                .send(tun::TunConfiguration::SetMTU(self.tun_mtu))
+                .await
+            {
+                error!("failed to send MTU update to TUN: {}", e);
+            }
 
             match http3_conn.send_response(&mut self.conn, stream_id, &headers, false) {
                 Ok(v) => v,

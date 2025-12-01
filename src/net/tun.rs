@@ -12,11 +12,12 @@ use crate::net::{add_route, remove_route};
 
 pub const MAX_TUN_MTU: usize = 9000;
 
-pub enum AddressUpdate {
+pub enum TunConfiguration {
     AddAddress(IpNet),
     RemoveAddress(IpNet),
     AddRoute(IpNet),
     RemoveRoute(IpNet),
+    SetMTU(u16),
 }
 
 pub struct Tun {
@@ -39,7 +40,7 @@ impl Tun {
     pub async fn start(
         &mut self,
         mut rx_in_tun: Receiver<Vec<u8>>,
-        mut rx_address_updates: Receiver<AddressUpdate>,
+        mut rx_address_updates: Receiver<TunConfiguration>,
         cancel_token: CancellationToken,
     ) -> Result<()> {
         let dev = DeviceBuilder::new()
@@ -65,7 +66,7 @@ impl Tun {
                             // Handle address updates
                             Some(update) = rx_address_updates.recv() => {
                                 match update {
-                                    AddressUpdate::AddAddress(ipnet) => {
+                                    TunConfiguration::AddAddress(ipnet) => {
                                         match ipnet.addr() {
                                             IpAddr::V4(address) => {
                                                 dev.add_address_v4(address, ipnet.prefix_len())?;
@@ -76,11 +77,11 @@ impl Tun {
                                         }
                                         debug!("Added address {} to TUN device {}", ipnet, name);
                                     }
-                                    AddressUpdate::RemoveAddress(ipnet) => {
+                                    TunConfiguration::RemoveAddress(ipnet) => {
                                         dev.remove_address(ipnet.addr())?;
                                         debug!("Removed address {} from TUN device {}", ipnet, name);
                                     }
-                                    AddressUpdate::AddRoute(ipnet) => {
+                                    TunConfiguration::AddRoute(ipnet) => {
                                         match add_route(&ipnet, &name) {
                                             Ok(true) => {
                                                 debug!("Added route {} via TUN device {}", ipnet, name);
@@ -93,11 +94,18 @@ impl Tun {
                                             }
                                         }
                                     }
-                                    AddressUpdate::RemoveRoute(ipnet) => {
+                                    TunConfiguration::RemoveRoute(ipnet) => {
                                         if let Err(e) = remove_route(&ipnet, &name) {
                                             error!("Failed to remove route {}: {}", ipnet, e);
                                         } else {
                                             debug!("Removed route {} via TUN device {}", ipnet, name);
+                                        }
+                                    }
+                                    TunConfiguration::SetMTU(mtu) => {
+                                        if let Err(e) = dev.set_mtu(mtu) {
+                                            error!("Failed to set MTU {} on TUN device {}: {}", mtu, name, e);
+                                        } else {
+                                            debug!("Set MTU {} on TUN device {}", mtu, name);
                                         }
                                     }
                                 }
