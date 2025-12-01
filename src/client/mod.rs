@@ -8,13 +8,14 @@ use std::fs;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, trace};
+use tracing::{debug, error, info, trace};
 
 use crate::client::connection::Connection;
 use crate::net::UdpPacket;
 use crate::net::quic::MAX_DATAGRAM_SIZE;
 
 pub const CHANNEL_CAPACITY: usize = 100;
+pub const UDP_PACKET_BUFFER_SIZE: usize = 65535;
 
 #[derive(Clone)]
 pub struct ClientConfig {
@@ -42,7 +43,7 @@ impl Client {
     }
 
     pub async fn run(&self) -> Result<()> {
-        let mut buf = [0; 65535];
+        let mut buf = [0; UDP_PACKET_BUFFER_SIZE];
         let quic_config = crate::net::quic::configure_quic(
             &self.config.ca_cert_path,
             &self.config.cert_path,
@@ -100,10 +101,10 @@ impl Client {
                         }) {
                             Ok(_) => {}
                             Err(mpsc::error::TrySendError::Full(_)) => {
-                                info!("UDP to QUIC channel full, dropping packet from {}", src);
+                                debug!("UDP to QUIC channel full, dropping packet from {}", src);
                             }
                             Err(e) => {
-                                info!("Failed to send packet to QUIC task: {}, shutting down", e);
+                                error!("Failed to send packet to QUIC task: {}, shutting down", e);
                                 break Err(anyhow!("QUIC task closed, shutting down. Error: {}", e));
                             }
                         }
@@ -197,10 +198,10 @@ impl Client {
                         }) {
                             Ok(_) => {}
                             Err(mpsc::error::TrySendError::Full(_)) => {
-                                info!("UDP to QUIC channel full, dropping packet from {}", src);
+                                debug!("UDP to QUIC channel full, dropping packet from {}", src);
                             }
                             Err(e) => {
-                                info!("Failed to send packet to QUIC task: {}, shutting down", e);
+                                error!("Failed to send packet to QUIC task: {}, shutting down", e);
                                 break Err(anyhow!("QUIC task closed, shutting down. Error: {}", e));
                             }
                         }

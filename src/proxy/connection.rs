@@ -18,10 +18,13 @@ use crate::connect_ip::capsule_protocol::{
 };
 use crate::connect_ip::request::{build_response, headers_to_strings};
 use crate::net::quic::{DEFAULT_TIMEOUT, KEEPALIVE_INTERVAL, MAX_DATAGRAM_SIZE};
+use crate::net::tun::MAX_TUN_MTU;
 use crate::net::{UdpPacket, check_packet_src_dst, return_subnet, tun};
 use crate::proxy::CLIENT_CHANNEL_CAPACITY;
 
 const SEND_BUFFER_SIZE: usize = 65535; // bytes
+const RCV_BUFFER_SIZE: usize = 65535; // bytes
+const RCV_MANY_CAPACITY: usize = 10; // number of packets to receive at once
 
 struct PartialResponse {
     headers: Option<Vec<quiche::h3::Header>>,
@@ -80,7 +83,7 @@ impl Connection {
                 local_routes: routes,
                 remote_routes: vec![],
             },
-            remaining_data: Vec::with_capacity(65535),
+            remaining_data: Vec::with_capacity(RCV_BUFFER_SIZE),
             remaining_sending_data: Vec::with_capacity(SEND_BUFFER_SIZE),
         }
     }
@@ -123,8 +126,8 @@ impl Connection {
         tun.start(rx_quic_to_tun, rx_address_updates, cancel_token.clone())
             .await?;
 
-        let mut udp_packet_buf: Vec<UdpPacket> = Vec::with_capacity(10); // buffer for incoming UDP packets. Used for processing multiple packets at once.
-        let mut tun_packet_buf: Vec<Vec<u8>> = Vec::with_capacity(10); // buffer for incoming TUN packets. Used for processing multiple packets at once.
+        let mut udp_packet_buf: Vec<UdpPacket> = Vec::with_capacity(RCV_MANY_CAPACITY); // buffer for incoming UDP packets. Used for processing multiple packets at once.
+        let mut tun_packet_buf: Vec<Vec<u8>> = Vec::with_capacity(RCV_MANY_CAPACITY); // buffer for incoming TUN packets. Used for processing multiple packets at once.
         let mut keepalive_interval =
             tokio::time::interval(std::time::Duration::from_millis(KEEPALIVE_INTERVAL));
 
@@ -151,12 +154,12 @@ impl Connection {
                 }
 
                 // Handle incoming UDP packets
-                num_packets = self.rx_udp_to_quic.recv_many(&mut udp_packet_buf, 10) => {
+                num_packets = self.rx_udp_to_quic.recv_many(&mut udp_packet_buf, RCV_MANY_CAPACITY) => {
                     self.process_udp_packets(&mut udp_packet_buf, num_packets, &mut tx_quic_to_tun, &tx_address_updates).await?;
                 }
 
                 // Handle outgoing IP packets from TUN
-                num_packets = rx_tun_to_quic.recv_many(&mut tun_packet_buf, 10) => {
+                num_packets = rx_tun_to_quic.recv_many(&mut tun_packet_buf, RCV_MANY_CAPACITY) => {
                     for packet in tun_packet_buf.iter().take(num_packets) {
                         self.process_tun_packet(packet).await?;
                     }
@@ -457,7 +460,7 @@ impl Connection {
         if self.conn.is_established()
             && let Some(stream_id) = self.capsule_state.stream_id
         {
-            let mut buf = [0; 1600];
+            let mut buf = [0; MAX_TUN_MTU + 32];
             if datagram {
                 let mut octets = OctetsMut::with_slice(&mut buf);
                 octets.put_varint(stream_id / 4)?;
@@ -468,7 +471,7 @@ impl Connection {
                     error!("dgram_send failed: {:?}", e);
                 }
             } else {
-                let mut datagram_data = [0u8; 1508];
+                let mut datagram_data = [0u8; MAX_TUN_MTU + 8];
                 let mut datagram_octets = OctetsMut::with_slice(&mut datagram_data);
                 datagram_octets.put_varint(0)?;
                 datagram_octets.put_bytes(ip_packet)?;
@@ -500,7 +503,7 @@ impl Connection {
         tx_address_updates: &mpsc::Sender<tun::AddressUpdate>,
         tx_quic_to_tun: &mut mpsc::Sender<Vec<u8>>,
     ) -> Result<()> {
-        let mut buf = [0; 20000];
+        let mut buf = [0; RCV_MANY_CAPACITY * MAX_DATAGRAM_SIZE];
 
         // Setup HTTP/3 connection if not already done
         if (self.conn.is_in_early_data() || self.conn.is_established()) && self.h3_conn.is_none() {

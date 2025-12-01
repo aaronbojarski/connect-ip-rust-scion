@@ -249,7 +249,7 @@ pub async fn prepare_address_and_route_assignment<'a>(
 ) -> Result<Option<IpNet>> {
     let mut assigned_address = None;
 
-    // Assign a /32 address from the address pool to peer
+    // Assign a /128 IPv6 or /32 IPv4 address from the address pool to peer
     let mut assigned_addresses = vec![];
     if let Some(addr) = get_next_avail_subnet(&available_addresses, false, 128)
         .await

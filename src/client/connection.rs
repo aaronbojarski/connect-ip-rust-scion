@@ -19,9 +19,13 @@ use crate::connect_ip::capsule_protocol::{
 };
 use crate::connect_ip::request::{build_request, check_response, headers_to_strings};
 use crate::net::quic::{DEFAULT_TIMEOUT, KEEPALIVE_INTERVAL};
+use crate::net::tun::MAX_TUN_MTU;
 use crate::net::{UdpPacket, ZERO_IPV4_ADDRESS, check_packet_src_dst, tun};
 
 const SEND_BUFFER_SIZE: usize = 65535; // bytes
+const RCV_BUFFER_SIZE: usize = 65535; // bytes
+const RCV_MANY_CAPACITY: usize = 10; // number of packets
+const SEND_ADDRESS_REQUEST_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
 
 pub struct Connection {
     local: scion_proto::address::SocketAddr,
@@ -103,7 +107,7 @@ impl Connection {
             assigned_addresses: false,
             requested_address: false,
             address_request_timer: std::time::Instant::now(),
-            remaining_data: Vec::with_capacity(65535),
+            remaining_data: Vec::with_capacity(RCV_BUFFER_SIZE),
             remaining_sending_data: Vec::with_capacity(SEND_BUFFER_SIZE),
         })
     }
@@ -119,7 +123,8 @@ impl Connection {
         let (tx_tun_to_quic, mut rx_tun_to_quic) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
 
         let mut tun = tun::Tun::new(&self.tun_name, tx_tun_to_quic.clone(), self.tun_mtu)?;
-        let (tx_address_updates, rx_address_updates) = mpsc::channel::<tun::AddressUpdate>(100);
+        let (tx_address_updates, rx_address_updates) =
+            mpsc::channel::<tun::AddressUpdate>(CHANNEL_CAPACITY);
         tun.start(rx_quic_to_tun, rx_address_updates, cancel_token.clone())
             .await?;
 
@@ -139,8 +144,8 @@ impl Connection {
             })
             .await?;
 
-        let mut udp_packet_buf: Vec<UdpPacket> = Vec::with_capacity(10);
-        let mut tun_packet_buf: Vec<Vec<u8>> = Vec::with_capacity(10); // buffer for incoming TUN packets. Used for processing multiple packets at once.
+        let mut udp_packet_buf: Vec<UdpPacket> = Vec::with_capacity(RCV_MANY_CAPACITY); // buffer for incoming UDP packets. Used for processing multiple packets at once.
+        let mut tun_packet_buf: Vec<Vec<u8>> = Vec::with_capacity(RCV_MANY_CAPACITY); // buffer for incoming TUN packets. Used for processing multiple packets at once.
 
         let mut keepalive_interval =
             tokio::time::interval(std::time::Duration::from_millis(KEEPALIVE_INTERVAL));
@@ -153,28 +158,28 @@ impl Connection {
                 .unwrap_or(std::time::Duration::from_millis(DEFAULT_TIMEOUT));
 
             tokio::select! {
-            // Connection timeout
-            _ = tokio::time::sleep(timeout) => {
-                debug!("connection timeout");
-                self.conn.on_timeout();
-            }
-
-            // Connection keepalive
-            _ = keepalive_interval.tick() => {
-                if self.conn.is_established() {
-                    self.conn.send_ack_eliciting()?;
-                    trace!("keepalive tick. time until timeout: {:?}", self.conn.timeout());
+                // Connection timeout
+                _ = tokio::time::sleep(timeout) => {
+                    debug!("connection timeout");
+                    self.conn.on_timeout();
                 }
-            }
 
-            // Incoming UDP packets (QUIC protocol packets)
-            num_packets = self.rx_udp_to_quic.recv_many(&mut udp_packet_buf, 10) => {
-                self.process_udp_packets(&mut udp_packet_buf, num_packets, &mut tx_quic_to_tun, &tx_address_updates).await?;
-            }
+                // Connection keepalive
+                _ = keepalive_interval.tick() => {
+                    if self.conn.is_established() {
+                        self.conn.send_ack_eliciting()?;
+                        trace!("keepalive tick. time until timeout: {:?}", self.conn.timeout());
+                    }
+                }
 
-            // Handle outgoing IP packets from TUN
-            num_packets = rx_tun_to_quic.recv_many(&mut tun_packet_buf, 10) => {
-                for packet in tun_packet_buf.iter().take(num_packets) {
+                // Incoming UDP packets (QUIC protocol packets)
+                num_packets = self.rx_udp_to_quic.recv_many(&mut udp_packet_buf, RCV_MANY_CAPACITY) => {
+                    self.process_udp_packets(&mut udp_packet_buf, num_packets, &mut tx_quic_to_tun, &tx_address_updates).await?;
+                }
+
+                // Handle outgoing IP packets from TUN
+                num_packets = rx_tun_to_quic.recv_many(&mut tun_packet_buf, RCV_MANY_CAPACITY) => {
+                    for packet in tun_packet_buf.iter().take(num_packets) {
                         self.process_tun_packet(packet).await?;
                     }
                 }
@@ -380,7 +385,7 @@ impl Connection {
     }
 
     async fn process_tun_packet(&mut self, ip_packet: &Vec<u8>) -> Result<()> {
-        let mut buf = [0; 1600];
+        let mut buf = [0; MAX_TUN_MTU + 32]; // extra space for capsule overhead
         let (src, dst) = if let Some(ipv4) = Ipv4Packet::new(ip_packet)
             && ipv4.get_version() == 4
         {
@@ -437,7 +442,7 @@ impl Connection {
                     error!("dgram_send failed: {:?}", e);
                 }
             } else {
-                let mut datagram_data = [0u8; 1508];
+                let mut datagram_data = [0u8; MAX_TUN_MTU + 8]; // extra space for context ID
                 let mut datagram_octets = OctetsMut::with_slice(&mut datagram_data);
                 datagram_octets.put_varint(0)?;
                 datagram_octets.put_bytes(ip_packet)?;
@@ -527,7 +532,7 @@ impl Connection {
                             stream_id
                         );
 
-                        let mut buf = [0; 20000];
+                        let mut buf = [0; RCV_MANY_CAPACITY * MAX_DATAGRAM_SIZE];
 
                         while let Ok(read) = self.h3_conn.as_mut().unwrap().recv_body(
                             &mut self.conn,
@@ -538,7 +543,6 @@ impl Connection {
                             self.remaining_data.extend_from_slice(&buf[..read]);
 
                             let mut consumed = 0;
-
                             'process_capsule_data: while consumed < self.remaining_data.len() {
                                 match handle_capsule_data(
                                     stream_id,
@@ -622,7 +626,7 @@ impl Connection {
             && self.tunnel_established
         {
             // Send request only if no address has been assigned within first second
-            if self.address_request_timer.elapsed().as_millis() > 1000 {
+            if self.address_request_timer.elapsed() > SEND_ADDRESS_REQUEST_AFTER {
                 self.send_address_request()?;
                 info!("sent address request capsule");
                 self.requested_address = true;
@@ -633,7 +637,7 @@ impl Connection {
             && self.tunnel_established
             && self.capsule_state.stream_id.is_some()
         {
-            let mut buf = [0; 100];
+            let mut buf = [0; 1000];
             let mut octets = OctetsMut::with_slice(&mut buf);
             let assigned_address = prepare_address_and_route_assignment(
                 &mut self.capsule_state,
@@ -650,7 +654,7 @@ impl Connection {
 
             let payload_len = octets.off();
             if payload_len == 0 {
-                error!("{} no capsule prepared, not sending", self.conn.trace_id());
+                error!("no capsule prepared, not sending");
                 return Ok(());
             }
 
@@ -672,7 +676,7 @@ impl Connection {
             }],
         };
         let capsule = Capsule::AddressRequest(addr_req);
-        let mut buf = [0u8; 100];
+        let mut buf = [0; 30];
         let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
         capsule.append(&mut octets_mut)?;
         let payload_len = octets_mut.off();

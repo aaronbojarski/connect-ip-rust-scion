@@ -505,7 +505,7 @@ mod tests {
             }],
         });
 
-        let mut buf = vec![0u8; 100];
+        let mut buf = vec![0u8; 1000];
         let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
         capsule.append(&mut octets_mut).unwrap();
         let written = octets_mut.off();

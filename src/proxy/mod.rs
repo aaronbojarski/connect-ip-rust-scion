@@ -18,8 +18,10 @@ use crate::net::quic::MAX_DATAGRAM_SIZE;
 use crate::proxy::connection::Connection;
 
 const TOKEN_PREFIX: &[u8] = b"connect-ip-rust-scion";
+const HMAC_TAG_LEN: usize = 32;
 const MAIN_CHANNEL_CAPACITY: usize = 10000;
 const CLIENT_CHANNEL_CAPACITY: usize = 100;
+const UDP_PACKET_BUFFER_SIZE: usize = 65535;
 
 pub struct ProxyConfig {
     pub listen: scion_proto::address::SocketAddr,
@@ -66,7 +68,7 @@ impl Proxy {
         let (tx_quic_to_udp, mut rx_quic_to_udp) =
             mpsc::channel::<UdpPacket>(MAIN_CHANNEL_CAPACITY);
 
-        let mut buf = [0; 65535];
+        let mut buf = [0; UDP_PACKET_BUFFER_SIZE];
         let mut next_client = 0u32;
 
         if self.config.listen.isd_asn() == IsdAsn::WILDCARD {
@@ -437,18 +439,17 @@ impl Proxy {
             return None;
         }
 
-        if token.len() < TOKEN_PREFIX.len() + addr.len() + 32 {
+        if token.len() < TOKEN_PREFIX.len() + addr.len() + HMAC_TAG_LEN {
             return None;
         }
 
-        let (data, tag) = token.split_at(token.len() - 32);
-
+        let (data, tag) = token.split_at(token.len() - HMAC_TAG_LEN);
         if ring::hmac::verify(&self.token_key, data, tag).is_err() {
             return None;
         }
 
         let dcid_start = TOKEN_PREFIX.len() + addr.len();
-        let dcid_end = token.len() - 32;
+        let dcid_end = token.len() - HMAC_TAG_LEN;
 
         Some(quiche::ConnectionId::from_ref(&token[dcid_start..dcid_end]))
     }

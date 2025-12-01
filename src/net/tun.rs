@@ -10,6 +10,8 @@ use tun_rs::DeviceBuilder;
 
 use crate::net::{add_route, remove_route};
 
+pub const MAX_TUN_MTU: usize = 9000;
+
 pub enum AddressUpdate {
     AddAddress(IpNet),
     RemoveAddress(IpNet),

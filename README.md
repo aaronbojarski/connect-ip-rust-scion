@@ -79,8 +79,6 @@ This project took inspiration from the following implementations. We thank the a
   - MTU
     - use datagrams if possible
     - make MTU negotiable via http header
-  - Stream behavior
-    - set all buffer sizes correctly
   - test performance if it is single threaded
     - due to scheduling we might not benefit from multiple tasks
     - is this worth the effort?
