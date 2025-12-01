@@ -45,9 +45,7 @@ pub fn configure_quic(
     config.set_initial_max_streams_uni(100);
     config.set_disable_active_migration(true);
     config.enable_early_data();
-
-    // IDEA: Enable datagrams for better performance depending on client side MTU
-    config.enable_dgram(true, 30000, 30000);
+    config.enable_dgram(true, 1_000_000, 1_000_000);
 
     Ok(config)
 }

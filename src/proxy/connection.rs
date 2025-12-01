@@ -25,7 +25,7 @@ use crate::proxy::CLIENT_CHANNEL_CAPACITY;
 const SEND_BUFFER_SIZE: usize = 65535; // bytes
 const RCV_BUFFER_SIZE: usize = 65535; // bytes
 const RCV_MANY_CAPACITY: usize = 10; // number of packets to receive at once
-
+const MAX_TUN_MTU_FOR_DATAGRAMS: usize = MAX_DATAGRAM_SIZE - 50;
 struct PartialResponse {
     headers: Option<Vec<quiche::h3::Header>>,
 }
@@ -457,12 +457,13 @@ impl Connection {
             return Ok(());
         }
 
-        let datagram = false;
         if self.conn.is_established()
             && let Some(stream_id) = self.capsule_state.stream_id
         {
             let mut buf = [0; MAX_TUN_MTU + 32];
-            if datagram {
+            if self.conn.dgram_max_writable_len().is_some()
+                && self.tun_mtu as usize <= MAX_TUN_MTU_FOR_DATAGRAMS
+            {
                 let mut octets = OctetsMut::with_slice(&mut buf);
                 octets.put_varint(stream_id / 4)?;
                 octets.put_varint(0)?;
