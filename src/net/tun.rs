@@ -4,7 +4,7 @@ use std::net::IpAddr;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info_span, warn};
+use tracing::{debug, error, info_span, trace, warn};
 use tracing_futures::Instrument as _;
 use tun_rs::DeviceBuilder;
 
@@ -51,7 +51,7 @@ impl Tun {
         let handle = tokio::spawn(
             async move {
                 let result: Result<()> = async {
-                    let mut buf = vec![0; 65536];
+                    let mut buf = [0; 65536];
                     loop {
                         tokio::select! {
                             // Check for cancellation signal
@@ -104,7 +104,16 @@ impl Tun {
                             // Read from TUN device and send to main task
                             len = dev.recv(&mut buf) => {
                                 let len = len?;
-                                tx_tun_to_quic.send(buf[..len].to_vec()).await.context("failed to send on TUN to QUIC channel")?;
+                                match tx_tun_to_quic.try_send(buf[..len].to_vec()) {
+                                    Ok(_) => {}
+                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                        trace!("TUN to QUIC channel full, dropping packet from TUN device {}", name);
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to send packet from TUN device {}: {}, shutting down", name, e);
+                                        break;
+                                    }
+                                }
                             }
 
                             // Receive from main task and write to TUN device

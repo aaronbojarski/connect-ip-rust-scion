@@ -14,7 +14,7 @@ use crate::client::connection::Connection;
 use crate::net::UdpPacket;
 use crate::net::quic::MAX_DATAGRAM_SIZE;
 
-pub const CHANNEL_CAPACITY: usize = 1000;
+pub const CHANNEL_CAPACITY: usize = 100;
 
 #[derive(Clone)]
 pub struct ClientConfig {
@@ -29,6 +29,7 @@ pub struct ClientConfig {
     pub routes: Vec<IpNet>,
     pub address_pool: Vec<IpNet>,
     pub tun_name: String,
+    pub tun_mtu: u16,
 }
 
 pub struct Client {
@@ -74,6 +75,7 @@ impl Client {
                 rx_udp_to_quic,
                 tx_quic_to_udp,
                 self.config.tun_name.clone(),
+                self.config.tun_mtu,
                 available_addresses,
                 self.config.routes.clone(),
             )?;
@@ -91,13 +93,19 @@ impl Client {
                 tokio::select! {
                     // Receive datagram from UDP socket and pass to QUIC
                     Ok((len, src)) = socket.recv_from(&mut buf) => {
-                        if tx_udp_to_quic.send(UdpPacket {
+                        match tx_udp_to_quic.try_send(UdpPacket {
                             data: buf[..len].to_vec(),
                             src: scion_proto::address::SocketAddr::from_std(IsdAsn::WILDCARD, src),
                             dst: scion_proto::address::SocketAddr::from_std(IsdAsn::WILDCARD, local_addr),
-                        }).await.is_err() {
-                            info!("QUIC task closed, shutting down");
-                            break Ok(());
+                        }) {
+                            Ok(_) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                info!("UDP to QUIC channel full, dropping packet from {}", src);
+                            }
+                            Err(e) => {
+                                info!("Failed to send packet to QUIC task: {}, shutting down", e);
+                                break Err(anyhow!("QUIC task closed, shutting down. Error: {}", e));
+                            }
                         }
                     }
                     // Send datagram from QUIC to UDP socket
@@ -164,6 +172,7 @@ impl Client {
                 rx_udp_to_quic,
                 tx_quic_to_udp,
                 self.config.tun_name.clone(),
+                self.config.tun_mtu,
                 available_addresses,
                 self.config.routes.clone(),
             )?;
@@ -180,15 +189,20 @@ impl Client {
             loop {
                 tokio::select! {
                     // Receive datagram from UDP socket and pass to QUIC
-                    Ok(result) = socket.recv_from(&mut buf) => {
-                        let (len, src) = result;
-                        if tx_udp_to_quic.send(UdpPacket {
+                    Ok((len, src)) = socket.recv_from(&mut buf) => {
+                        match tx_udp_to_quic.try_send(UdpPacket {
                             data: buf[..len].to_vec(),
                             src,
                             dst: local_addr,
-                        }).await.is_err() {
-                            info!("QUIC task closed, shutting down");
-                            break Ok(());
+                        }) {
+                            Ok(_) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                info!("UDP to QUIC channel full, dropping packet from {}", src);
+                            }
+                            Err(e) => {
+                                info!("Failed to send packet to QUIC task: {}, shutting down", e);
+                                break Err(anyhow!("QUIC task closed, shutting down. Error: {}", e));
+                            }
                         }
                     }
                     // Send datagram from QUIC to UDP socket

@@ -19,7 +19,7 @@ use crate::proxy::connection::Connection;
 
 const TOKEN_PREFIX: &[u8] = b"connect-ip-rust-scion";
 const MAIN_CHANNEL_CAPACITY: usize = 10000;
-const CLIENT_CHANNEL_CAPACITY: usize = 1000;
+const CLIENT_CHANNEL_CAPACITY: usize = 100;
 
 pub struct ProxyConfig {
     pub listen: scion_proto::address::SocketAddr,
@@ -30,6 +30,7 @@ pub struct ProxyConfig {
     pub key_path: std::path::PathBuf,
     pub routes: Vec<IpNet>,
     pub address_pool: Vec<IpNet>,
+    pub tun_mtu: u16,
 }
 
 pub struct Proxy {
@@ -199,13 +200,26 @@ impl Proxy {
         };
         if let Some(client_conn) = client_conn_sender {
             // Forward to existing connection task
-            let _ = client_conn
-                .send(UdpPacket {
-                    data: buf[..len].to_vec(),
-                    src: src_scion_socket,
-                    dst: local_scion_socket,
-                })
-                .await;
+            match client_conn.try_send(UdpPacket {
+                data: buf[..len].to_vec(),
+                src: src_scion_socket,
+                dst: local_scion_socket,
+            }) {
+                Ok(_) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    trace!(
+                        "Connection channel full, dropping packet for connection {:?}",
+                        hdr.dcid
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to send packet to connection {:?}: {}, shutting down",
+                        hdr.dcid, e
+                    );
+                    // TODO: properly shut down the connection
+                }
+            }
         } else if hdr.ty == quiche::Type::Initial {
             let mut out = [0; MAX_DATAGRAM_SIZE];
 
@@ -222,7 +236,16 @@ impl Proxy {
                     dst: src_scion_socket,
                 };
 
-                tx_quic_to_udp.send(packet).await?;
+                // We use try_send here to avoid a deadlock
+                match tx_quic_to_udp.try_send(packet) {
+                    Ok(_) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        trace!("QUIC to UDP channel full, dropping version negotiation packet");
+                    }
+                    Err(e) => {
+                        warn!("Failed to send version negotiation packet: {}", e);
+                    }
+                }
                 return Ok(());
             }
 
@@ -259,7 +282,16 @@ impl Proxy {
                     dst: src_scion_socket,
                 };
 
-                tx_quic_to_udp.send(packet).await?;
+                // We use try_send here to avoid a deadlock
+                match tx_quic_to_udp.try_send(packet) {
+                    Ok(_) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        trace!("QUIC to UDP channel full, dropping retry packet");
+                    }
+                    Err(e) => {
+                        warn!("Failed to send retry packet: {}", e);
+                    }
+                }
                 return Ok(());
             }
 
@@ -317,29 +349,6 @@ impl Proxy {
                 }
             }
 
-            // Send response packets
-            loop {
-                let (write, send_info) = match conn.send(buf) {
-                    Ok(v) => v,
-                    Err(quiche::Error::Done) => break,
-                    Err(e) => {
-                        error!("send failed: {:?}", e);
-                        break;
-                    }
-                };
-
-                let packet = UdpPacket {
-                    data: buf[..write].to_vec(),
-                    src: local_scion_socket,
-                    dst: scion_proto::address::SocketAddr::from_std(
-                        src_scion_socket.isd_asn(),
-                        send_info.to,
-                    ),
-                };
-
-                tx_quic_to_udp.send(packet).await?;
-            }
-
             // Create channel for this connection
             let (tx_to_connection, rx_from_main) =
                 mpsc::channel::<UdpPacket>(CLIENT_CHANNEL_CAPACITY);
@@ -357,6 +366,7 @@ impl Proxy {
                 rx_from_main,
                 tx_quic_to_udp.clone(),
                 tun_name,
+                self.config.tun_mtu,
                 self.available_addresses.clone(),
                 self.config.routes.clone(),
             );

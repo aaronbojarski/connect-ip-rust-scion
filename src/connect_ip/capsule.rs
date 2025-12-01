@@ -26,6 +26,7 @@ pub type CapsuleResult<T> = Result<T, CapsuleError>;
 // Capsule types
 #[derive(Clone, Debug)]
 pub enum CapsuleType {
+    Datagram = 0x00,
     AddressAssign = 0x01,
     AddressRequest = 0x02,
     RouteAdvertisement = 0x03,
@@ -33,6 +34,7 @@ pub enum CapsuleType {
 
 #[derive(Clone, Debug)]
 pub enum Capsule {
+    Datagram(DatagramCapsule),
     AddressAssign(AddressAssignCapsule),
     AddressRequest(AddressRequestCapsule),
     RouteAdvertisement(RouteAdvertisementCapsule),
@@ -43,6 +45,7 @@ impl Capsule {
         let capsule_type = octets.get_varint()?;
 
         let capsule_type = match capsule_type {
+            0x00 => CapsuleType::Datagram,
             0x01 => CapsuleType::AddressAssign,
             0x02 => CapsuleType::AddressRequest,
             0x03 => CapsuleType::RouteAdvertisement,
@@ -54,6 +57,9 @@ impl Capsule {
         let mut payload_octets = octets::Octets::with_slice(payload_bytes.buf());
 
         let capsule = match capsule_type {
+            CapsuleType::Datagram => {
+                Capsule::Datagram(DatagramCapsule::parse(&mut payload_octets)?)
+            }
             CapsuleType::AddressAssign => {
                 Capsule::AddressAssign(AddressAssignCapsule::parse(&mut payload_octets)?)
             }
@@ -70,6 +76,12 @@ impl Capsule {
 
     pub fn append(&self, octets: &mut octets::OctetsMut) -> CapsuleResult<()> {
         match self {
+            Capsule::Datagram(capsule) => {
+                octets.put_varint(CapsuleType::Datagram as u64)?;
+                let len = capsule.len();
+                octets.put_varint(len as u64)?;
+                capsule.append(octets)?;
+            }
             Capsule::AddressAssign(capsule) => {
                 octets.put_varint(CapsuleType::AddressAssign as u64)?;
                 let len = capsule.len();
@@ -90,6 +102,27 @@ impl Capsule {
             }
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DatagramCapsule {
+    pub data: Vec<u8>,
+}
+
+impl DatagramCapsule {
+    pub fn parse(octets: &mut octets::Octets) -> CapsuleResult<DatagramCapsule> {
+        let data = octets.get_bytes(octets.cap() as usize)?.to_vec();
+        Ok(DatagramCapsule { data })
+    }
+
+    pub fn append(&self, octets: &mut octets::OctetsMut) -> CapsuleResult<()> {
+        octets.put_bytes(&self.data)?;
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.data.len()
     }
 }
 

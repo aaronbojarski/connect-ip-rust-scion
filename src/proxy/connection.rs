@@ -12,18 +12,19 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
+use crate::connect_ip::capsule::{Capsule, CapsuleError, DatagramCapsule};
 use crate::connect_ip::capsule_protocol::{
-    CapsuleProtocolState, handle_capsule_data, prepare_address_and_route_assignment,
+    RoutingState, handle_capsule_data, prepare_address_and_route_assignment,
 };
 use crate::connect_ip::request::{build_response, headers_to_strings};
 use crate::net::quic::{DEFAULT_TIMEOUT, KEEPALIVE_INTERVAL, MAX_DATAGRAM_SIZE};
 use crate::net::{UdpPacket, check_packet_src_dst, return_subnet, tun};
 use crate::proxy::CLIENT_CHANNEL_CAPACITY;
 
+const SEND_BUFFER_SIZE: usize = 65535; // bytes
+
 struct PartialResponse {
     headers: Option<Vec<quiche::h3::Header>>,
-    body: Vec<u8>,
-    written: usize,
 }
 
 pub struct Connection {
@@ -35,11 +36,14 @@ pub struct Connection {
     pub rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
     pub tx_quic_to_udp: mpsc::Sender<UdpPacket>,
     pub tun_name: String,
+    pub tun_mtu: u16,
     available_addresses: Arc<Mutex<Vec<IpNet>>>,
     partial_responses: HashMap<u64, PartialResponse>,
     assign_addresses_and_routes_done: bool,
     client_cert_timer: std::time::Instant,
-    capsule_state: CapsuleProtocolState,
+    capsule_state: RoutingState,
+    remaining_data: Vec<u8>,
+    remaining_sending_data: Vec<u8>,
 }
 
 impl Connection {
@@ -51,6 +55,7 @@ impl Connection {
         rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
         tx_quic_to_udp: mpsc::Sender<UdpPacket>,
         tun_name: String,
+        tun_mtu: u16,
         available_addresses: Arc<Mutex<Vec<IpNet>>>,
         routes: Vec<IpNet>,
     ) -> Self {
@@ -63,21 +68,46 @@ impl Connection {
             rx_udp_to_quic,
             tx_quic_to_udp,
             tun_name,
+            tun_mtu,
             available_addresses,
             partial_responses: HashMap::new(),
             assign_addresses_and_routes_done: false,
             client_cert_timer: std::time::Instant::now(),
-            capsule_state: CapsuleProtocolState {
+            capsule_state: RoutingState {
                 stream_id: None,
                 local_addresses: vec![],
                 remote_addresses: vec![],
                 local_routes: routes,
                 remote_routes: vec![],
             },
+            remaining_data: Vec::with_capacity(65535),
+            remaining_sending_data: Vec::with_capacity(SEND_BUFFER_SIZE),
         }
     }
 
     pub async fn handle_client_connection(mut self) -> Result<()> {
+        let mut buf = [0; MAX_DATAGRAM_SIZE];
+
+        // Send initial response packets
+        loop {
+            let (write, send_info) = match self.conn.send(&mut buf) {
+                Ok(v) => v,
+                Err(quiche::Error::Done) => break,
+                Err(e) => {
+                    error!("send failed: {:?}", e);
+                    break;
+                }
+            };
+
+            let packet = UdpPacket {
+                data: buf[..write].to_vec(),
+                src: scion_proto::address::SocketAddr::from_std(self.local_isd_as, send_info.from),
+                dst: scion_proto::address::SocketAddr::from_std(self.remote_isd_as, send_info.to),
+            };
+
+            self.tx_quic_to_udp.send(packet).await?;
+        }
+
         info!("starting connection handler with TUN {}", self.tun_name);
         // Create cancellation token for clean shutdown
         let cancel_token = CancellationToken::new();
@@ -87,23 +117,20 @@ impl Connection {
             mpsc::channel::<Vec<u8>>(CLIENT_CHANNEL_CAPACITY);
         let (tx_tun_to_quic, mut rx_tun_to_quic) =
             mpsc::channel::<Vec<u8>>(CLIENT_CHANNEL_CAPACITY);
-        let mut tun = tun::Tun::new(
-            &self.tun_name,
-            tx_tun_to_quic,
-            (MAX_DATAGRAM_SIZE - 50).try_into().unwrap(), // 12 bytes QUIC header, 16 bytes aead, at most 16 bytes datagram format
-        )?;
+        let mut tun = tun::Tun::new(&self.tun_name, tx_tun_to_quic, self.tun_mtu)?;
 
         let (tx_address_updates, rx_address_updates) = mpsc::channel::<tun::AddressUpdate>(10);
         tun.start(rx_quic_to_tun, rx_address_updates, cancel_token.clone())
             .await?;
 
-        let mut buf = [0; MAX_DATAGRAM_SIZE];
-        let mut packet_buf: Vec<UdpPacket> = Vec::with_capacity(10); // buffer for incoming UDP packets. Used for processing multiple packets at once.
+        let mut udp_packet_buf: Vec<UdpPacket> = Vec::with_capacity(10); // buffer for incoming UDP packets. Used for processing multiple packets at once.
+        let mut tun_packet_buf: Vec<Vec<u8>> = Vec::with_capacity(10); // buffer for incoming TUN packets. Used for processing multiple packets at once.
         let mut keepalive_interval =
             tokio::time::interval(std::time::Duration::from_millis(KEEPALIVE_INTERVAL));
 
         loop {
-            packet_buf.clear();
+            udp_packet_buf.clear();
+            tun_packet_buf.clear();
             let timeout = self
                 .conn
                 .timeout()
@@ -124,13 +151,15 @@ impl Connection {
                 }
 
                 // Handle incoming UDP packets
-                num_packets = self.rx_udp_to_quic.recv_many(&mut packet_buf, 10) => {
-                    self.process_udp_packets(&mut packet_buf, num_packets, &mut tx_quic_to_tun, &tx_address_updates).await?;
+                num_packets = self.rx_udp_to_quic.recv_many(&mut udp_packet_buf, 10) => {
+                    self.process_udp_packets(&mut udp_packet_buf, num_packets, &mut tx_quic_to_tun, &tx_address_updates).await?;
                 }
 
                 // Handle outgoing IP packets from TUN
-                Some(ip_packet) = rx_tun_to_quic.recv() => {
-                    self.process_tun_packet(ip_packet).await?;
+                num_packets = rx_tun_to_quic.recv_many(&mut tun_packet_buf, 10) => {
+                    for packet in tun_packet_buf.iter().take(num_packets) {
+                        self.process_tun_packet(packet).await?;
+                    }
                 }
             }
 
@@ -152,6 +181,45 @@ impl Connection {
                 break;
             }
 
+            if !self.remaining_sending_data.is_empty() {
+                debug!(
+                    "having {} bytes of remaining data to send, attempting to send",
+                    self.remaining_sending_data.len()
+                );
+                let to_send = self.remaining_sending_data.split_off(0);
+                if let Some(stream_id) = self.capsule_state.stream_id {
+                    match self.h3_conn.as_mut().unwrap().send_body(
+                        &mut self.conn,
+                        stream_id,
+                        &to_send,
+                        false,
+                    ) {
+                        Ok(sent) => {
+                            debug!("send_body sent {} bytes on stream {}", sent, stream_id);
+                            if sent < to_send.len() {
+                                debug!(
+                                    "only sent {} out of {} bytes, storing remaining",
+                                    sent,
+                                    to_send.len()
+                                );
+                                self.remaining_sending_data
+                                    .extend_from_slice(&to_send[sent..]);
+                            }
+                        }
+                        Err(quiche::h3::Error::Done) => {
+                            debug!("send_body would block, storing all {} bytes", to_send.len());
+                            self.remaining_sending_data.extend_from_slice(&to_send);
+                        }
+                        Err(e) => {
+                            error!("send_body failed: {:?}", e);
+                            return Err(anyhow!("send_body failed: {:?}", e));
+                        }
+                    }
+                } else {
+                    debug!("no stream id for sending data, dropping");
+                }
+            }
+
             // Send any pending QUIC packets
             loop {
                 let (write, send_info) = match self.conn.send(&mut buf) {
@@ -163,16 +231,17 @@ impl Connection {
                     }
                 };
 
-                let src =
-                    scion_proto::address::SocketAddr::from_std(self.local_isd_as, send_info.from);
-                let dst =
-                    scion_proto::address::SocketAddr::from_std(self.remote_isd_as, send_info.to);
-
                 self.tx_quic_to_udp
                     .send(UdpPacket {
                         data: buf[..write].to_vec(),
-                        src,
-                        dst,
+                        src: scion_proto::address::SocketAddr::from_std(
+                            self.local_isd_as,
+                            send_info.from,
+                        ),
+                        dst: scion_proto::address::SocketAddr::from_std(
+                            self.remote_isd_as,
+                            send_info.to,
+                        ),
                     })
                     .await?;
             }
@@ -219,7 +288,6 @@ impl Connection {
 
             // Process the packet
             if let Err(e) = self.conn.recv(&mut packet.data, recv_info) {
-                // TODO: handle specific errors
                 error!("recv failed: {:?}, recv_info: {:?}", e, recv_info);
                 continue;
             }
@@ -236,13 +304,11 @@ impl Connection {
         }
 
         // Handle HTTP/3 connection establishment and process HTTP/3 data
-        self.handle_http3_connection(tx_address_updates).await?;
+        self.handle_http3_connection(tx_address_updates, tx_quic_to_tun)
+            .await?;
 
         // Handle initial address assignment and route advertisement
-        if let Some(h3_conn) = &mut self.h3_conn
-            && let Some(stream_id) = self.capsule_state.stream_id
-            && !self.assign_addresses_and_routes_done
-        {
+        if !self.assign_addresses_and_routes_done {
             let mut octets = OctetsMut::with_slice(&mut buf);
             let assigned_address = prepare_address_and_route_assignment(
                 &mut self.capsule_state,
@@ -262,7 +328,9 @@ impl Connection {
                 error!("{} no capsule prepared, not sending", self.conn.trace_id());
                 return Ok(());
             }
-            h3_conn.send_body(&mut self.conn, stream_id, &buf[..payload_len], false)?;
+
+            self.remaining_sending_data
+                .extend_from_slice(&buf[..payload_len]);
 
             self.assign_addresses_and_routes_done = true;
         }
@@ -343,15 +411,15 @@ impl Connection {
         Ok(())
     }
 
-    async fn process_tun_packet(&mut self, ip_packet: Vec<u8>) -> Result<()> {
-        let (src, dst) = if let Some(ipv4) = Ipv4Packet::new(&ip_packet)
+    async fn process_tun_packet(&mut self, ip_packet: &Vec<u8>) -> Result<()> {
+        let (src, dst) = if let Some(ipv4) = Ipv4Packet::new(ip_packet)
             && ipv4.get_version() == 4
         {
             (
                 IpAddr::V4(ipv4.get_source()),
                 IpAddr::V4(ipv4.get_destination()),
             )
-        } else if let Some(ipv6) = Ipv6Packet::new(&ip_packet)
+        } else if let Some(ipv6) = Ipv6Packet::new(ip_packet)
             && ipv6.get_version() == 6
         {
             (
@@ -385,22 +453,41 @@ impl Connection {
             return Ok(());
         }
 
+        let datagram = false;
         if self.conn.is_established()
             && let Some(stream_id) = self.capsule_state.stream_id
         {
-            let mut buf = [0; MAX_DATAGRAM_SIZE];
-            let mut octets = OctetsMut::with_slice(&mut buf);
-
-            // The datagram format is:
-            // - varint: quarter stream id (stream_id / 4)
-            // - varint: context_id (must be 0)
-            // - bytes: IP packet
-            octets.put_varint(stream_id / 4)?;
-            octets.put_varint(0)?;
-            octets.put_bytes(&ip_packet)?;
-            let len = octets.off();
-            if let Err(e) = self.conn.dgram_send(&buf[..len]) {
-                error!("dgram_send failed: {:?}", e);
+            let mut buf = [0; 1600];
+            if datagram {
+                let mut octets = OctetsMut::with_slice(&mut buf);
+                octets.put_varint(stream_id / 4)?;
+                octets.put_varint(0)?;
+                octets.put_bytes(ip_packet)?;
+                let len = octets.off();
+                if let Err(e) = self.conn.dgram_send(&buf[..len]) {
+                    error!("dgram_send failed: {:?}", e);
+                }
+            } else {
+                let mut datagram_data = [0u8; 1508];
+                let mut datagram_octets = OctetsMut::with_slice(&mut datagram_data);
+                datagram_octets.put_varint(0)?;
+                datagram_octets.put_bytes(ip_packet)?;
+                let len = datagram_octets.off();
+                let datagram_capsule = DatagramCapsule {
+                    data: datagram_data[..len].to_vec(),
+                };
+                let capsule = Capsule::Datagram(datagram_capsule);
+                let mut octets = OctetsMut::with_slice(&mut buf);
+                capsule.append(&mut octets)?;
+                let len = octets.off();
+                if self.remaining_sending_data.len() + len > SEND_BUFFER_SIZE {
+                    debug!(
+                        "too much remaining data to send ({} bytes), dropping packet",
+                        self.remaining_sending_data.len() + len
+                    );
+                    return Ok(());
+                }
+                self.remaining_sending_data.extend_from_slice(&buf[..len]);
             }
         } else {
             debug!("connection not established yet, dropping packet");
@@ -411,8 +498,9 @@ impl Connection {
     async fn handle_http3_connection(
         &mut self,
         tx_address_updates: &mpsc::Sender<tun::AddressUpdate>,
+        tx_quic_to_tun: &mut mpsc::Sender<Vec<u8>>,
     ) -> Result<()> {
-        let mut buf = [0; MAX_DATAGRAM_SIZE];
+        let mut buf = [0; 20000];
 
         // Setup HTTP/3 connection if not already done
         if (self.conn.is_in_early_data() || self.conn.is_established()) && self.h3_conn.is_none() {
@@ -439,7 +527,7 @@ impl Connection {
             }
 
             // Process HTTP/3 events.
-            loop {
+            'h3_events: loop {
                 let http3_conn = self.h3_conn.as_mut().unwrap();
                 match http3_conn.poll(&mut self.conn) {
                     Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
@@ -456,30 +544,54 @@ impl Connection {
                     }
 
                     Ok((stream_id, quiche::h3::Event::Data)) => {
-                        trace!(
-                            "{} got data on stream id {}",
-                            self.conn.trace_id(),
-                            stream_id
-                        );
                         while let Ok(read) = self.h3_conn.as_mut().unwrap().recv_body(
                             &mut self.conn,
                             stream_id,
                             &mut buf,
                         ) {
                             trace!("got {read} bytes of response data on stream {stream_id}");
+                            self.remaining_data.extend_from_slice(&buf[..read]);
+
                             let mut consumed = 0;
-                            while consumed < read {
-                                consumed += handle_capsule_data(
+
+                            'process_capsule_data: while consumed < self.remaining_data.len() {
+                                match handle_capsule_data(
                                     stream_id,
-                                    &buf[consumed..read],
+                                    &self.remaining_data[consumed..],
                                     &mut self.capsule_state,
-                                    &mut self.conn,
-                                    &mut self.h3_conn,
                                     &self.available_addresses,
                                     tx_address_updates,
+                                    tx_quic_to_tun,
+                                    &mut self.remaining_sending_data,
                                 )
-                                .await?;
+                                .await
+                                {
+                                    Ok(len) => {
+                                        debug!(
+                                            "{} processed capsule data of length {} on stream {}",
+                                            self.conn.trace_id(),
+                                            len,
+                                            stream_id
+                                        );
+                                        consumed += len;
+                                    }
+                                    Err(err) if err.is::<CapsuleError>() => {
+                                        // Need more data to process capsule. Store remaining data for later processing.
+                                        debug!("need more data to process capsule. Err {:?}", err);
+                                        break 'process_capsule_data;
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            "{} error handling capsule data: {:?}, closing connection",
+                                            self.conn.trace_id(),
+                                            e
+                                        );
+                                        self.conn.close(true, 0x100, b"capsule data error")?;
+                                        break 'h3_events;
+                                    }
+                                }
                             }
+                            self.remaining_data = self.remaining_data[consumed..].to_vec();
                         }
                     }
 
@@ -529,8 +641,6 @@ impl Connection {
                 Err(quiche::h3::Error::StreamBlocked) => {
                     let response = PartialResponse {
                         headers: Some(headers),
-                        body: vec![],
-                        written: 0,
                     };
 
                     self.partial_responses.insert(stream_id, response);
@@ -584,25 +694,6 @@ impl Connection {
             }
         }
 
-        resp.headers = None;
-        let body = &resp.body[resp.written..];
-        let written = match http3_conn.send_body(&mut self.conn, stream_id, body, false) {
-            Ok(v) => v,
-
-            Err(quiche::h3::Error::Done) => 0,
-
-            Err(e) => {
-                self.partial_responses.remove(&stream_id);
-
-                error!("{} stream send failed {:?}", self.conn.trace_id(), e);
-                return;
-            }
-        };
-
-        resp.written += written;
-
-        if resp.written == resp.body.len() {
-            self.partial_responses.remove(&stream_id);
-        }
+        self.partial_responses.remove(&stream_id);
     }
 }
