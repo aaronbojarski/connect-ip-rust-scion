@@ -20,7 +20,7 @@ use crate::proxy::connection::Connection;
 const TOKEN_PREFIX: &[u8] = b"connect-ip-rust-scion";
 const HMAC_TAG_LEN: usize = 32;
 const MAIN_CHANNEL_CAPACITY: usize = 10000;
-const CLIENT_CHANNEL_CAPACITY: usize = 100;
+const CLIENT_CHANNEL_CAPACITY: usize = 200;
 const UDP_PACKET_BUFFER_SIZE: usize = 65535;
 
 pub struct ProxyConfig {
@@ -87,6 +87,7 @@ impl Proxy {
                             IsdAsn::WILDCARD,
                             src,
                         );
+                        debug!("received {} bytes on socket from {}", len, src);
                         self.handle_udp_packet(&mut buf, len, src, src_scion, local_addr, self.config.listen, &tx_quic_to_udp, &mut quic_config, &mut next_client).await?;
                     }
 
@@ -99,7 +100,7 @@ impl Proxy {
                             continue;
                         };
                         socket.send_to(&packet_data.data, dst).await?;
-                        trace!("sent {} bytes to {}", packet_data.data.len(), dst);
+                        debug!("sent {} bytes on socket to {}", packet_data.data.len(), dst);
                     }
                 }
             }
@@ -154,13 +155,14 @@ impl Proxy {
                                 continue;
                             }
                         };
+                        debug!("received {} bytes on socket from {}", len, src);
                         self.handle_udp_packet(&mut buf, len, src_ip_addr, src, local_addr, local_scion_addr, &tx_quic_to_udp, &mut quic_config, &mut next_client).await?;
                     }
 
                     // Send QUIC packets over UDP socket
                     Some(packet_data) = rx_quic_to_udp.recv() => {
                         socket.send_to(&packet_data.data, packet_data.dst).await?;
-                        trace!("sent {} bytes to {}", packet_data.data.len(), packet_data.dst);
+                        debug!("sent {} bytes on socket to {}", packet_data.data.len(), packet_data.dst);
                     }
                 }
             }
@@ -209,7 +211,7 @@ impl Proxy {
             }) {
                 Ok(_) => {}
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    trace!(
+                    debug!(
                         "Connection channel full, dropping packet for connection {:?}",
                         hdr.dcid
                     );

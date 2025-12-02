@@ -76,9 +76,6 @@ This project took inspiration from the following implementations. We thank the a
   - SNAP on server side
 - Connect-IP
   - Better error handling
-  - MTU
-    - use datagrams if possible
-    - make MTU negotiable via http header
   - test performance if it is single threaded
     - due to scheduling we might not benefit from multiple tasks
     - is this worth the effort?

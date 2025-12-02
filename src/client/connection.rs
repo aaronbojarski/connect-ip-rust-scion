@@ -386,7 +386,7 @@ impl Connection {
         Ok(())
     }
 
-    async fn process_tun_packet(&mut self, ip_packet: &Vec<u8>) -> Result<()> {
+    async fn process_tun_packet(&mut self, ip_packet: &[u8]) -> Result<()> {
         let mut buf = [0; MAX_TUN_MTU + 32]; // extra space for capsule overhead
         let (src, dst) = if let Some(ipv4) = Ipv4Packet::new(ip_packet)
             && ipv4.get_version() == 4
@@ -440,8 +440,14 @@ impl Connection {
                 octets.put_varint(0)?;
                 octets.put_bytes(ip_packet)?;
                 let len = octets.off();
-                if let Err(e) = self.conn.dgram_send(&buf[..len]) {
-                    error!("dgram_send failed: {:?}", e);
+                match self.conn.dgram_send(&buf[..len]) {
+                    Ok(_) => {}
+                    Err(quiche::Error::Done) => {
+                        debug!("datagram send queue full, dropping packet");
+                    }
+                    Err(e) => {
+                        error!("failed to send datagram: {:?}", e);
+                    }
                 }
             } else {
                 let mut datagram_data = [0u8; MAX_TUN_MTU + 8]; // extra space for context ID

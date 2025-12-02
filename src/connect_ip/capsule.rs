@@ -112,7 +112,7 @@ pub struct DatagramCapsule {
 
 impl DatagramCapsule {
     pub fn parse(octets: &mut octets::Octets) -> CapsuleResult<DatagramCapsule> {
-        let data = octets.get_bytes(octets.cap() as usize)?.to_vec();
+        let data = octets.get_bytes(octets.cap())?.to_vec();
         Ok(DatagramCapsule { data })
     }
 

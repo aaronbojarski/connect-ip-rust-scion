@@ -3,7 +3,7 @@ use tracing::info;
 
 pub const MAX_DATAGRAM_SIZE: usize = 1200;
 pub const KEEPALIVE_INTERVAL: u64 = 5000; // in milliseconds
-pub const DEFAULT_TIMEOUT: u64 = 60_000; // in milliseconds
+pub const DEFAULT_TIMEOUT: u64 = 30_000; // in milliseconds
 
 pub fn configure_quic(
     ca_cert_path: &std::path::Path,
@@ -34,7 +34,7 @@ pub fn configure_quic(
     )?;
 
     config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
-    config.set_max_idle_timeout(10000);
+    config.set_max_idle_timeout(DEFAULT_TIMEOUT);
     config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
     config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
     config.set_initial_max_data(10_000_000);
@@ -45,7 +45,7 @@ pub fn configure_quic(
     config.set_initial_max_streams_uni(100);
     config.set_disable_active_migration(true);
     config.enable_early_data();
-    config.enable_dgram(true, 1_000_000, 1_000_000);
+    config.enable_dgram(true, 1000, 200);
 
     Ok(config)
 }

@@ -4,7 +4,7 @@ use std::net::IpAddr;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info_span, trace, warn};
+use tracing::{debug, error, info_span, warn};
 use tracing_futures::Instrument as _;
 use tun_rs::DeviceBuilder;
 
@@ -117,7 +117,7 @@ impl Tun {
                                 match tx_tun_to_quic.try_send(buf[..len].to_vec()) {
                                     Ok(_) => {}
                                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                        trace!("TUN to QUIC channel full, dropping packet from TUN device {}", name);
+                                        debug!("TUN to QUIC channel full, dropping packet from TUN device {}", name);
                                     }
                                     Err(e) => {
                                         warn!("Failed to send packet from TUN device {}: {}, shutting down", name, e);

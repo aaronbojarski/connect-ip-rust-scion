@@ -8,13 +8,13 @@ use std::fs;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info};
 
 use crate::client::connection::Connection;
 use crate::net::UdpPacket;
 use crate::net::quic::MAX_DATAGRAM_SIZE;
 
-pub const CHANNEL_CAPACITY: usize = 100;
+pub const CHANNEL_CAPACITY: usize = 200;
 pub const UDP_PACKET_BUFFER_SIZE: usize = 65535;
 
 #[derive(Clone)]
@@ -94,6 +94,7 @@ impl Client {
                 tokio::select! {
                     // Receive datagram from UDP socket and pass to QUIC
                     Ok((len, src)) = socket.recv_from(&mut buf) => {
+                        debug!("received {} bytes on socket from {}", len, src);
                         match tx_udp_to_quic.try_send(UdpPacket {
                             data: buf[..len].to_vec(),
                             src: scion_proto::address::SocketAddr::from_std(IsdAsn::WILDCARD, src),
@@ -113,7 +114,7 @@ impl Client {
                     Some(packet_data) = rx_quic_to_udp.recv() => {
                         let dst = packet_data.dst.local_address().ok_or_else(|| anyhow!("invalid dst address"))?;
                         socket.send_to(&packet_data.data, dst).await?;
-                        trace!("sent {} bytes to {}", packet_data.data.len(), packet_data.dst);
+                        debug!("sent {} bytes on socket to {}", packet_data.data.len(), packet_data.dst);
                     }
                     // Connection handler exited
                     quic_result = &mut quic_handle => {
@@ -191,6 +192,7 @@ impl Client {
                 tokio::select! {
                     // Receive datagram from UDP socket and pass to QUIC
                     Ok((len, src)) = socket.recv_from(&mut buf) => {
+                        debug!("received {} bytes on socket from {}", len, src);
                         match tx_udp_to_quic.try_send(UdpPacket {
                             data: buf[..len].to_vec(),
                             src,
@@ -209,7 +211,7 @@ impl Client {
                     // Send datagram from QUIC to UDP socket
                     Some(packet_data) = rx_quic_to_udp.recv() => {
                         socket.send_to(&packet_data.data, packet_data.dst).await?;
-                        trace!("sent {} bytes to {}", packet_data.data.len(), packet_data.dst);
+                        debug!("sent {} bytes on socket to {}", packet_data.data.len(), packet_data.dst);
                     }
                     // Connection handler exited
                     quic_result = &mut quic_handle => {
