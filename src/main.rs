@@ -56,6 +56,10 @@ struct ProxyOpt {
     #[clap(long, required = true)]
     address_pool: Vec<IpNet>,
 
+    /// MTU for the interface
+    #[clap(long, default_value = "1500")]
+    mtu: u16,
+
     /// Tracing level (trace, debug, info, warn, error)
     #[clap(long = "log", default_value = "info")]
     log_level: tracing::Level,
@@ -106,6 +110,10 @@ struct ClientOpt {
     #[clap(long = "tun", default_value = "tun0")]
     tun_name: String,
 
+    /// MTU for the interface
+    #[clap(long, default_value = "1500")]
+    mtu: u16,
+
     /// Tracing level (trace, debug, info, warn, error)
     #[clap(long = "log", default_value = "info")]
     log_level: tracing::Level,
@@ -138,6 +146,7 @@ async fn run_proxy(opt: ProxyOpt) -> Result<(), anyhow::Error> {
         key_path: opt.key_path,
         routes: opt.routes,
         address_pool: opt.address_pool,
+        tun_mtu: opt.mtu,
     };
     let proxy = connect_ip_rust_scion::proxy::Proxy::new(config);
     proxy.run().await?;
@@ -162,6 +171,7 @@ async fn run_client(opt: ClientOpt) -> Result<(), anyhow::Error> {
         routes: opt.routes,
         address_pool: opt.address_pool,
         tun_name: opt.tun_name,
+        tun_mtu: opt.mtu,
     };
     let client = connect_ip_rust_scion::client::Client::new(config);
     client.run().await?;

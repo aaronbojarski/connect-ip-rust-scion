@@ -18,8 +18,10 @@ use crate::net::quic::MAX_DATAGRAM_SIZE;
 use crate::proxy::connection::Connection;
 
 const TOKEN_PREFIX: &[u8] = b"connect-ip-rust-scion";
+const HMAC_TAG_LEN: usize = 32;
 const MAIN_CHANNEL_CAPACITY: usize = 10000;
-const CLIENT_CHANNEL_CAPACITY: usize = 1000;
+const CLIENT_CHANNEL_CAPACITY: usize = 200;
+const UDP_PACKET_BUFFER_SIZE: usize = 65535;
 
 pub struct ProxyConfig {
     pub listen: scion_proto::address::SocketAddr,
@@ -30,6 +32,7 @@ pub struct ProxyConfig {
     pub key_path: std::path::PathBuf,
     pub routes: Vec<IpNet>,
     pub address_pool: Vec<IpNet>,
+    pub tun_mtu: u16,
 }
 
 pub struct Proxy {
@@ -65,7 +68,7 @@ impl Proxy {
         let (tx_quic_to_udp, mut rx_quic_to_udp) =
             mpsc::channel::<UdpPacket>(MAIN_CHANNEL_CAPACITY);
 
-        let mut buf = [0; 65535];
+        let mut buf = [0; UDP_PACKET_BUFFER_SIZE];
         let mut next_client = 0u32;
 
         if self.config.listen.isd_asn() == IsdAsn::WILDCARD {
@@ -84,6 +87,7 @@ impl Proxy {
                             IsdAsn::WILDCARD,
                             src,
                         );
+                        debug!("received {} bytes on socket from {}", len, src);
                         self.handle_udp_packet(&mut buf, len, src, src_scion, local_addr, self.config.listen, &tx_quic_to_udp, &mut quic_config, &mut next_client).await?;
                     }
 
@@ -96,7 +100,7 @@ impl Proxy {
                             continue;
                         };
                         socket.send_to(&packet_data.data, dst).await?;
-                        trace!("sent {} bytes to {}", packet_data.data.len(), dst);
+                        debug!("sent {} bytes on socket to {}", packet_data.data.len(), dst);
                     }
                 }
             }
@@ -151,13 +155,14 @@ impl Proxy {
                                 continue;
                             }
                         };
+                        debug!("received {} bytes on socket from {}", len, src);
                         self.handle_udp_packet(&mut buf, len, src_ip_addr, src, local_addr, local_scion_addr, &tx_quic_to_udp, &mut quic_config, &mut next_client).await?;
                     }
 
                     // Send QUIC packets over UDP socket
                     Some(packet_data) = rx_quic_to_udp.recv() => {
                         socket.send_to(&packet_data.data, packet_data.dst).await?;
-                        trace!("sent {} bytes to {}", packet_data.data.len(), packet_data.dst);
+                        debug!("sent {} bytes on socket to {}", packet_data.data.len(), packet_data.dst);
                     }
                 }
             }
@@ -199,13 +204,26 @@ impl Proxy {
         };
         if let Some(client_conn) = client_conn_sender {
             // Forward to existing connection task
-            let _ = client_conn
-                .send(UdpPacket {
-                    data: buf[..len].to_vec(),
-                    src: src_scion_socket,
-                    dst: local_scion_socket,
-                })
-                .await;
+            match client_conn.try_send(UdpPacket {
+                data: buf[..len].to_vec(),
+                src: src_scion_socket,
+                dst: local_scion_socket,
+            }) {
+                Ok(_) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    debug!(
+                        "Connection channel full, dropping packet for connection {:?}",
+                        hdr.dcid
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to send packet to connection {:?}: {}, shutting down",
+                        hdr.dcid, e
+                    );
+                    // TODO: properly shut down the connection
+                }
+            }
         } else if hdr.ty == quiche::Type::Initial {
             let mut out = [0; MAX_DATAGRAM_SIZE];
 
@@ -222,7 +240,16 @@ impl Proxy {
                     dst: src_scion_socket,
                 };
 
-                tx_quic_to_udp.send(packet).await?;
+                // We use try_send here to avoid a deadlock
+                match tx_quic_to_udp.try_send(packet) {
+                    Ok(_) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        trace!("QUIC to UDP channel full, dropping version negotiation packet");
+                    }
+                    Err(e) => {
+                        warn!("Failed to send version negotiation packet: {}", e);
+                    }
+                }
                 return Ok(());
             }
 
@@ -259,7 +286,16 @@ impl Proxy {
                     dst: src_scion_socket,
                 };
 
-                tx_quic_to_udp.send(packet).await?;
+                // We use try_send here to avoid a deadlock
+                match tx_quic_to_udp.try_send(packet) {
+                    Ok(_) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        trace!("QUIC to UDP channel full, dropping retry packet");
+                    }
+                    Err(e) => {
+                        warn!("Failed to send retry packet: {}", e);
+                    }
+                }
                 return Ok(());
             }
 
@@ -317,29 +353,6 @@ impl Proxy {
                 }
             }
 
-            // Send response packets
-            loop {
-                let (write, send_info) = match conn.send(buf) {
-                    Ok(v) => v,
-                    Err(quiche::Error::Done) => break,
-                    Err(e) => {
-                        error!("send failed: {:?}", e);
-                        break;
-                    }
-                };
-
-                let packet = UdpPacket {
-                    data: buf[..write].to_vec(),
-                    src: local_scion_socket,
-                    dst: scion_proto::address::SocketAddr::from_std(
-                        src_scion_socket.isd_asn(),
-                        send_info.to,
-                    ),
-                };
-
-                tx_quic_to_udp.send(packet).await?;
-            }
-
             // Create channel for this connection
             let (tx_to_connection, rx_from_main) =
                 mpsc::channel::<UdpPacket>(CLIENT_CHANNEL_CAPACITY);
@@ -357,6 +370,7 @@ impl Proxy {
                 rx_from_main,
                 tx_quic_to_udp.clone(),
                 tun_name,
+                self.config.tun_mtu,
                 self.available_addresses.clone(),
                 self.config.routes.clone(),
             );
@@ -427,18 +441,17 @@ impl Proxy {
             return None;
         }
 
-        if token.len() < TOKEN_PREFIX.len() + addr.len() + 32 {
+        if token.len() < TOKEN_PREFIX.len() + addr.len() + HMAC_TAG_LEN {
             return None;
         }
 
-        let (data, tag) = token.split_at(token.len() - 32);
-
+        let (data, tag) = token.split_at(token.len() - HMAC_TAG_LEN);
         if ring::hmac::verify(&self.token_key, data, tag).is_err() {
             return None;
         }
 
         let dcid_start = TOKEN_PREFIX.len() + addr.len();
-        let dcid_end = token.len() - 32;
+        let dcid_end = token.len() - HMAC_TAG_LEN;
 
         Some(quiche::ConnectionId::from_ref(&token[dcid_start..dcid_end]))
     }

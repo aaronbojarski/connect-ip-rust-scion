@@ -74,6 +74,7 @@ This project took inspiration from the following implementations. We thank the a
 - SCION
   - Path selection
   - SNAP on server side
+  - Fix address assignment
 - Connect-IP
   - Better error handling
-  - MTU
+  - Simplify Packet forwarding in different modes (streams/datagrams)
