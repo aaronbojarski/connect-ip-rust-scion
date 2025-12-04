@@ -74,8 +74,7 @@ This project took inspiration from the following implementations. We thank the a
 - SCION
   - Path selection
   - SNAP on server side
+  - Fix address assignment
 - Connect-IP
   - Better error handling
-  - test performance if it is single threaded
-    - due to scheduling we might not benefit from multiple tasks
-    - is this worth the effort?
+  - Simplify Packet forwarding in different modes (streams/datagrams)

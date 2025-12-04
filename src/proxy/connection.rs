@@ -588,9 +588,19 @@ impl Connection {
                                         consumed += len;
                                     }
                                     Err(err) if err.is::<CapsuleError>() => {
-                                        // Need more data to process capsule. Store remaining data for later processing.
-                                        debug!("need more data to process capsule. Err {:?}", err);
-                                        break 'process_capsule_data;
+                                        if let Some(CapsuleError::Buffer(_)) =
+                                            err.downcast_ref::<CapsuleError>()
+                                        {
+                                            // Need more data to process capsule. Store remaining data for later processing.
+                                            debug!("need more data to process capsule.");
+                                            break 'process_capsule_data;
+                                        }
+
+                                        error!(
+                                            "error handling capsule data: {:?}, closing connection",
+                                            err
+                                        );
+                                        self.conn.close(true, 0x100, b"capsule data error")?;
                                     }
                                     Err(e) => {
                                         error!(
