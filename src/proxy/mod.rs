@@ -4,6 +4,7 @@ use anyhow::{Context, Result, anyhow};
 use ipnet::IpNet;
 use ring::rand::SystemRandom;
 use scion_proto::address::IsdAsn;
+use scion_proto::path::policy::acl::AclPolicy;
 use scion_stack::scionstack::ScionStackBuilder;
 use std::collections::HashMap;
 use std::fs;
@@ -27,6 +28,7 @@ pub struct ProxyConfig {
     pub listen: scion_proto::address::SocketAddr,
     pub endhost_api_address: Option<url::Url>,
     pub snap_token_path: Option<std::path::PathBuf>,
+    pub acl_policy: Option<AclPolicy>,
     pub ca_cert_path: std::path::PathBuf,
     pub cert_path: std::path::PathBuf,
     pub key_path: std::path::PathBuf,
@@ -136,9 +138,12 @@ impl Proxy {
             let socket_address = scion_proto::address::SocketAddr::new(proxy_addr.into(), 4433);
 
             let mut socket_config = scion_stack::scionstack::SocketConfig::new();
-            let policy = scion_proto::path::policy::acl::AclPolicy::parse("+ 64 +").unwrap();
-            info!("Policy: {:?}", policy);
-            socket_config = socket_config.with_path_policy(policy);
+            if let Some(policy) = &self.config.acl_policy {
+                info!("Using ACL policy: {:?}", policy);
+                socket_config = socket_config.with_path_policy(policy.clone());
+            } else {
+                info!("No ACL policy specified, using default (allow all)");
+            }
 
             let socket = scion_network_stack
                 .bind_with_config(Some(socket_address), socket_config)
