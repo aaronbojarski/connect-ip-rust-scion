@@ -31,15 +31,16 @@ struct PartialResponse {
 }
 
 pub struct Connection {
-    pub conn: quiche::Connection,
-    pub scid: quiche::ConnectionId<'static>,
-    pub h3_conn: Option<quiche::h3::Connection>,
-    pub local_isd_as: IsdAsn,
-    pub remote_isd_as: IsdAsn,
-    pub rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
-    pub tx_quic_to_udp: mpsc::Sender<UdpPacket>,
-    pub tun_name: String,
-    pub tun_mtu: u16,
+    conn: quiche::Connection,
+    scid: quiche::ConnectionId<'static>,
+    h3_conn: Option<quiche::h3::Connection>,
+    local_isd_as: IsdAsn,
+    remote_isd_as: IsdAsn,
+    rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
+    tx_quic_to_udp: mpsc::Sender<UdpPacket>,
+    tun_name: String,
+    tun_mtu: u16,
+    cancel_token: CancellationToken,
     available_addresses: Arc<Mutex<Vec<IpNet>>>,
     partial_responses: HashMap<u64, PartialResponse>,
     assign_addresses_and_routes_done: bool,
@@ -59,6 +60,7 @@ impl Connection {
         tx_quic_to_udp: mpsc::Sender<UdpPacket>,
         tun_name: String,
         tun_mtu: u16,
+        cancel_token: CancellationToken,
         available_addresses: Arc<Mutex<Vec<IpNet>>>,
         routes: Vec<IpNet>,
     ) -> Self {
@@ -72,6 +74,7 @@ impl Connection {
             tx_quic_to_udp,
             tun_name,
             tun_mtu,
+            cancel_token,
             available_addresses,
             partial_responses: HashMap::new(),
             assign_addresses_and_routes_done: false,
@@ -164,6 +167,11 @@ impl Connection {
                     for packet in tun_packet_buf.iter().take(num_packets) {
                         self.process_tun_packet(packet).await?;
                     }
+                }
+
+                _ = self.cancel_token.cancelled() => {
+                    info!("cancellation requested, shutting down connection handler");
+                    break;
                 }
             }
 

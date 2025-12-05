@@ -11,6 +11,7 @@ use std::fs;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
+use tokio_util::sync::CancellationToken;
 use tracing::instrument::Instrument;
 use tracing::{debug, error, info, trace, warn};
 
@@ -23,6 +24,12 @@ const HMAC_TAG_LEN: usize = 32;
 const MAIN_CHANNEL_CAPACITY: usize = 10000;
 const CLIENT_CHANNEL_CAPACITY: usize = 200;
 const UDP_PACKET_BUFFER_SIZE: usize = 65535;
+
+#[derive(Clone)]
+struct ConnectionInfo {
+    pub sender: mpsc::Sender<UdpPacket>,
+    pub cancel_token: CancellationToken,
+}
 
 pub struct ProxyConfig {
     pub listen: scion_proto::address::SocketAddr,
@@ -41,7 +48,7 @@ pub struct Proxy {
     config: ProxyConfig,
     token_key: ring::hmac::Key,
     conn_id_seed: ring::hmac::Key,
-    connections: Arc<Mutex<HashMap<quiche::ConnectionId<'static>, mpsc::Sender<UdpPacket>>>>,
+    connections: Arc<Mutex<HashMap<quiche::ConnectionId<'static>, ConnectionInfo>>>,
     available_addresses: Arc<Mutex<Vec<IpNet>>>,
 }
 
@@ -222,7 +229,7 @@ impl Proxy {
         };
         if let Some(client_conn) = client_conn_sender {
             // Forward to existing connection task
-            match client_conn.try_send(UdpPacket {
+            match client_conn.sender.try_send(UdpPacket {
                 data: buf[..len].to_vec(),
                 src: src_scion_socket,
                 dst: local_scion_socket,
@@ -239,7 +246,7 @@ impl Proxy {
                         "Failed to send packet to connection {:?}: {}, shutting down",
                         hdr.dcid, e
                     );
-                    // TODO: properly shut down the connection
+                    client_conn.cancel_token.cancel();
                 }
             }
         } else if hdr.ty == quiche::Type::Initial {
@@ -371,6 +378,9 @@ impl Proxy {
                 }
             }
 
+            // Create cancellation token for clean shutdown
+            let cancel_token = CancellationToken::new();
+
             // Create channel for this connection
             let (tx_to_connection, rx_from_main) =
                 mpsc::channel::<UdpPacket>(CLIENT_CHANNEL_CAPACITY);
@@ -389,13 +399,17 @@ impl Proxy {
                 tx_quic_to_udp.clone(),
                 tun_name,
                 self.config.tun_mtu,
+                cancel_token.clone(),
                 self.available_addresses.clone(),
                 self.config.routes.clone(),
             );
-            self.connections
-                .lock()
-                .await
-                .insert(scid.clone().into_owned(), tx_to_connection);
+            self.connections.lock().await.insert(
+                scid.clone().into_owned(),
+                ConnectionInfo {
+                    sender: tx_to_connection,
+                    cancel_token,
+                },
+            );
 
             // Spawn task for this connection
             let scid_owned = scid.clone().into_owned();

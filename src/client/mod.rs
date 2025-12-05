@@ -82,17 +82,14 @@ impl Client {
                 tx_quic_to_udp,
                 self.config.tun_name.clone(),
                 self.config.tun_mtu,
+                cancel_token.clone(),
                 available_addresses,
                 self.config.routes.clone(),
             )?;
 
             // Spawn connection handler task
-            let cancel_token_clone = cancel_token.clone();
-            let mut quic_handle = tokio::spawn(async move {
-                connection
-                    .start_connection_handling(cancel_token_clone)
-                    .await
-            });
+            let mut quic_handle =
+                tokio::spawn(async move { connection.start_connection_handling().await });
 
             // Main loop: handle UDP socket
             loop {
@@ -192,17 +189,14 @@ impl Client {
                 tx_quic_to_udp,
                 self.config.tun_name.clone(),
                 self.config.tun_mtu,
+                cancel_token.clone(),
                 available_addresses,
                 self.config.routes.clone(),
             )?;
 
             // Spawn connection handler task
-            let cancel_token_clone = cancel_token.clone();
-            let mut quic_handle = tokio::spawn(async move {
-                connection
-                    .start_connection_handling(cancel_token_clone)
-                    .await
-            });
+            let mut quic_handle =
+                tokio::spawn(async move { connection.start_connection_handling().await });
 
             // Main loop: handle UDP socket
             loop {

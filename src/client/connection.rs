@@ -37,6 +37,7 @@ pub struct Connection {
     tx_quic_to_udp: mpsc::Sender<UdpPacket>,
     tun_name: String,
     tun_mtu: u16,
+    cancel_token: CancellationToken,
     available_addresses: Arc<Mutex<Vec<IpNet>>>,
     capsule_state: RoutingState,
     tunnel_established: bool,
@@ -57,6 +58,7 @@ impl Connection {
         tx_quic_to_udp: mpsc::Sender<UdpPacket>,
         tun_name: String,
         tun_mtu: u16,
+        cancel_token: CancellationToken,
         available_addresses: Arc<Mutex<Vec<IpNet>>>,
         routes: Vec<IpNet>,
     ) -> Result<Self> {
@@ -96,6 +98,7 @@ impl Connection {
             tx_quic_to_udp,
             tun_name,
             tun_mtu,
+            cancel_token,
             available_addresses,
             capsule_state: RoutingState {
                 stream_id: None,
@@ -113,10 +116,7 @@ impl Connection {
         })
     }
 
-    pub async fn start_connection_handling(
-        &mut self,
-        cancel_token: CancellationToken,
-    ) -> Result<()> {
+    pub async fn start_connection_handling(&mut self) -> Result<()> {
         let mut buf = [0; MAX_DATAGRAM_SIZE];
 
         // Channels between TUN and QUIC tasks. Contents are IP packets.
@@ -126,8 +126,12 @@ impl Connection {
         let mut tun = tun::Tun::new(&self.tun_name, tx_tun_to_quic.clone(), self.tun_mtu)?;
         let (tx_tun_configuration, rx_tun_configuration) =
             mpsc::channel::<tun::TunConfiguration>(CHANNEL_CAPACITY);
-        tun.start(rx_quic_to_tun, rx_tun_configuration, cancel_token.clone())
-            .await?;
+        tun.start(
+            rx_quic_to_tun,
+            rx_tun_configuration,
+            self.cancel_token.clone(),
+        )
+        .await?;
 
         // Send initial packet
         let (write, send_info) = self.conn.send(&mut buf)?;
@@ -183,6 +187,11 @@ impl Connection {
                     for packet in tun_packet_buf.iter().take(num_packets) {
                         self.process_tun_packet(packet).await?;
                     }
+                }
+
+                _ = self.cancel_token.cancelled() => {
+                    info!("cancellation requested, shutting down connection handler");
+                    break;
                 }
             }
 
@@ -272,7 +281,7 @@ impl Connection {
         }
 
         // Graceful shutdown of TUN task
-        cancel_token.cancel();
+        self.cancel_token.cancel();
         if let Some(tun_handle) = tun.handle.take() {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(2), tun_handle).await;
         }
