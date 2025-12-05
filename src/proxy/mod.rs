@@ -46,39 +46,41 @@ pub struct ProxyConfig {
 
 pub struct Proxy {
     config: ProxyConfig,
+    quic_config: quiche::Config,
     token_key: ring::hmac::Key,
     conn_id_seed: ring::hmac::Key,
     connections: Arc<Mutex<HashMap<quiche::ConnectionId<'static>, ConnectionInfo>>>,
     available_addresses: Arc<Mutex<Vec<IpNet>>>,
+    next_client: u32,
 }
 
 impl Proxy {
-    pub fn new(config: ProxyConfig) -> Self {
+    pub fn new(config: ProxyConfig) -> Result<Self> {
         let available_addresses = Arc::new(Mutex::new(config.address_pool.clone()));
-        Proxy {
+        let quic_config = crate::net::quic::configure_quic(
+            &config.ca_cert_path,
+            &config.cert_path,
+            &config.key_path,
+        )?;
+        Ok(Proxy {
             config,
+            quic_config,
             token_key: ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &SystemRandom::new())
                 .unwrap(),
             conn_id_seed: ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &SystemRandom::new())
                 .unwrap(),
             connections: Arc::new(Mutex::new(HashMap::new())),
             available_addresses,
-        }
+            next_client: 0,
+        })
     }
 
-    pub async fn run(&self) -> Result<()> {
-        let mut quic_config = crate::net::quic::configure_quic(
-            &self.config.ca_cert_path,
-            &self.config.cert_path,
-            &self.config.key_path,
-        )?;
-
+    pub async fn run(&mut self) -> Result<()> {
         // Channel for sending UDP packets
         let (tx_quic_to_udp, mut rx_quic_to_udp) =
             mpsc::channel::<UdpPacket>(MAIN_CHANNEL_CAPACITY);
 
         let mut buf = [0; UDP_PACKET_BUFFER_SIZE];
-        let mut next_client = 0u32;
 
         if self.config.listen.isd_asn() == IsdAsn::WILDCARD {
             let local_addr = self
@@ -97,7 +99,7 @@ impl Proxy {
                             src,
                         );
                         debug!("received {} bytes on socket from {}", len, src);
-                        self.handle_udp_packet(&mut buf, len, src, src_scion, local_addr, self.config.listen, &tx_quic_to_udp, &mut quic_config, &mut next_client).await?;
+                        self.handle_udp_packet(&mut buf[..len], src, src_scion, local_addr, self.config.listen, &tx_quic_to_udp).await?;
                     }
 
                     // Send QUIC packets over UDP socket
@@ -181,7 +183,7 @@ impl Proxy {
                             }
                         };
                         debug!("received {} bytes on socket from {}", len, src);
-                        self.handle_udp_packet(&mut buf, len, src_ip_addr, src, local_addr, local_scion_addr, &tx_quic_to_udp, &mut quic_config, &mut next_client).await?;
+                        self.handle_udp_packet(&mut buf[..len], src_ip_addr, src, local_addr, local_scion_addr, &tx_quic_to_udp).await?;
                     }
 
                     // Send QUIC packets over UDP socket
@@ -195,19 +197,16 @@ impl Proxy {
     }
 
     async fn handle_udp_packet(
-        &self,
+        &mut self,
         buf: &mut [u8],
-        len: usize,
         src_ip_socket: std::net::SocketAddr,
         src_scion_socket: scion_proto::address::SocketAddr,
         local_ip_socket: std::net::SocketAddr,
         local_scion_socket: scion_proto::address::SocketAddr,
         tx_quic_to_udp: &mpsc::Sender<UdpPacket>,
-        quic_config: &mut quiche::Config,
-        next_client: &mut u32,
     ) -> Result<()> {
         // Parse the QUIC packet header to identify connection
-        let hdr = match quiche::Header::from_slice(&mut buf[..len], quiche::MAX_CONN_ID_LEN) {
+        let hdr = match quiche::Header::from_slice(buf, quiche::MAX_CONN_ID_LEN) {
             Ok(v) => v,
             Err(e) => {
                 warn!("failed to parse header: {:?}", e);
@@ -230,7 +229,7 @@ impl Proxy {
         if let Some(client_conn) = client_conn_sender {
             // Forward to existing connection task
             match client_conn.sender.try_send(UdpPacket {
-                data: buf[..len].to_vec(),
+                data: buf.to_vec(),
                 src: src_scion_socket,
                 dst: local_scion_socket,
             }) {
@@ -353,7 +352,7 @@ impl Proxy {
                 odcid.as_ref(),
                 local_ip_socket,
                 src_ip_socket,
-                quic_config,
+                &mut self.quic_config,
             ) {
                 Ok(c) => c,
                 Err(e) => {
@@ -368,7 +367,7 @@ impl Proxy {
                 to: local_ip_socket,
             };
 
-            match conn.recv(&mut buf[..len], recv_info) {
+            match conn.recv(buf, recv_info) {
                 Ok(len) => {
                     debug!("processed initial packet {} bytes", len);
                 }
@@ -386,8 +385,8 @@ impl Proxy {
                 mpsc::channel::<UdpPacket>(CLIENT_CHANNEL_CAPACITY);
 
             // Allocate TUN name for this client
-            let tun_name = format!("tun{}", next_client);
-            *next_client += 1;
+            let tun_name = format!("tun{}", self.next_client);
+            self.next_client += 1;
 
             // Store connection info
             let mut client_conn = Connection::new(

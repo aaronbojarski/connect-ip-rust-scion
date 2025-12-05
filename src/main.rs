@@ -158,7 +158,7 @@ async fn run_proxy(opt: ProxyOpt) -> Result<(), anyhow::Error> {
         address_pool: opt.address_pool,
         tun_mtu: opt.mtu,
     };
-    let proxy = connect_ip_rust_scion::proxy::Proxy::new(config);
+    let mut proxy = connect_ip_rust_scion::proxy::Proxy::new(config)?;
     proxy.run().await?;
     Ok(())
 }
