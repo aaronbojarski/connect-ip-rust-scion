@@ -41,6 +41,7 @@ pub enum Capsule {
 }
 
 impl Capsule {
+    /// Parse a capsule from octets
     pub fn parse(octets: &mut octets::Octets) -> CapsuleResult<Capsule> {
         let capsule_type = octets.get_varint()?;
 
@@ -74,29 +75,30 @@ impl Capsule {
         Ok(capsule)
     }
 
+    /// Append the capsule to octets
     pub fn append(&self, octets: &mut octets::OctetsMut) -> CapsuleResult<()> {
         match self {
             Capsule::Datagram(capsule) => {
                 octets.put_varint(CapsuleType::Datagram as u64)?;
-                let len = capsule.len();
+                let len = capsule.wire_len();
                 octets.put_varint(len as u64)?;
                 capsule.append(octets)?;
             }
             Capsule::AddressAssign(capsule) => {
                 octets.put_varint(CapsuleType::AddressAssign as u64)?;
-                let len = capsule.len();
+                let len = capsule.wire_len();
                 octets.put_varint(len as u64)?;
                 capsule.append(octets)?;
             }
             Capsule::AddressRequest(capsule) => {
                 octets.put_varint(CapsuleType::AddressRequest as u64)?;
-                let len = capsule.len();
+                let len = capsule.wire_len();
                 octets.put_varint(len as u64)?;
                 capsule.append(octets)?;
             }
             Capsule::RouteAdvertisement(capsule) => {
                 octets.put_varint(CapsuleType::RouteAdvertisement as u64)?;
-                let len = capsule.len();
+                let len = capsule.wire_len();
                 octets.put_varint(len as u64)?;
                 capsule.append(octets)?;
             }
@@ -111,17 +113,20 @@ pub struct DatagramCapsule {
 }
 
 impl DatagramCapsule {
+    /// Parse a DatagramCapsule from octets
     pub fn parse(octets: &mut octets::Octets) -> CapsuleResult<DatagramCapsule> {
         let data = octets.get_bytes(octets.cap())?.to_vec();
         Ok(DatagramCapsule { data })
     }
 
+    /// Append the DatagramCapsule to octets
     pub fn append(&self, octets: &mut octets::OctetsMut) -> CapsuleResult<()> {
         octets.put_bytes(&self.data)?;
         Ok(())
     }
 
-    pub fn len(&self) -> usize {
+    /// Calculate the wire length of the DatagramCapsule
+    pub fn wire_len(&self) -> usize {
         self.data.len()
     }
 }
@@ -133,6 +138,7 @@ pub struct AssignedAddress {
 }
 
 impl AssignedAddress {
+    /// Parse an AssignedAddress from octets
     pub fn parse(octets: &mut octets::Octets) -> CapsuleResult<AssignedAddress> {
         let request_id = octets.get_varint()?;
 
@@ -157,6 +163,7 @@ impl AssignedAddress {
         Ok(AssignedAddress { request_id, ip_net })
     }
 
+    /// Append the AssignedAddress to octets
     pub fn append(&self, octets: &mut octets::OctetsMut) -> CapsuleResult<()> {
         octets.put_varint(self.request_id)?;
 
@@ -175,7 +182,8 @@ impl AssignedAddress {
         Ok(())
     }
 
-    pub fn len(&self) -> usize {
+    /// Calculate the wire length of the AssignedAddress
+    pub fn wire_len(&self) -> usize {
         let addr_len = match self.ip_net.addr() {
             IpAddr::V4(_) => 4,
             IpAddr::V6(_) => 16,
@@ -190,10 +198,7 @@ pub struct AddressAssignCapsule {
 }
 
 impl AddressAssignCapsule {
-    pub fn new(addresses: Vec<AssignedAddress>) -> Self {
-        AddressAssignCapsule { addresses }
-    }
-
+    /// Parse an AddressAssignCapsule from octets
     pub fn parse(octets: &mut octets::Octets) -> CapsuleResult<AddressAssignCapsule> {
         let mut addresses = Vec::new();
         while octets.cap() > 0 {
@@ -203,6 +208,7 @@ impl AddressAssignCapsule {
         Ok(AddressAssignCapsule { addresses })
     }
 
+    /// Append the AddressAssignCapsule to octets
     pub fn append(&self, octets: &mut octets::OctetsMut) -> CapsuleResult<()> {
         for address in &self.addresses {
             address.append(octets)?;
@@ -210,8 +216,9 @@ impl AddressAssignCapsule {
         Ok(())
     }
 
-    pub fn len(&self) -> usize {
-        self.addresses.iter().map(|addr| addr.len()).sum()
+    /// Calculate the wire length of the AddressAssignCapsule
+    pub fn wire_len(&self) -> usize {
+        self.addresses.iter().map(|addr| addr.wire_len()).sum()
     }
 }
 
@@ -222,6 +229,7 @@ pub struct RequestedAddress {
 }
 
 impl RequestedAddress {
+    /// Parse a RequestedAddress from octets
     pub fn parse(octets: &mut octets::Octets) -> CapsuleResult<RequestedAddress> {
         let request_id = octets.get_varint()?;
 
@@ -246,6 +254,7 @@ impl RequestedAddress {
         Ok(RequestedAddress { request_id, ip_net })
     }
 
+    /// Append the RequestedAddress to octets
     pub fn append(&self, octets: &mut octets::OctetsMut) -> CapsuleResult<()> {
         octets.put_varint(self.request_id)?;
 
@@ -264,7 +273,8 @@ impl RequestedAddress {
         Ok(())
     }
 
-    pub fn len(&self) -> usize {
+    /// Calculate the wire length of the RequestedAddress
+    pub fn wire_len(&self) -> usize {
         let addr_len = match self.ip_net.addr() {
             IpAddr::V4(_) => 4,
             IpAddr::V6(_) => 16,
@@ -279,6 +289,7 @@ pub struct AddressRequestCapsule {
 }
 
 impl AddressRequestCapsule {
+    /// Parse an AddressRequestCapsule from octets
     pub fn parse(octets: &mut octets::Octets) -> CapsuleResult<AddressRequestCapsule> {
         let mut addresses = Vec::new();
         while octets.cap() > 0 {
@@ -288,6 +299,7 @@ impl AddressRequestCapsule {
         Ok(AddressRequestCapsule { addresses })
     }
 
+    /// Append the AddressRequestCapsule to octets
     pub fn append(&self, octets: &mut octets::OctetsMut) -> CapsuleResult<()> {
         for address in &self.addresses {
             address.append(octets)?;
@@ -295,8 +307,9 @@ impl AddressRequestCapsule {
         Ok(())
     }
 
-    pub fn len(&self) -> usize {
-        self.addresses.iter().map(|addr| addr.len()).sum()
+    /// Calculate the wire length of the AddressRequestCapsule
+    pub fn wire_len(&self) -> usize {
+        self.addresses.iter().map(|addr| addr.wire_len()).sum()
     }
 }
 
@@ -307,6 +320,7 @@ pub struct RouteAdvertisement {
 }
 
 impl RouteAdvertisement {
+    /// Parse a RouteAdvertisement from octets
     pub fn parse(octets: &mut octets::Octets) -> CapsuleResult<RouteAdvertisement> {
         let ip_version = octets.get_u8()?;
 
@@ -339,6 +353,7 @@ impl RouteAdvertisement {
         Ok(RouteAdvertisement { ip_net, proto })
     }
 
+    /// Append the RouteAdvertisement to octets
     pub fn append(&self, octets: &mut octets::OctetsMut) -> CapsuleResult<()> {
         let start = self.ip_net.network();
         let end = self.ip_net.broadcast();
@@ -362,7 +377,8 @@ impl RouteAdvertisement {
         Ok(())
     }
 
-    pub fn len(&self) -> usize {
+    /// Calculate the wire length of the RouteAdvertisement
+    pub fn wire_len(&self) -> usize {
         let addr_len = match self.ip_net.addr() {
             IpAddr::V4(_) => 4,
             IpAddr::V6(_) => 16,
@@ -377,6 +393,7 @@ pub struct RouteAdvertisementCapsule {
 }
 
 impl RouteAdvertisementCapsule {
+    /// Parse a RouteAdvertisementCapsule from octets
     pub fn parse(octets: &mut octets::Octets) -> CapsuleResult<RouteAdvertisementCapsule> {
         let mut routes = Vec::new();
         while octets.cap() > 0 {
@@ -386,6 +403,7 @@ impl RouteAdvertisementCapsule {
         Ok(RouteAdvertisementCapsule { routes })
     }
 
+    /// Append the RouteAdvertisementCapsule to octets
     pub fn append(&self, octets: &mut octets::OctetsMut) -> CapsuleResult<()> {
         for route in &self.routes {
             route.append(octets)?;
@@ -393,8 +411,9 @@ impl RouteAdvertisementCapsule {
         Ok(())
     }
 
-    pub fn len(&self) -> usize {
-        self.routes.iter().map(|route| route.len()).sum()
+    /// Calculate the wire length of the RouteAdvertisementCapsule
+    pub fn wire_len(&self) -> usize {
+        self.routes.iter().map(|route| route.wire_len()).sum()
     }
 }
 
@@ -415,7 +434,9 @@ mod tests {
                     .unwrap(),
             },
         ];
-        let capsule = AddressAssignCapsule::new(addresses.clone());
+        let capsule = AddressAssignCapsule {
+            addresses: addresses.clone(),
+        };
         let mut buf = vec![0u8; 1000];
         let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
         capsule.append(&mut octets_mut).unwrap();

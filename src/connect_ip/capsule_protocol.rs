@@ -207,7 +207,7 @@ pub async fn handle_capsule_data(
                 addresses: assigned_addresses,
             };
 
-            let mut buf = vec![0u8; address_assign_capsule.len() + 16];
+            let mut buf = vec![0u8; address_assign_capsule.wire_len() + 16];
             let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
 
             let capsule = Capsule::AddressAssign(address_assign_capsule);
