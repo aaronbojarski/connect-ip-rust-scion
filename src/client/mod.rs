@@ -71,7 +71,10 @@ impl Client {
             let local_addr = socket.local_addr()?;
 
             let mut connection = Connection::new(
-                self.config.host.clone().unwrap_or("localhost".to_string()),
+                self.config
+                    .host
+                    .clone()
+                    .unwrap_or("connect-ip-rust-scion".to_string()),
                 quic_config,
                 scion_proto::address::SocketAddr::from_std(IsdAsn::WILDCARD, local_addr),
                 self.config.remote,
@@ -155,7 +158,7 @@ impl Client {
             }
             let client_network_stack = builder.build().await?;
 
-            // Since we did not request a specific address, the SNAP will assign one
+            // When using SNAP, we will get an address assigned.
             let assigned_addr = client_network_stack
                 .local_addresses()
                 .first()
@@ -163,6 +166,8 @@ impl Client {
                 .context("client did not get any address assigned")?;
 
             let socket_address = scion_proto::address::SocketAddr::new(assigned_addr.into(), 10111);
+            info!("client SCION address: {}", socket_address);
+
             let mut socket_config = scion_stack::scionstack::SocketConfig::new();
             if let Some(policy) = &self.config.acl_policy {
                 info!("Using ACL policy: {:?}", policy);

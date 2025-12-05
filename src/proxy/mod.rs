@@ -136,6 +136,13 @@ impl Proxy {
                 .context("proxy did not get any address assigned")?;
 
             let socket_address = scion_proto::address::SocketAddr::new(proxy_addr.into(), 4433);
+            info!("proxy listening on: {}", socket_address);
+            if socket_address != self.config.listen {
+                warn!(
+                    "requested listening SCION address {} does not match assigned address {}",
+                    self.config.listen, socket_address
+                );
+            }
 
             let mut socket_config = scion_stack::scionstack::SocketConfig::new();
             if let Some(policy) = &self.config.acl_policy {
