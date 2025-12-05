@@ -10,11 +10,14 @@ use tun_rs::DeviceBuilder;
 
 use crate::net::{add_route, remove_route};
 
-pub enum AddressUpdate {
+pub const MAX_TUN_MTU: usize = 9000;
+
+pub enum TunConfiguration {
     AddAddress(IpNet),
     RemoveAddress(IpNet),
     AddRoute(IpNet),
     RemoveRoute(IpNet),
+    SetMTU(u16),
 }
 
 pub struct Tun {
@@ -37,7 +40,7 @@ impl Tun {
     pub async fn start(
         &mut self,
         mut rx_in_tun: Receiver<Vec<u8>>,
-        mut rx_address_updates: Receiver<AddressUpdate>,
+        mut rx_address_updates: Receiver<TunConfiguration>,
         cancel_token: CancellationToken,
     ) -> Result<()> {
         let dev = DeviceBuilder::new()
@@ -51,7 +54,7 @@ impl Tun {
         let handle = tokio::spawn(
             async move {
                 let result: Result<()> = async {
-                    let mut buf = vec![0; 65536];
+                    let mut buf = [0; 65536];
                     loop {
                         tokio::select! {
                             // Check for cancellation signal
@@ -63,7 +66,7 @@ impl Tun {
                             // Handle address updates
                             Some(update) = rx_address_updates.recv() => {
                                 match update {
-                                    AddressUpdate::AddAddress(ipnet) => {
+                                    TunConfiguration::AddAddress(ipnet) => {
                                         match ipnet.addr() {
                                             IpAddr::V4(address) => {
                                                 dev.add_address_v4(address, ipnet.prefix_len())?;
@@ -74,11 +77,11 @@ impl Tun {
                                         }
                                         debug!("Added address {} to TUN device {}", ipnet, name);
                                     }
-                                    AddressUpdate::RemoveAddress(ipnet) => {
+                                    TunConfiguration::RemoveAddress(ipnet) => {
                                         dev.remove_address(ipnet.addr())?;
                                         debug!("Removed address {} from TUN device {}", ipnet, name);
                                     }
-                                    AddressUpdate::AddRoute(ipnet) => {
+                                    TunConfiguration::AddRoute(ipnet) => {
                                         match add_route(&ipnet, &name) {
                                             Ok(true) => {
                                                 debug!("Added route {} via TUN device {}", ipnet, name);
@@ -91,11 +94,18 @@ impl Tun {
                                             }
                                         }
                                     }
-                                    AddressUpdate::RemoveRoute(ipnet) => {
+                                    TunConfiguration::RemoveRoute(ipnet) => {
                                         if let Err(e) = remove_route(&ipnet, &name) {
                                             error!("Failed to remove route {}: {}", ipnet, e);
                                         } else {
                                             debug!("Removed route {} via TUN device {}", ipnet, name);
+                                        }
+                                    }
+                                    TunConfiguration::SetMTU(mtu) => {
+                                        if let Err(e) = dev.set_mtu(mtu) {
+                                            error!("Failed to set MTU {} on TUN device {}: {}", mtu, name, e);
+                                        } else {
+                                            debug!("Set MTU {} on TUN device {}", mtu, name);
                                         }
                                     }
                                 }
@@ -104,7 +114,16 @@ impl Tun {
                             // Read from TUN device and send to main task
                             len = dev.recv(&mut buf) => {
                                 let len = len?;
-                                tx_tun_to_quic.send(buf[..len].to_vec()).await.context("failed to send on TUN to QUIC channel")?;
+                                match tx_tun_to_quic.try_send(buf[..len].to_vec()) {
+                                    Ok(_) => {}
+                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                        debug!("TUN to QUIC channel full, dropping packet from TUN device {}", name);
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to send packet from TUN device {}: {}, shutting down", name, e);
+                                        break;
+                                    }
+                                }
                             }
 
                             // Receive from main task and write to TUN device

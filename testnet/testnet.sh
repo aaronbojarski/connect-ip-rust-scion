@@ -58,7 +58,7 @@ function net_up() {
 
 	sudo ip -n $nodexns link set dev lo up
 
-	sudo ip -n $ehxns link set dev $ehx mtu 1420
+	sudo ip -n $ehxns link set dev $ehx mtu 1500
 
 	sudo ip -n $ehxns route add default via $nodex0_address
 }

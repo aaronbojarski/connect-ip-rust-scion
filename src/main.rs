@@ -32,6 +32,10 @@ struct ProxyOpt {
     #[clap(long = "endhost-api")]
     endhost_api_address: Option<Url>,
 
+    /// Path to the Snap token file for authentication with the endhost API
+    #[clap(long = "snap-token", value_name = "FILE")]
+    snap_token_path: Option<PathBuf>,
+
     /// CA certificate used to verify peers
     #[clap(long = "ca-cert", value_name = "FILE", default_value = "ca-cert.pem")]
     ca_cert_path: PathBuf,
@@ -51,6 +55,10 @@ struct ProxyOpt {
     /// Address pool to assign addresses to clients from
     #[clap(long, required = true)]
     address_pool: Vec<IpNet>,
+
+    /// MTU for the interface
+    #[clap(long, default_value = "1500")]
+    mtu: u16,
 
     /// Tracing level (trace, debug, info, warn, error)
     #[clap(long = "log", default_value = "info")]
@@ -102,6 +110,10 @@ struct ClientOpt {
     #[clap(long = "tun", default_value = "tun0")]
     tun_name: String,
 
+    /// MTU for the interface
+    #[clap(long, default_value = "1500")]
+    mtu: u16,
+
     /// Tracing level (trace, debug, info, warn, error)
     #[clap(long = "log", default_value = "info")]
     log_level: tracing::Level,
@@ -128,11 +140,13 @@ async fn run_proxy(opt: ProxyOpt) -> Result<(), anyhow::Error> {
     let config = connect_ip_rust_scion::proxy::ProxyConfig {
         listen: opt.listen,
         endhost_api_address: opt.endhost_api_address,
+        snap_token_path: opt.snap_token_path,
         ca_cert_path: opt.ca_cert_path,
         cert_path: opt.cert_path,
         key_path: opt.key_path,
         routes: opt.routes,
         address_pool: opt.address_pool,
+        tun_mtu: opt.mtu,
     };
     let proxy = connect_ip_rust_scion::proxy::Proxy::new(config);
     proxy.run().await?;
@@ -157,6 +171,7 @@ async fn run_client(opt: ClientOpt) -> Result<(), anyhow::Error> {
         routes: opt.routes,
         address_pool: opt.address_pool,
         tun_name: opt.tun_name,
+        tun_mtu: opt.mtu,
     };
     let client = connect_ip_rust_scion::client::Client::new(config);
     client.run().await?;

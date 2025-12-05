@@ -1,20 +1,23 @@
 use anyhow::{Result, anyhow};
 use ipnet::IpNet;
 use octets::Octets;
+use pnet::packet::ipv4::Ipv4Packet;
+use pnet::packet::ipv6::Ipv6Packet;
+use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::connect_ip::capsule::{
     AddressAssignCapsule, AssignedAddress, Capsule, RouteAdvertisement, RouteAdvertisementCapsule,
 };
 use crate::net::{
-    ZERO_IPV4_ADDRESS, ZERO_IPV6_ADDRESS, get_next_avail_subnet, get_specific_subnet, is_ipv4,
-    is_zero_address, tun,
+    ZERO_IPV4_ADDRESS, ZERO_IPV6_ADDRESS, check_packet_src_dst, get_next_avail_subnet,
+    get_specific_subnet, is_ipv4, is_zero_address, tun,
 };
 
-/// State for the capsule protocol.
-pub struct CapsuleProtocolState {
+/// Addresses and routes negotiated through capsule protocol.
+pub struct RoutingState {
     pub stream_id: Option<u64>,
     /// addresses we assign to the peer
     pub remote_addresses: Vec<IpNet>,
@@ -30,31 +33,92 @@ pub struct CapsuleProtocolState {
 pub async fn handle_capsule_data(
     stream_id: u64,
     data: &[u8],
-    state: &mut CapsuleProtocolState,
-    conn: &mut quiche::Connection,
-    h3_conn: &mut Option<quiche::h3::Connection>,
+    state: &mut RoutingState,
     available_addresses: &Arc<Mutex<Vec<IpNet>>>,
-    tx_address_updates: &mpsc::Sender<tun::AddressUpdate>,
+    tx_tun_configuration: &mpsc::Sender<tun::TunConfiguration>,
+    tx_quic_to_tun: &mpsc::Sender<Vec<u8>>,
+    send_stream_buffer: &mut Vec<u8>,
 ) -> Result<usize> {
     if state.stream_id != Some(stream_id) {
-        warn!(
-            "{} received capsule data on unknown stream id {}",
-            conn.trace_id(),
-            stream_id
-        );
+        warn!("received capsule data on unknown stream id {}", stream_id);
         return Err(anyhow!("unknown stream id"));
     }
 
     // parse capsule data here
     let mut octets = Octets::with_slice(data);
     let capsule = Capsule::parse(&mut octets)?;
+    let len = octets.off();
     match capsule {
+        Capsule::Datagram(datagram_capsule) => {
+            trace!("received Datagram capsule: {:?}", datagram_capsule);
+            // Handle the datagram data as needed
+            debug!(
+                "received datagram of length {} bytes",
+                datagram_capsule.data.len()
+            );
+            let mut octets = Octets::with_slice(&datagram_capsule.data);
+
+            // The datagram format is:
+            // - varint: context_id (must be 0)
+            // - bytes: IP packet
+            let context_id = octets.get_varint()?;
+            let packet_start = octets.off();
+
+            if context_id != 0 {
+                error!("received datagram with unknown context id {}", context_id);
+                return Ok(len);
+            }
+
+            let (src, dst) = if let Some(ipv4) =
+                Ipv4Packet::new(&datagram_capsule.data[packet_start..])
+                && ipv4.get_version() == 4
+            {
+                (
+                    IpAddr::V4(ipv4.get_source()),
+                    IpAddr::V4(ipv4.get_destination()),
+                )
+            } else if let Some(ipv6) = Ipv6Packet::new(&datagram_capsule.data[packet_start..]) {
+                (
+                    IpAddr::V6(ipv6.get_source()),
+                    IpAddr::V6(ipv6.get_destination()),
+                )
+            } else {
+                error!("received non-IP packet in datagram, dropping");
+                return Ok(len);
+            };
+
+            debug!(
+                "received IP packet from QUIC connection: {} -> {}, {} bytes",
+                src,
+                dst,
+                datagram_capsule.data.len() - packet_start
+            );
+
+            if check_packet_src_dst(
+                src,
+                dst,
+                &state.remote_addresses,
+                &state.remote_routes,
+                &state.local_addresses,
+                &state.local_routes,
+            ) {
+                tx_quic_to_tun
+                    .send(datagram_capsule.data[packet_start..].to_vec())
+                    .await?;
+            } else {
+                debug!(
+                    "dropping packet from peer with invalid src/dst: {} -> {}",
+                    src, dst
+                );
+            }
+        }
+
         Capsule::AddressAssign(assign_capsule) => {
             debug!("received AddressAssign capsule: {:?}", assign_capsule);
             // Remove old addresses as they are no longer valid
             for addr in state.local_addresses.iter() {
-                tx_address_updates
-                    .send(tun::AddressUpdate::RemoveAddress(*addr))
+                tx_tun_configuration
+                    .send(tun::TunConfiguration::RemoveAddress(*addr))
                     .await?;
             }
             state.local_addresses.clear();
@@ -66,8 +130,8 @@ pub async fn handle_capsule_data(
                     continue;
                 }
                 info!("received address from peer: {}", assigned_address.ip_net);
-                tx_address_updates
-                    .send(tun::AddressUpdate::AddAddress(assigned_address.ip_net))
+                tx_tun_configuration
+                    .send(tun::TunConfiguration::AddAddress(assigned_address.ip_net))
                     .await?;
                 state.local_addresses.push(assigned_address.ip_net);
             }
@@ -78,8 +142,8 @@ pub async fn handle_capsule_data(
                 .iter()
                 .chain(state.remote_routes.iter())
             {
-                tx_address_updates
-                    .send(tun::AddressUpdate::AddRoute(*route))
+                tx_tun_configuration
+                    .send(tun::TunConfiguration::AddRoute(*route))
                     .await?;
             }
         }
@@ -115,8 +179,8 @@ pub async fn handle_capsule_data(
                     };
                     assigned_addresses.push(assigned_address);
 
-                    tx_address_updates
-                        .send(tun::AddressUpdate::AddRoute(assigned_subnet))
+                    tx_tun_configuration
+                        .send(tun::TunConfiguration::AddRoute(assigned_subnet))
                         .await?;
                     state.remote_addresses.push(assigned_subnet);
                 } else {
@@ -149,10 +213,7 @@ pub async fn handle_capsule_data(
             let capsule = Capsule::AddressAssign(address_assign_capsule);
             capsule.append(&mut octets_mut)?;
             let payload_len = octets_mut.off();
-            h3_conn
-                .as_mut()
-                .unwrap()
-                .send_body(conn, stream_id, &buf[..payload_len], false)?;
+            send_stream_buffer.extend_from_slice(&buf[..payload_len]);
         }
         Capsule::RouteAdvertisement(route_capsule) => {
             debug!("received RouteAdvertisement capsule: {:?}", route_capsule);
@@ -160,8 +221,8 @@ pub async fn handle_capsule_data(
 
             // remove old routes
             for route in state.remote_routes.iter() {
-                tx_address_updates
-                    .send(tun::AddressUpdate::RemoveRoute(*route))
+                tx_tun_configuration
+                    .send(tun::TunConfiguration::RemoveRoute(*route))
                     .await?;
             }
             state.remote_routes.clear();
@@ -169,8 +230,8 @@ pub async fn handle_capsule_data(
             // add new routes
             for route in route_capsule.routes {
                 info!("received route advertisement from peer: {}", route.ip_net);
-                tx_address_updates
-                    .send(tun::AddressUpdate::AddRoute(route.ip_net))
+                tx_tun_configuration
+                    .send(tun::TunConfiguration::AddRoute(route.ip_net))
                     .await?;
 
                 state.remote_routes.push(route.ip_net);
@@ -178,17 +239,17 @@ pub async fn handle_capsule_data(
         }
     }
 
-    Ok(octets.off())
+    Ok(len)
 }
 
 pub async fn prepare_address_and_route_assignment<'a>(
-    state: &mut CapsuleProtocolState,
+    state: &mut RoutingState,
     available_addresses: Arc<Mutex<Vec<IpNet>>>,
     octets: &mut octets::OctetsMut<'a>,
 ) -> Result<Option<IpNet>> {
     let mut assigned_address = None;
 
-    // Assign a /32 address from the address pool to peer
+    // Assign a /128 IPv6 or /32 IPv4 address from the address pool to peer
     let mut assigned_addresses = vec![];
     if let Some(addr) = get_next_avail_subnet(&available_addresses, false, 128)
         .await
