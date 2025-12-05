@@ -1,6 +1,7 @@
 use anyhow::anyhow;
 use clap::{Args, Parser, Subcommand};
 use ipnet::IpNet;
+use scion_proto::path::policy::acl::AclPolicy;
 use std::path::PathBuf;
 use url::Url;
 
@@ -35,6 +36,10 @@ struct ProxyOpt {
     /// Path to the Snap token file for authentication with the endhost API
     #[clap(long = "snap-token", value_name = "FILE")]
     snap_token_path: Option<PathBuf>,
+
+    /// ACL policy to filter SCION paths
+    #[clap(long = "acl", allow_hyphen_values = true)]
+    acl: Option<AclPolicy>,
 
     /// CA certificate used to verify peers
     #[clap(long = "ca-cert", value_name = "FILE", default_value = "ca-cert.pem")]
@@ -85,6 +90,10 @@ struct ClientOpt {
     /// Path to the Snap token file for authentication with the endhost API
     #[clap(long = "snap-token", value_name = "FILE")]
     snap_token_path: Option<PathBuf>,
+
+    /// ACL policy to filter SCION paths
+    #[clap(long = "acl", allow_hyphen_values = true)]
+    acl: Option<AclPolicy>,
 
     /// Routes to advertise to the proxy (repeat --routes for each CIDR, e.g. 192.0.2.0/24)
     #[clap(long)]
@@ -141,6 +150,7 @@ async fn run_proxy(opt: ProxyOpt) -> Result<(), anyhow::Error> {
         listen: opt.listen,
         endhost_api_address: opt.endhost_api_address,
         snap_token_path: opt.snap_token_path,
+        acl_policy: opt.acl,
         ca_cert_path: opt.ca_cert_path,
         cert_path: opt.cert_path,
         key_path: opt.key_path,
@@ -165,6 +175,7 @@ async fn run_client(opt: ClientOpt) -> Result<(), anyhow::Error> {
         host: opt.host,
         endhost_api_address: opt.endhost_api_address,
         snap_token_path: opt.snap_token_path,
+        acl_policy: opt.acl,
         ca_cert_path: opt.ca_cert_path,
         cert_path: opt.cert_path,
         key_path: opt.key_path,

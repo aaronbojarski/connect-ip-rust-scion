@@ -4,6 +4,7 @@ use anyhow::{Context, Result, anyhow};
 use ipnet::IpNet;
 use ring::rand::SystemRandom;
 use scion_proto::address::IsdAsn;
+use scion_proto::path::policy::acl::AclPolicy;
 use scion_stack::scionstack::ScionStackBuilder;
 use std::collections::HashMap;
 use std::fs;
@@ -27,6 +28,7 @@ pub struct ProxyConfig {
     pub listen: scion_proto::address::SocketAddr,
     pub endhost_api_address: Option<url::Url>,
     pub snap_token_path: Option<std::path::PathBuf>,
+    pub acl_policy: Option<AclPolicy>,
     pub ca_cert_path: std::path::PathBuf,
     pub cert_path: std::path::PathBuf,
     pub key_path: std::path::PathBuf,
@@ -96,7 +98,7 @@ impl Proxy {
                         let dst = if let Some(addr) = packet_data.dst.local_address() {
                             addr
                         } else {
-                            warn!("Could not get destination address from SCION SocketAddr. Skipping packet.");
+                            warn!("Invalid destination address. Skipping packet. {}", packet_data.dst);
                             continue;
                         };
                         socket.send_to(&packet_data.data, dst).await?;
@@ -135,7 +137,17 @@ impl Proxy {
 
             let socket_address = scion_proto::address::SocketAddr::new(proxy_addr.into(), 4433);
 
-            let socket = scion_network_stack.bind(Some(socket_address)).await?;
+            let mut socket_config = scion_stack::scionstack::SocketConfig::new();
+            if let Some(policy) = &self.config.acl_policy {
+                info!("Using ACL policy: {:?}", policy);
+                socket_config = socket_config.with_path_policy(policy.clone());
+            } else {
+                info!("No ACL policy specified, using default (allow all)");
+            }
+
+            let socket = scion_network_stack
+                .bind_with_config(Some(socket_address), socket_config)
+                .await?;
 
             let local_scion_addr = socket.local_addr();
             info!("listening on {}", local_scion_addr);
