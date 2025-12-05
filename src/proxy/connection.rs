@@ -19,7 +19,7 @@ use crate::connect_ip::capsule_protocol::{
 use crate::connect_ip::request::{build_response, headers_to_strings};
 use crate::net::quic::{DEFAULT_TIMEOUT, KEEPALIVE_INTERVAL, MAX_DATAGRAM_SIZE};
 use crate::net::tun::MAX_TUN_MTU;
-use crate::net::{UdpPacket, check_packet_src_dst, return_subnet, tun};
+use crate::net::{UdpPacket, check_packet_src_dst, tun};
 use crate::proxy::CLIENT_CHANNEL_CAPACITY;
 
 const SEND_BUFFER_SIZE: usize = 65535; // bytes
@@ -44,7 +44,7 @@ pub struct Connection {
     partial_responses: HashMap<u64, PartialResponse>,
     assign_addresses_and_routes_done: bool,
     client_cert_timer: std::time::Instant,
-    capsule_state: RoutingState,
+    pub capsule_state: RoutingState,
     remaining_data: Vec<u8>,
     remaining_sending_data: Vec<u8>,
 }
@@ -88,7 +88,7 @@ impl Connection {
         }
     }
 
-    pub async fn handle_client_connection(mut self) -> Result<()> {
+    pub async fn handle_client_connection(&mut self) -> Result<()> {
         let mut buf = [0; MAX_DATAGRAM_SIZE];
 
         // Send initial response packets
@@ -257,12 +257,6 @@ impl Connection {
         // Wait for TUN task to finish with timeout
         if let Some(tun_handle) = tun.handle {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(2), tun_handle).await;
-        }
-
-        // TODO: return addresses also if connection fails before releasing them
-        for addr in self.capsule_state.remote_addresses.iter() {
-            info!("Releasing address {}", addr);
-            return_subnet(&self.available_addresses, *addr).await;
         }
 
         Ok(())

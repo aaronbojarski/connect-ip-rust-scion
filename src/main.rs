@@ -54,7 +54,7 @@ struct ProxyOpt {
     key_path: PathBuf,
 
     /// Routes to advertise to clients
-    #[clap(long, required = true)]
+    #[clap(long)]
     routes: Vec<IpNet>,
 
     /// Address pool to assign addresses to clients from
@@ -75,7 +75,7 @@ struct ClientOpt {
     /// Address of proxy to connect to (e.g. [0-0,proxy.example.com]:4433)
     remote: scion_proto::address::SocketAddr,
 
-    /// Override hostname used for certificate verification (defaults to the host from --url)
+    /// Hostname used for certificate verification
     #[clap(long = "host")]
     host: Option<String>,
 

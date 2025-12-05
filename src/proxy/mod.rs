@@ -14,8 +14,8 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::instrument::Instrument;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::net::UdpPacket;
 use crate::net::quic::MAX_DATAGRAM_SIZE;
+use crate::net::{UdpPacket, return_subnet};
 use crate::proxy::connection::Connection;
 
 const TOKEN_PREFIX: &[u8] = b"connect-ip-rust-scion";
@@ -128,7 +128,6 @@ impl Proxy {
                 .await
                 .context("error building proxy SCION stack")?;
 
-            // TODO: Check how address selection is handled with Udp Underlay
             let proxy_addr = scion_network_stack
                 .local_addresses()
                 .first()
@@ -381,7 +380,7 @@ impl Proxy {
             *next_client += 1;
 
             // Store connection info
-            let client_conn = Connection::new(
+            let mut client_conn = Connection::new(
                 conn,
                 scid.clone().into_owned(),
                 local_scion_socket.isd_asn(),
@@ -401,6 +400,7 @@ impl Proxy {
             // Spawn task for this connection
             let scid_owned = scid.clone().into_owned();
             let connections_clone = self.connections.clone();
+            let available_nets = self.available_addresses.clone();
             tokio::spawn(async move {
                 if let Err(e) = client_conn
                     .handle_client_connection()
@@ -410,6 +410,10 @@ impl Proxy {
                     error!("connection {:?} error: {:?}", scid_owned, e);
                 }
                 connections_clone.lock().await.remove(&scid_owned);
+                for addr in client_conn.capsule_state.remote_addresses.iter() {
+                    info!("Releasing address {}", addr);
+                    return_subnet(&available_nets, *addr).await;
+                }
             });
         } else {
             debug!("packet for unknown connection with dcid {:?}", hdr.dcid);
