@@ -1,8 +1,9 @@
+use std::path::PathBuf;
+
 use anyhow::anyhow;
 use clap::{Args, Parser, Subcommand};
 use ipnet::IpNet;
 use scion_proto::path::policy::acl::AclPolicy;
-use std::path::PathBuf;
 use url::Url;
 
 #[derive(Parser, Debug)]

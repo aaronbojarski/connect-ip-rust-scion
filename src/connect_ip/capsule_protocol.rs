@@ -1,16 +1,19 @@
+use std::net::IpAddr;
+use std::sync::Arc;
+
 use anyhow::{Result, anyhow};
 use ipnet::IpNet;
 use octets::Octets;
 use pnet::packet::ipv4::Ipv4Packet;
 use pnet::packet::ipv6::Ipv6Packet;
-use std::net::IpAddr;
-use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::connect_ip::capsule::{
     AddressAssignCapsule, AssignedAddress, Capsule, RouteAdvertisement, RouteAdvertisementCapsule,
 };
+use crate::net::icmp::build_icmp_error;
+use crate::net::tun::MAX_TUN_MTU;
 use crate::net::{
     ZERO_IPV4_ADDRESS, ZERO_IPV6_ADDRESS, check_packet_src_dst, get_next_avail_subnet,
     get_specific_subnet, is_ipv4, is_zero_address, tun,
@@ -38,6 +41,7 @@ pub async fn handle_capsule_data(
     tx_tun_configuration: &mpsc::Sender<tun::TunConfiguration>,
     tx_quic_to_tun: &mpsc::Sender<Vec<u8>>,
     send_stream_buffer: &mut Vec<u8>,
+    mtu: u16,
 ) -> Result<usize> {
     if state.stream_id != Some(stream_id) {
         warn!("received capsule data on unknown stream id {}", stream_id);
@@ -87,6 +91,35 @@ pub async fn handle_capsule_data(
                 return Ok(len);
             };
 
+            if datagram_capsule.data.len() - packet_start > mtu as usize {
+                warn!(
+                    "received IP packet larger than MTU ({} > {}), sending ICMP Packet Too Big",
+                    datagram_capsule.data.len() - packet_start,
+                    mtu
+                );
+
+                // TODO: move the packet sending into connections
+                if let Some(icmp_reply) =
+                    build_icmp_error(&datagram_capsule.data[packet_start..], mtu as u32)
+                {
+                    let mut datagram_data = [0u8; MAX_TUN_MTU + 8];
+                    let mut octets_mut = octets::OctetsMut::with_slice(&mut datagram_data);
+                    octets_mut.put_varint(0)?; // context_id
+                    octets_mut.put_bytes(&icmp_reply)?;
+                    let len = octets_mut.off();
+                    let capsule = Capsule::Datagram(crate::connect_ip::capsule::DatagramCapsule {
+                        data: datagram_data[..len].to_vec(),
+                    });
+                    let mut capsule_data = [0u8; MAX_TUN_MTU + 32];
+                    let mut octets_mut = octets::OctetsMut::with_slice(&mut capsule_data);
+                    capsule.append(&mut octets_mut)?;
+                    let len = octets_mut.off();
+                    send_stream_buffer.extend_from_slice(&capsule_data[..len]);
+                }
+
+                return Ok(len);
+            }
+
             debug!(
                 "received IP packet from QUIC connection: {} -> {}, {} bytes",
                 src,
@@ -106,6 +139,7 @@ pub async fn handle_capsule_data(
                     .send(datagram_capsule.data[packet_start..].to_vec())
                     .await?;
             } else {
+                // TODO: send ICMP error back to peer
                 debug!(
                     "dropping packet from peer with invalid src/dst: {} -> {}",
                     src, dst

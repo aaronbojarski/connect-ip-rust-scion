@@ -1,6 +1,7 @@
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
 use anyhow::Error as AnyhowError;
 use ipnet::IpNet;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use thiserror::Error;
 
 use crate::net::ip_range_to_net;

@@ -1,13 +1,14 @@
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::Arc;
+use std::vec;
+
 use anyhow::{Result, anyhow};
 use ipnet::IpNet;
 use octets::{Octets, OctetsMut};
 use pnet::packet::ipv4::Ipv4Packet;
 use pnet::packet::ipv6::Ipv6Packet;
 use scion_proto::address::IsdAsn;
-use std::collections::HashMap;
-use std::net::IpAddr;
-use std::sync::Arc;
-use std::vec;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
@@ -576,6 +577,7 @@ impl Connection {
                                     tx_tun_configuration,
                                     tx_quic_to_tun,
                                     &mut self.remaining_sending_data,
+                                    self.tun_mtu,
                                 )
                                 .await
                                 {
