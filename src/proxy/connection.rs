@@ -546,15 +546,14 @@ impl Connection {
                     Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
                         if self.capsule_state.stream_id.is_some() {
                             error!(
-                                "{} got headers after successful request on stream id {}. Closing connection.",
-                                self.conn.trace_id(),
+                                "got headers after successful request on stream id {}. Closing connection.",
                                 stream_id
                             );
-                            self.conn.close(true, 0x100, b"headers on unknown stream")?;
+                            self.conn.close(true, 0x108, b"headers on unknown stream")?;
                             continue;
                         }
                         self.handle_request(stream_id, &list, tx_tun_configuration)
-                            .await;
+                            .await?;
                     }
 
                     Ok((stream_id, quiche::h3::Event::Data)) => {
@@ -581,20 +580,18 @@ impl Connection {
                                 .await
                                 {
                                     Ok(len) => {
-                                        debug!(
-                                            "{} processed capsule data of length {} on stream {}",
-                                            self.conn.trace_id(),
-                                            len,
-                                            stream_id
+                                        trace!(
+                                            "processed capsule data of length {} on stream {}",
+                                            len, stream_id
                                         );
                                         consumed += len;
                                     }
-                                    Err(err) if err.is::<CapsuleError>() => {
-                                        if let Some(CapsuleError::Buffer(_)) =
+                                    Err(err) => {
+                                        if let Some(capsule_err) =
                                             err.downcast_ref::<CapsuleError>()
+                                            && matches!(capsule_err, CapsuleError::Buffer(_))
                                         {
-                                            // Need more data to process capsule. Store remaining data for later processing.
-                                            debug!("need more data to process capsule.");
+                                            trace!("need more data to process capsule.");
                                             break 'process_capsule_data;
                                         }
 
@@ -602,15 +599,7 @@ impl Connection {
                                             "error handling capsule data: {:?}, closing connection",
                                             err
                                         );
-                                        self.conn.close(true, 0x100, b"capsule data error")?;
-                                    }
-                                    Err(e) => {
-                                        error!(
-                                            "{} error handling capsule data: {:?}, closing connection",
-                                            self.conn.trace_id(),
-                                            e
-                                        );
-                                        self.conn.close(true, 0x100, b"capsule data error")?;
+                                        self.conn.close(true, 0x10e, b"capsule data error")?;
                                         break 'h3_events;
                                     }
                                 }
@@ -639,6 +628,7 @@ impl Connection {
 
                     Err(e) => {
                         error!("{} HTTP/3 error {:?}", self.conn.trace_id(), e);
+                        self.conn.close(true, 0x102, b"HTTP/3 error")?;
                         break;
                     }
                 }
@@ -653,16 +643,15 @@ impl Connection {
         stream_id: u64,
         headers: &[quiche::h3::Header],
         tx_tun_configuration: &tokio::sync::mpsc::Sender<tun::TunConfiguration>,
-    ) {
+    ) -> Result<(), quiche::h3::Error> {
         debug!(
-            "{} got request {:?} on stream id {}",
-            self.conn.trace_id(),
+            "got request {:?} on stream id {}",
             headers_to_strings(headers),
             stream_id
         );
 
         if let Some(http3_conn) = &mut self.h3_conn {
-            let (headers, negotiated_mtu) = build_response(headers, self.tun_mtu);
+            let (headers, negotiated_mtu, status) = build_response(headers, self.tun_mtu);
             self.tun_mtu = negotiated_mtu;
 
             if let Err(e) = tx_tun_configuration
@@ -681,16 +670,28 @@ impl Connection {
                     };
 
                     self.partial_responses.insert(stream_id, response);
-                    return;
                 }
 
                 Err(e) => {
-                    error!("{} stream send failed {:?}", self.conn.trace_id(), e);
-                    return;
+                    error!(
+                        "{} stream send response failed {:?}",
+                        self.conn.trace_id(),
+                        e
+                    );
+                    return Err(e);
                 }
             }
             self.capsule_state.stream_id = Some(stream_id);
+
+            if status != 200 {
+                error!(
+                    "unsupported request on stream id {}, closing connection",
+                    stream_id
+                );
+                self.conn.close(true, 0x100, b"unsupported request")?;
+            }
         }
+        Ok(())
     }
 
     /// Handles newly writable streams. This is quiche boilerplate for handling partial writes.
@@ -699,11 +700,7 @@ impl Connection {
             Some(v) => v,
 
             None => {
-                error!(
-                    "{} no HTTP/3 connection for writable stream {}",
-                    self.conn.trace_id(),
-                    stream_id
-                );
+                error!("no HTTP/3 connection for writable stream {}", stream_id);
                 return;
             }
         };

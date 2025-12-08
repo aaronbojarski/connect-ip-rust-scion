@@ -529,7 +529,7 @@ impl Connection {
                                 self.conn.trace_id(),
                                 stream_id
                             );
-                            self.conn.close(true, 0x100, b"headers on unknown stream")?;
+                            self.conn.close(true, 0x108, b"headers on unknown stream")?;
                             break;
                         }
                         let (valid, tun_mtu) = check_response(&list);
@@ -580,20 +580,18 @@ impl Connection {
                                 .await
                                 {
                                     Ok(len) => {
-                                        debug!(
-                                            "{} processed capsule data of length {} on stream {}",
-                                            self.conn.trace_id(),
-                                            len,
-                                            stream_id
+                                        trace!(
+                                            "processed capsule data of length {} on stream {}",
+                                            len, stream_id
                                         );
                                         consumed += len;
                                     }
-                                    Err(err) if err.is::<CapsuleError>() => {
-                                        if let Some(CapsuleError::Buffer(_)) =
+                                    Err(err) => {
+                                        if let Some(capsule_err) =
                                             err.downcast_ref::<CapsuleError>()
+                                            && matches!(capsule_err, CapsuleError::Buffer(_))
                                         {
-                                            // Need more data to process capsule. Store remaining data for later processing.
-                                            debug!("need more data to process capsule.");
+                                            trace!("need more data to process capsule.");
                                             break 'process_capsule_data;
                                         }
 
@@ -601,15 +599,7 @@ impl Connection {
                                             "error handling capsule data: {:?}, closing connection",
                                             err
                                         );
-                                        self.conn.close(true, 0x100, b"capsule data error")?;
-                                    }
-                                    Err(e) => {
-                                        error!(
-                                            "{} error handling capsule data: {:?}, closing connection",
-                                            self.conn.trace_id(),
-                                            e
-                                        );
-                                        self.conn.close(true, 0x100, b"capsule data error")?;
+                                        self.conn.close(true, 0x10e, b"capsule data error")?;
                                         break 'h3_events;
                                     }
                                 }
@@ -642,7 +632,7 @@ impl Connection {
 
                     Err(e) => {
                         error!("HTTP/3 processing failed: {e:?}");
-                        self.conn.close(true, 0x100, b"HTTP/3 error")?;
+                        self.conn.close(true, 0x102, b"HTTP/3 error")?;
                         break;
                     }
                 }

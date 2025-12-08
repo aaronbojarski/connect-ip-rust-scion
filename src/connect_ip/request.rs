@@ -22,7 +22,7 @@ pub fn build_request(authority: String, path: String, tun_mtu: u16) -> Vec<quich
 pub fn build_response(
     request: &[quiche::h3::Header],
     own_tun_mtu: u16,
-) -> (Vec<quiche::h3::Header>, u16) {
+) -> (Vec<quiche::h3::Header>, u16, u16) {
     let mut method = None;
     let mut protocol = None;
     let mut capsule_protocol = None;
@@ -69,7 +69,7 @@ pub fn build_response(
         quiche::h3::Header::new(b"tun-mtu", negotiated_mtu.to_string().as_bytes()),
     ];
 
-    (headers, negotiated_mtu)
+    (headers, negotiated_mtu, status)
 }
 
 /// Checks if the response headers indicate a successful CONNECT response.
