@@ -1,25 +1,42 @@
-use std::net::IpAddr;
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use ipnet::IpNet;
 use octets::Octets;
-use pnet::packet::ipv4::Ipv4Packet;
-use pnet::packet::ipv6::Ipv6Packet;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::Mutex;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::connect_ip::capsule::{
     AddressAssignCapsule, AssignedAddress, Capsule, RouteAdvertisement, RouteAdvertisementCapsule,
 };
 use crate::net::icmp::build_icmp_error;
-use crate::net::tun::MAX_TUN_MTU;
 use crate::net::{
-    ZERO_IPV4_ADDRESS, ZERO_IPV6_ADDRESS, check_packet_src_dst, get_next_avail_subnet,
-    get_specific_subnet, is_ipv4, is_zero_address, tun,
+    ZERO_IPV4_ADDRESS, ZERO_IPV6_ADDRESS, get_next_avail_subnet, get_specific_subnet, is_ipv4,
+    is_zero_address, tun,
 };
 
+pub trait ConnectIPEndpoint {
+    fn check_ingress_packet(&mut self, packet: &[u8]) -> bool;
+    fn check_egress_packet(&mut self, packet: &[u8]) -> bool;
+    fn forward_ingress_packet(
+        &mut self,
+        packet: &[u8],
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
+    fn forward_egress_packet(&mut self, packet: &[u8]) -> Result<()>;
+    fn update_tun_interface(
+        &self,
+        update: tun::TunConfiguration,
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
+    fn send_capsule(
+        &mut self,
+        capsule: Capsule,
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
+    fn get_routing_state(&self) -> RoutingState;
+    fn set_routing_state(&mut self, state: RoutingState);
+}
+
 /// Addresses and routes negotiated through capsule protocol.
+#[derive(Clone, Debug)]
 pub struct RoutingState {
     pub stream_id: Option<u64>,
     /// addresses we assign to the peer
@@ -33,21 +50,12 @@ pub struct RoutingState {
 }
 
 /// Handles incoming capsule data.
-pub async fn handle_capsule_data(
-    stream_id: u64,
+pub async fn handle_capsule_data<T: ConnectIPEndpoint>(
     data: &[u8],
-    state: &mut RoutingState,
     available_addresses: &Arc<Mutex<Vec<IpNet>>>,
-    tx_tun_configuration: &mpsc::Sender<tun::TunConfiguration>,
-    tx_quic_to_tun: &mpsc::Sender<Vec<u8>>,
-    send_stream_buffer: &mut Vec<u8>,
+    connect_ip_endpoint: &mut T,
     mtu: u16,
 ) -> Result<usize> {
-    if state.stream_id != Some(stream_id) {
-        warn!("received capsule data on unknown stream id {}", stream_id);
-        return Err(anyhow!("unknown stream id"));
-    }
-
     // parse capsule data here
     let mut octets = Octets::with_slice(data);
     let capsule = Capsule::parse(&mut octets)?;
@@ -73,24 +81,6 @@ pub async fn handle_capsule_data(
                 return Ok(len);
             }
 
-            let (src, dst) = if let Some(ipv4) =
-                Ipv4Packet::new(&datagram_capsule.data[packet_start..])
-                && ipv4.get_version() == 4
-            {
-                (
-                    IpAddr::V4(ipv4.get_source()),
-                    IpAddr::V4(ipv4.get_destination()),
-                )
-            } else if let Some(ipv6) = Ipv6Packet::new(&datagram_capsule.data[packet_start..]) {
-                (
-                    IpAddr::V6(ipv6.get_source()),
-                    IpAddr::V6(ipv6.get_destination()),
-                )
-            } else {
-                error!("received non-IP packet in datagram, dropping");
-                return Ok(len);
-            };
-
             if datagram_capsule.data.len() - packet_start > mtu as usize {
                 warn!(
                     "received IP packet larger than MTU ({} > {}), sending ICMP Packet Too Big",
@@ -98,63 +88,37 @@ pub async fn handle_capsule_data(
                     mtu
                 );
 
-                // TODO: move the packet sending into connections
                 if let Some(icmp_reply) =
                     build_icmp_error(&datagram_capsule.data[packet_start..], mtu as u32)
                 {
-                    let mut datagram_data = [0u8; MAX_TUN_MTU + 8];
-                    let mut octets_mut = octets::OctetsMut::with_slice(&mut datagram_data);
-                    octets_mut.put_varint(0)?; // context_id
-                    octets_mut.put_bytes(&icmp_reply)?;
-                    let len = octets_mut.off();
-                    let capsule = Capsule::Datagram(crate::connect_ip::capsule::DatagramCapsule {
-                        data: datagram_data[..len].to_vec(),
-                    });
-                    let mut capsule_data = [0u8; MAX_TUN_MTU + 32];
-                    let mut octets_mut = octets::OctetsMut::with_slice(&mut capsule_data);
-                    capsule.append(&mut octets_mut)?;
-                    let len = octets_mut.off();
-                    send_stream_buffer.extend_from_slice(&capsule_data[..len]);
+                    connect_ip_endpoint.forward_egress_packet(&icmp_reply)?;
                 }
 
                 return Ok(len);
             }
 
-            debug!(
-                "received IP packet from QUIC connection: {} -> {}, {} bytes",
-                src,
-                dst,
-                datagram_capsule.data.len() - packet_start
-            );
-
-            if check_packet_src_dst(
-                src,
-                dst,
-                &state.remote_addresses,
-                &state.remote_routes,
-                &state.local_addresses,
-                &state.local_routes,
-            ) {
-                tx_quic_to_tun
-                    .send(datagram_capsule.data[packet_start..].to_vec())
-                    .await?;
-            } else {
+            if !connect_ip_endpoint.check_ingress_packet(&datagram_capsule.data[packet_start..]) {
                 // TODO: send ICMP error back to peer
-                debug!(
-                    "dropping packet from peer with invalid src/dst: {} -> {}",
-                    src, dst
-                );
+                debug!("dropping packet from peer due to ingress filter");
+                return Ok(len);
             }
+            connect_ip_endpoint
+                .forward_ingress_packet(&datagram_capsule.data[packet_start..])
+                .await?;
         }
 
         Capsule::AddressAssign(assign_capsule) => {
             debug!("received AddressAssign capsule: {:?}", assign_capsule);
+
+            let mut state = connect_ip_endpoint.get_routing_state();
+
             // Remove old addresses as they are no longer valid
             for addr in state.local_addresses.iter() {
-                tx_tun_configuration
-                    .send(tun::TunConfiguration::RemoveAddress(*addr))
+                connect_ip_endpoint
+                    .update_tun_interface(tun::TunConfiguration::RemoveAddress(*addr))
                     .await?;
             }
+
             state.local_addresses.clear();
 
             // Add new addresses
@@ -164,8 +128,11 @@ pub async fn handle_capsule_data(
                     continue;
                 }
                 info!("received address from peer: {}", assigned_address.ip_net);
-                tx_tun_configuration
-                    .send(tun::TunConfiguration::AddAddress(assigned_address.ip_net))
+
+                connect_ip_endpoint
+                    .update_tun_interface(tun::TunConfiguration::AddAddress(
+                        assigned_address.ip_net,
+                    ))
                     .await?;
                 state.local_addresses.push(assigned_address.ip_net);
             }
@@ -176,13 +143,16 @@ pub async fn handle_capsule_data(
                 .iter()
                 .chain(state.remote_routes.iter())
             {
-                tx_tun_configuration
-                    .send(tun::TunConfiguration::AddRoute(*route))
+                connect_ip_endpoint
+                    .update_tun_interface(tun::TunConfiguration::AddRoute(*route))
                     .await?;
             }
+            connect_ip_endpoint.set_routing_state(state);
         }
         Capsule::AddressRequest(request_capsule) => {
             debug!("received AddressRequest capsule: {:?}", request_capsule);
+
+            let mut state = connect_ip_endpoint.get_routing_state();
 
             // Keep previous assigned addresses
             let mut assigned_addresses = state
@@ -213,8 +183,8 @@ pub async fn handle_capsule_data(
                     };
                     assigned_addresses.push(assigned_address);
 
-                    tx_tun_configuration
-                        .send(tun::TunConfiguration::AddRoute(assigned_subnet))
+                    connect_ip_endpoint
+                        .update_tun_interface(tun::TunConfiguration::AddRoute(assigned_subnet))
                         .await?;
                     state.remote_addresses.push(assigned_subnet);
                 } else {
@@ -241,22 +211,21 @@ pub async fn handle_capsule_data(
                 addresses: assigned_addresses,
             };
 
-            let mut buf = vec![0u8; address_assign_capsule.wire_len() + 16];
-            let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
-
             let capsule = Capsule::AddressAssign(address_assign_capsule);
-            capsule.append(&mut octets_mut)?;
-            let payload_len = octets_mut.off();
-            send_stream_buffer.extend_from_slice(&buf[..payload_len]);
+            connect_ip_endpoint.send_capsule(capsule).await?;
+            connect_ip_endpoint.set_routing_state(state);
         }
         Capsule::RouteAdvertisement(route_capsule) => {
             debug!("received RouteAdvertisement capsule: {:?}", route_capsule);
+
+            let mut state = connect_ip_endpoint.get_routing_state();
+
             // TODO: add some validation here
 
             // remove old routes
             for route in state.remote_routes.iter() {
-                tx_tun_configuration
-                    .send(tun::TunConfiguration::RemoveRoute(*route))
+                connect_ip_endpoint
+                    .update_tun_interface(tun::TunConfiguration::RemoveRoute(*route))
                     .await?;
             }
             state.remote_routes.clear();
@@ -264,12 +233,13 @@ pub async fn handle_capsule_data(
             // add new routes
             for route in route_capsule.routes {
                 info!("received route advertisement from peer: {}", route.ip_net);
-                tx_tun_configuration
-                    .send(tun::TunConfiguration::AddRoute(route.ip_net))
+                connect_ip_endpoint
+                    .update_tun_interface(tun::TunConfiguration::AddRoute(route.ip_net))
                     .await?;
 
                 state.remote_routes.push(route.ip_net);
             }
+            connect_ip_endpoint.set_routing_state(state);
         }
     }
 
