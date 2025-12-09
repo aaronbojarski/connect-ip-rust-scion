@@ -392,7 +392,6 @@ impl Proxy {
             // Store connection info
             let mut client_conn = Connection::new(
                 conn,
-                scid.clone().into_owned(),
                 local_scion_socket.isd_asn(),
                 src_scion_socket.isd_asn(),
                 rx_from_main,
@@ -424,7 +423,7 @@ impl Proxy {
                     error!("connection {:?} error: {:?}", scid_owned, e);
                 }
                 connections_clone.lock().await.remove(&scid_owned);
-                for addr in client_conn.capsule_state.remote_addresses.iter() {
+                for addr in client_conn.routing_state.remote_addresses.iter() {
                     info!("Releasing address {}", addr);
                     return_subnet(&available_nets, *addr).await;
                 }

@@ -38,7 +38,10 @@ pub trait ConnectIPEndpoint {
 /// Addresses and routes negotiated through capsule protocol.
 #[derive(Clone, Debug)]
 pub struct RoutingState {
+    /// QUIC stream ID used for this connection
     pub stream_id: Option<u64>,
+    /// mtu of the tunnel
+    pub mtu: u16,
     /// addresses we assign to the peer
     pub remote_addresses: Vec<IpNet>,
     /// addresses the peer assigns to us

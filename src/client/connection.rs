@@ -30,6 +30,12 @@ const RCV_MANY_CAPACITY: usize = 10; // number of packets
 const SEND_ADDRESS_REQUEST_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
 const MAX_TUN_MTU_FOR_DATAGRAMS: usize = MAX_DATAGRAM_SIZE - 50;
 
+struct TunnelStatus {
+    established: bool,
+    addresses_assigned: bool,
+    address_requested: bool,
+}
+
 pub struct Connection {
     local: scion_proto::address::SocketAddr,
     remote: scion_proto::address::SocketAddr,
@@ -38,18 +44,15 @@ pub struct Connection {
     rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
     tx_quic_to_udp: mpsc::Sender<UdpPacket>,
     tun_name: String,
-    tun_mtu: u16,
     tx_tun_configuration: Option<mpsc::Sender<tun::TunConfiguration>>,
     tx_quic_to_tun: Option<mpsc::Sender<Vec<u8>>>,
     cancel_token: CancellationToken,
     available_addresses: Arc<Mutex<Vec<IpNet>>>,
-    capsule_state: RoutingState,
-    tunnel_established: bool,
-    assigned_addresses: bool,
-    requested_address: bool,
+    routing_state: RoutingState,
+    tunnel_status: TunnelStatus,
     address_request_timer: std::time::Instant,
-    remaining_data: Vec<u8>,
-    remaining_sending_data: Vec<u8>,
+    stream_data_received: Vec<u8>, // data received from the stream, not yet processed
+    stream_data_to_send: Vec<u8>, // needs to be sent on the stream, not yet sent due to flow control
 }
 
 impl Connection {
@@ -61,7 +64,7 @@ impl Connection {
         rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
         tx_quic_to_udp: mpsc::Sender<UdpPacket>,
         tun_name: String,
-        tun_mtu: u16,
+        configured_mtu: u16,
         cancel_token: CancellationToken,
         available_addresses: Arc<Mutex<Vec<IpNet>>>,
         routes: Vec<IpNet>,
@@ -101,24 +104,26 @@ impl Connection {
             rx_udp_to_quic,
             tx_quic_to_udp,
             tun_name,
-            tun_mtu,
             tx_tun_configuration: None,
             tx_quic_to_tun: None,
             cancel_token,
             available_addresses,
-            capsule_state: RoutingState {
+            routing_state: RoutingState {
                 stream_id: None,
+                mtu: configured_mtu,
                 remote_addresses: vec![],
                 local_addresses: vec![],
                 local_routes: routes,
                 remote_routes: vec![],
             },
-            tunnel_established: false,
-            assigned_addresses: false,
-            requested_address: false,
+            tunnel_status: TunnelStatus {
+                established: false,
+                addresses_assigned: false,
+                address_requested: false,
+            },
             address_request_timer: std::time::Instant::now(),
-            remaining_data: Vec::with_capacity(RCV_BUFFER_SIZE),
-            remaining_sending_data: Vec::with_capacity(SEND_BUFFER_SIZE),
+            stream_data_received: Vec::with_capacity(RCV_BUFFER_SIZE),
+            stream_data_to_send: Vec::with_capacity(SEND_BUFFER_SIZE),
         })
     }
 
@@ -129,7 +134,11 @@ impl Connection {
         let (tx_quic_to_tun, rx_quic_to_tun) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
         let (tx_tun_to_quic, mut rx_tun_to_quic) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
 
-        let mut tun = tun::Tun::new(&self.tun_name, tx_tun_to_quic.clone(), self.tun_mtu)?;
+        let mut tun = tun::Tun::new(
+            &self.tun_name,
+            tx_tun_to_quic.clone(),
+            self.routing_state.mtu,
+        )?;
         let (tx_tun_configuration, rx_tun_configuration) =
             mpsc::channel::<tun::TunConfiguration>(CHANNEL_CAPACITY);
         tun.start(
@@ -222,9 +231,9 @@ impl Connection {
                 break;
             }
 
-            if !self.remaining_sending_data.is_empty() {
-                let to_send = self.remaining_sending_data.split_off(0);
-                if let Some(stream_id) = self.capsule_state.stream_id {
+            if !self.stream_data_to_send.is_empty() {
+                let to_send = self.stream_data_to_send.split_off(0);
+                if let Some(stream_id) = self.routing_state.stream_id {
                     match self.h3_conn.as_mut().unwrap().send_body(
                         &mut self.conn,
                         stream_id,
@@ -239,12 +248,11 @@ impl Connection {
                                     sent,
                                     to_send.len()
                                 );
-                                self.remaining_sending_data
-                                    .extend_from_slice(&to_send[sent..]);
+                                self.stream_data_to_send.extend_from_slice(&to_send[sent..]);
                             }
                         }
                         Err(quiche::h3::Error::Done) => {
-                            self.remaining_sending_data.extend_from_slice(&to_send);
+                            self.stream_data_to_send.extend_from_slice(&to_send);
                         }
                         Err(e) => {
                             error!("send_body failed: {:?}", e);
@@ -326,7 +334,7 @@ impl Connection {
         self.handle_address_negotiation().await?;
 
         // Handle datagrams and forward to TUN if tunnel is established
-        if self.conn.is_established() && self.tunnel_established {
+        if self.conn.is_established() && self.tunnel_status.established {
             // Receive datagrams from QUIC and forward to TUN
             let mut buf = [0; MAX_DATAGRAM_SIZE];
             while let Ok(len) = self.conn.dgram_recv(&mut buf) {
@@ -335,7 +343,7 @@ impl Connection {
                 let context_id = octets.get_varint()?;
                 let packet_start = octets.off();
 
-                if self.capsule_state.stream_id != Some(stream_id) {
+                if self.routing_state.stream_id != Some(stream_id) {
                     error!(
                         "{} received datagram on unknown stream id {}",
                         self.conn.trace_id(),
@@ -406,12 +414,16 @@ impl Connection {
 
         // Send HTTP requests.
         if let Some(h3_conn) = &mut self.h3_conn
-            && self.capsule_state.stream_id.is_none()
+            && self.routing_state.stream_id.is_none()
         {
-            let req = build_request("localhost".to_string(), "/vpn".to_string(), self.tun_mtu);
+            let req = build_request(
+                "localhost".to_string(),
+                "/vpn".to_string(),
+                self.routing_state.mtu,
+            );
             debug!("sending HTTP request {req:?}");
             let stream_id = h3_conn.send_request(&mut self.conn, &req, false)?;
-            self.capsule_state.stream_id = Some(stream_id);
+            self.routing_state.stream_id = Some(stream_id);
             debug!("sent CONNECT request on stream {}", stream_id);
         }
 
@@ -426,7 +438,7 @@ impl Connection {
                             headers_to_strings(&list),
                             stream_id
                         );
-                        if Some(stream_id) != self.capsule_state.stream_id {
+                        if Some(stream_id) != self.routing_state.stream_id {
                             error!(
                                 "{} got headers on unknown stream id {}. Closing connection.",
                                 self.conn.trace_id(),
@@ -437,13 +449,15 @@ impl Connection {
                         }
                         let (valid, tun_mtu) = check_response(&list);
                         if valid {
-                            self.tunnel_established = true;
+                            self.tunnel_status.established = true;
                             if let Some(mtu) = tun_mtu {
-                                self.tun_mtu = mtu;
+                                self.routing_state.mtu = mtu;
                             }
-                            self.update_tun_interface(tun::TunConfiguration::SetMTU(self.tun_mtu))
-                                .await?;
-                            info!("connected. negotiated TUN MTU: {}", self.tun_mtu);
+                            self.update_tun_interface(tun::TunConfiguration::SetMTU(
+                                self.routing_state.mtu,
+                            ))
+                            .await?;
+                            info!("connected. negotiated TUN MTU: {}", self.routing_state.mtu);
                         } else {
                             error!("unexpected response from server, closing connection");
                             self.conn.close(true, 0x100, b"unexpected response")?;
@@ -467,7 +481,7 @@ impl Connection {
                         ) {
                             trace!("got {read} bytes of response data on stream {stream_id}");
 
-                            let mut data = self.remaining_data.split_off(0);
+                            let mut data = self.stream_data_received.split_off(0);
                             data.extend_from_slice(&buf[..read]);
                             let mut consumed = 0;
                             'process_capsule_data: while consumed < data.len() {
@@ -503,7 +517,8 @@ impl Connection {
                                     }
                                 }
                             }
-                            self.remaining_data.extend_from_slice(&data[consumed..]);
+                            self.stream_data_received
+                                .extend_from_slice(&data[consumed..]);
                         }
                     }
 
@@ -541,26 +556,26 @@ impl Connection {
     }
 
     async fn handle_address_negotiation(&mut self) -> Result<()> {
-        if self.capsule_state.local_addresses.is_empty()
-            && !self.requested_address
-            && self.tunnel_established
+        if self.routing_state.local_addresses.is_empty()
+            && !self.tunnel_status.address_requested
+            && self.tunnel_status.established
         {
             // Send request only if no address has been assigned within first second
             if self.address_request_timer.elapsed() > SEND_ADDRESS_REQUEST_AFTER {
                 self.send_address_request()?;
                 info!("sent address request capsule");
-                self.requested_address = true;
+                self.tunnel_status.address_requested = true;
             }
         }
 
-        if !self.assigned_addresses
-            && self.tunnel_established
-            && self.capsule_state.stream_id.is_some()
+        if !self.tunnel_status.addresses_assigned
+            && self.tunnel_status.established
+            && self.routing_state.stream_id.is_some()
         {
             let mut buf = [0; 1000];
             let mut octets = OctetsMut::with_slice(&mut buf);
             let assigned_address = prepare_address_and_route_assignment(
-                &mut self.capsule_state,
+                &mut self.routing_state,
                 self.available_addresses.clone(),
                 &mut octets,
             )
@@ -577,10 +592,10 @@ impl Connection {
                 return Ok(());
             }
 
-            self.remaining_sending_data
+            self.stream_data_to_send
                 .extend_from_slice(&buf[..payload_len]);
 
-            self.assigned_addresses = true;
+            self.tunnel_status.addresses_assigned = true;
         }
         Ok(())
     }
@@ -599,7 +614,7 @@ impl Connection {
         let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
         capsule.append(&mut octets_mut)?;
         let payload_len = octets_mut.off();
-        self.remaining_sending_data
+        self.stream_data_to_send
             .extend_from_slice(&buf[..payload_len]);
 
         Ok(())
@@ -608,14 +623,14 @@ impl Connection {
 
 impl ConnectIPEndpoint for Connection {
     fn check_ingress_packet(&mut self, packet: &[u8]) -> ForwardingDecision {
-        if packet.len() > self.tun_mtu as usize {
+        if packet.len() > self.routing_state.mtu as usize {
             debug!(
                 "packet size {} exceeds TUN MTU {}",
                 packet.len(),
-                self.tun_mtu
+                self.routing_state.mtu
             );
             return ForwardingDecision::RespondWithIcmp(crate::net::icmp::IcmpType::PacketTooBig(
-                self.tun_mtu as u32,
+                self.routing_state.mtu as u32,
             ));
         }
 
@@ -646,22 +661,22 @@ impl ConnectIPEndpoint for Connection {
         check_packet_src_dst(
             src,
             dst,
-            &self.capsule_state.remote_addresses,
-            &self.capsule_state.remote_routes,
-            &self.capsule_state.local_addresses,
-            &self.capsule_state.local_routes,
+            &self.routing_state.remote_addresses,
+            &self.routing_state.remote_routes,
+            &self.routing_state.local_addresses,
+            &self.routing_state.local_routes,
         )
     }
 
     fn check_egress_packet(&mut self, packet: &[u8]) -> ForwardingDecision {
-        if packet.len() > self.tun_mtu as usize {
+        if packet.len() > self.routing_state.mtu as usize {
             debug!(
                 "packet size {} exceeds TUN MTU {}",
                 packet.len(),
-                self.tun_mtu
+                self.routing_state.mtu
             );
             return ForwardingDecision::RespondWithIcmp(crate::net::icmp::IcmpType::PacketTooBig(
-                self.tun_mtu as u32,
+                self.routing_state.mtu as u32,
             ));
         }
 
@@ -694,10 +709,10 @@ impl ConnectIPEndpoint for Connection {
         check_packet_src_dst(
             src,
             dst,
-            &self.capsule_state.local_addresses,
-            &self.capsule_state.local_routes,
-            &self.capsule_state.remote_addresses,
-            &self.capsule_state.remote_routes,
+            &self.routing_state.local_addresses,
+            &self.routing_state.local_routes,
+            &self.routing_state.remote_addresses,
+            &self.routing_state.remote_routes,
         )
     }
 
@@ -713,11 +728,11 @@ impl ConnectIPEndpoint for Connection {
 
     fn forward_egress_packet(&mut self, packet: &[u8]) -> Result<()> {
         if self.conn.is_established()
-            && let Some(stream_id) = self.capsule_state.stream_id
+            && let Some(stream_id) = self.routing_state.stream_id
         {
             let mut buf = [0; MAX_TUN_MTU + 32];
             if self.conn.dgram_max_writable_len().is_some()
-                && self.tun_mtu as usize <= MAX_TUN_MTU_FOR_DATAGRAMS
+                && self.routing_state.mtu as usize <= MAX_TUN_MTU_FOR_DATAGRAMS
             {
                 let mut octets = OctetsMut::with_slice(&mut buf);
                 octets.put_varint(stream_id / 4)?;
@@ -746,14 +761,14 @@ impl ConnectIPEndpoint for Connection {
                 let mut octets = OctetsMut::with_slice(&mut buf);
                 capsule.append(&mut octets)?;
                 let len = octets.off();
-                if self.remaining_sending_data.len() + len > SEND_BUFFER_SIZE {
+                if self.stream_data_to_send.len() + len > SEND_BUFFER_SIZE {
                     debug!(
                         "too much remaining data to send ({} bytes), dropping packet",
-                        self.remaining_sending_data.len() + len
+                        self.stream_data_to_send.len() + len
                     );
                     return Ok(());
                 }
-                self.remaining_sending_data.extend_from_slice(&buf[..len]);
+                self.stream_data_to_send.extend_from_slice(&buf[..len]);
             }
         } else {
             debug!("connection not established yet, dropping packet");
@@ -775,22 +790,22 @@ impl ConnectIPEndpoint for Connection {
         let mut octets = OctetsMut::with_slice(&mut buf);
         capsule.append(&mut octets)?;
         let len = octets.off();
-        if self.remaining_sending_data.len() + len > SEND_BUFFER_SIZE {
+        if self.stream_data_to_send.len() + len > SEND_BUFFER_SIZE {
             debug!(
                 "too much remaining data to send ({} bytes), dropping capsule",
-                self.remaining_sending_data.len() + len
+                self.stream_data_to_send.len() + len
             );
             return Ok(());
         }
-        self.remaining_sending_data.extend_from_slice(&buf[..len]);
+        self.stream_data_to_send.extend_from_slice(&buf[..len]);
         Ok(())
     }
 
     fn get_routing_state(&self) -> RoutingState {
-        self.capsule_state.clone()
+        self.routing_state.clone()
     }
 
     fn set_routing_state(&mut self, state: RoutingState) {
-        self.capsule_state = state;
+        self.routing_state = state;
     }
 }
