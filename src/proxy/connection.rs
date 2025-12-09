@@ -671,14 +671,14 @@ impl ConnectIPEndpoint for Connection {
             packet.len()
         );
 
-        return check_packet_src_dst(
+        check_packet_src_dst(
             src,
             dst,
             &self.capsule_state.remote_addresses,
             &self.capsule_state.remote_routes,
             &self.capsule_state.local_addresses,
             &self.capsule_state.local_routes,
-        );
+        )
     }
 
     fn check_egress_packet(&mut self, packet: &[u8]) -> ForwardingDecision {
@@ -719,14 +719,14 @@ impl ConnectIPEndpoint for Connection {
             packet.len()
         );
 
-        return check_packet_src_dst(
+        check_packet_src_dst(
             src,
             dst,
             &self.capsule_state.local_addresses,
             &self.capsule_state.local_routes,
             &self.capsule_state.remote_addresses,
             &self.capsule_state.remote_routes,
-        );
+        )
     }
 
     async fn forward_ingress_packet(&mut self, packet: &[u8]) -> Result<()> {
