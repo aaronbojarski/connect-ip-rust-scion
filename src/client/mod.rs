@@ -1,12 +1,13 @@
 pub mod connection;
 
+use std::fs;
+use std::sync::Arc;
+
 use anyhow::{Context, Result, anyhow};
 use ipnet::IpNet;
 use scion_proto::address::IsdAsn;
 use scion_proto::path::policy::acl::AclPolicy;
 use scion_stack::scionstack::ScionStackBuilder;
-use std::fs;
-use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};

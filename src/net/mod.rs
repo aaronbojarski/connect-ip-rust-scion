@@ -1,12 +1,17 @@
+pub mod icmp;
 pub mod quic;
 pub mod tun;
 
-use anyhow::{Context, Error};
-use ipnet::IpNet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::Command;
 use std::sync::Arc;
+
+use anyhow::{Context, Error};
+use ipnet::IpNet;
 use tokio::sync::Mutex;
+use tracing::debug;
+
+use crate::net::icmp::IcmpType;
 
 pub const ZERO_IPV4_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
 pub const ZERO_IPV6_ADDRESS: IpAddr = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0));
@@ -203,6 +208,13 @@ fn run_ip_command(mut cmd: Command) -> Result<std::process::Output, Error> {
     Ok(output)
 }
 
+#[derive(Debug)]
+pub enum ForwardingDecision {
+    Forward,
+    Drop,
+    RespondWithIcmp(IcmpType),
+}
+
 pub fn check_packet_src_dst(
     packet_src: IpAddr,
     packet_dst: IpAddr,
@@ -210,7 +222,7 @@ pub fn check_packet_src_dst(
     allowed_src_2: &[IpNet],
     allowed_dst_1: &[IpNet],
     allowed_dst_2: &[IpNet],
-) -> bool {
+) -> ForwardingDecision {
     let src_valid = allowed_src_1
         .iter()
         .chain(allowed_src_2.iter())
@@ -221,5 +233,13 @@ pub fn check_packet_src_dst(
         .chain(allowed_dst_2.iter())
         .any(|net| net.contains(&packet_dst));
 
-    src_valid && dst_valid
+    if src_valid && dst_valid {
+        ForwardingDecision::Forward
+    } else if !src_valid {
+        debug!("source address {} not allowed", packet_src);
+        ForwardingDecision::RespondWithIcmp(IcmpType::SourceRouteFailed)
+    } else {
+        debug!("destination address {} not allowed", packet_dst);
+        ForwardingDecision::RespondWithIcmp(IcmpType::DestinationUnreachable)
+    }
 }
