@@ -9,15 +9,15 @@ use tracing::{debug, error, info, trace, warn};
 use crate::connect_ip::capsule::{
     AddressAssignCapsule, AssignedAddress, Capsule, RouteAdvertisement, RouteAdvertisementCapsule,
 };
-use crate::net::icmp::build_icmp_error;
+use crate::net::icmp::build_icmp_response;
 use crate::net::{
-    ZERO_IPV4_ADDRESS, ZERO_IPV6_ADDRESS, get_next_avail_subnet, get_specific_subnet, is_ipv4,
-    is_zero_address, tun,
+    ForwardingDecision, ZERO_IPV4_ADDRESS, ZERO_IPV6_ADDRESS, get_next_avail_subnet,
+    get_specific_subnet, is_ipv4, is_zero_address, tun,
 };
 
 pub trait ConnectIPEndpoint {
-    fn check_ingress_packet(&mut self, packet: &[u8]) -> bool;
-    fn check_egress_packet(&mut self, packet: &[u8]) -> bool;
+    fn check_ingress_packet(&mut self, packet: &[u8]) -> ForwardingDecision;
+    fn check_egress_packet(&mut self, packet: &[u8]) -> ForwardingDecision;
     fn forward_ingress_packet(
         &mut self,
         packet: &[u8],
@@ -54,7 +54,6 @@ pub async fn handle_capsule_data<T: ConnectIPEndpoint>(
     data: &[u8],
     available_addresses: &Arc<Mutex<Vec<IpNet>>>,
     connect_ip_endpoint: &mut T,
-    mtu: u16,
 ) -> Result<usize> {
     // parse capsule data here
     let mut octets = Octets::with_slice(data);
@@ -81,30 +80,28 @@ pub async fn handle_capsule_data<T: ConnectIPEndpoint>(
                 return Ok(len);
             }
 
-            if datagram_capsule.data.len() - packet_start > mtu as usize {
-                warn!(
-                    "received IP packet larger than MTU ({} > {}), sending ICMP Packet Too Big",
-                    datagram_capsule.data.len() - packet_start,
-                    mtu
-                );
-
-                if let Some(icmp_reply) =
-                    build_icmp_error(&datagram_capsule.data[packet_start..], mtu as u32)
-                {
-                    connect_ip_endpoint.forward_egress_packet(&icmp_reply)?;
+            match connect_ip_endpoint.check_ingress_packet(&datagram_capsule.data[packet_start..]) {
+                ForwardingDecision::Drop => {
+                    debug!("dropping invalid packet from datagram capsule");
                 }
-
-                return Ok(len);
+                ForwardingDecision::RespondWithIcmp(icmp_type) => {
+                    warn!(
+                        "packet from datagram capsule requires ICMP response: {:?}, sending ICMP Destination Unreachable",
+                        icmp_type
+                    );
+                    if let Some(icmp_reply) =
+                        build_icmp_response(&datagram_capsule.data[packet_start..], icmp_type)
+                    {
+                        connect_ip_endpoint.forward_egress_packet(&icmp_reply)?;
+                    }
+                    return Ok(len);
+                }
+                ForwardingDecision::Forward => {
+                    connect_ip_endpoint
+                        .forward_ingress_packet(&datagram_capsule.data[packet_start..])
+                        .await?;
+                }
             }
-
-            if !connect_ip_endpoint.check_ingress_packet(&datagram_capsule.data[packet_start..]) {
-                // TODO: send ICMP error back to peer
-                debug!("dropping packet from peer due to ingress filter");
-                return Ok(len);
-            }
-            connect_ip_endpoint
-                .forward_ingress_packet(&datagram_capsule.data[packet_start..])
-                .await?;
         }
 
         Capsule::AddressAssign(assign_capsule) => {

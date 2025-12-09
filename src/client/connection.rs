@@ -19,9 +19,10 @@ use crate::connect_ip::capsule_protocol::{
     ConnectIPEndpoint, RoutingState, handle_capsule_data, prepare_address_and_route_assignment,
 };
 use crate::connect_ip::request::{build_request, check_response, headers_to_strings};
+use crate::net::icmp::build_icmp_response;
 use crate::net::quic::{DEFAULT_TIMEOUT, KEEPALIVE_INTERVAL};
 use crate::net::tun::MAX_TUN_MTU;
-use crate::net::{UdpPacket, ZERO_IPV4_ADDRESS, check_packet_src_dst, tun};
+use crate::net::{ForwardingDecision, UdpPacket, ZERO_IPV4_ADDRESS, check_packet_src_dst, tun};
 
 const SEND_BUFFER_SIZE: usize = 65535; // bytes
 const RCV_BUFFER_SIZE: usize = 65535; // bytes
@@ -353,11 +354,22 @@ impl Connection {
                 }
 
                 let ip_packet = &buf[packet_start..len];
-                if !self.check_ingress_packet(ip_packet) {
-                    debug!("dropping invalid packet from QUIC");
-                    continue;
+                match self.check_ingress_packet(ip_packet) {
+                    ForwardingDecision::Drop => {
+                        debug!("dropping invalid packet from Datagram");
+                        continue;
+                    }
+                    ForwardingDecision::Forward => {
+                        self.forward_egress_packet(ip_packet)?;
+                    }
+                    ForwardingDecision::RespondWithIcmp(icmp_type) => {
+                        if let Some(icmp_response) = build_icmp_response(ip_packet, icmp_type) {
+                            self.forward_egress_packet(&icmp_response)?;
+                        } else {
+                            debug!("could not build ICMP error message, dropping packet");
+                        }
+                    }
                 }
-                self.forward_egress_packet(ip_packet)?;
             }
         }
 
@@ -365,12 +377,19 @@ impl Connection {
     }
 
     async fn process_tun_packet(&mut self, ip_packet: &[u8]) -> Result<()> {
-        if !self.check_egress_packet(ip_packet) {
-            debug!("dropping invalid packet from TUN");
-            return Ok(());
+        match self.check_egress_packet(ip_packet) {
+            ForwardingDecision::Drop => {
+                debug!("dropping invalid packet from TUN");
+                return Ok(());
+            }
+            ForwardingDecision::Forward => {
+                self.forward_egress_packet(ip_packet)?;
+            }
+            ForwardingDecision::RespondWithIcmp(_) => {
+                // For now, we do not send ICMP for invalid tun packets (since this should be handled by the OS)
+            }
         }
 
-        self.forward_egress_packet(ip_packet)?;
         Ok(())
     }
 
@@ -456,7 +475,6 @@ impl Connection {
                                     &data[consumed..],
                                     &self.available_addresses.clone(),
                                     self,
-                                    self.tun_mtu,
                                 )
                                 .await
                                 {
@@ -589,7 +607,18 @@ impl Connection {
 }
 
 impl ConnectIPEndpoint for Connection {
-    fn check_ingress_packet(&mut self, packet: &[u8]) -> bool {
+    fn check_ingress_packet(&mut self, packet: &[u8]) -> ForwardingDecision {
+        if packet.len() > self.tun_mtu as usize {
+            debug!(
+                "packet size {} exceeds TUN MTU {}",
+                packet.len(),
+                self.tun_mtu
+            );
+            return ForwardingDecision::RespondWithIcmp(crate::net::icmp::IcmpType::PacketTooBig(
+                self.tun_mtu as u32,
+            ));
+        }
+
         let (src, dst) = if let Some(ipv4) = Ipv4Packet::new(packet)
             && ipv4.get_version() == 4
         {
@@ -604,7 +633,7 @@ impl ConnectIPEndpoint for Connection {
             )
         } else {
             error!("received non-IP packet in datagram, dropping");
-            return false;
+            return ForwardingDecision::Drop;
         };
 
         debug!(
@@ -614,24 +643,28 @@ impl ConnectIPEndpoint for Connection {
             packet.len()
         );
 
-        if !check_packet_src_dst(
+        return check_packet_src_dst(
             src,
             dst,
             &self.capsule_state.remote_addresses,
             &self.capsule_state.remote_routes,
             &self.capsule_state.local_addresses,
             &self.capsule_state.local_routes,
-        ) {
-            debug!(
-                "dropping packet from peer with invalid src/dst: {} -> {}",
-                src, dst
-            );
-            return false;
-        }
-        true
+        );
     }
 
-    fn check_egress_packet(&mut self, packet: &[u8]) -> bool {
+    fn check_egress_packet(&mut self, packet: &[u8]) -> ForwardingDecision {
+        if packet.len() > self.tun_mtu as usize {
+            debug!(
+                "packet size {} exceeds TUN MTU {}",
+                packet.len(),
+                self.tun_mtu
+            );
+            return ForwardingDecision::RespondWithIcmp(crate::net::icmp::IcmpType::PacketTooBig(
+                self.tun_mtu as u32,
+            ));
+        }
+
         let (src, dst) = if let Some(ipv4) = Ipv4Packet::new(packet)
             && ipv4.get_version() == 4
         {
@@ -648,7 +681,7 @@ impl ConnectIPEndpoint for Connection {
             )
         } else {
             error!("received non-IP packet from tun, dropping");
-            return false;
+            return ForwardingDecision::Drop;
         };
 
         debug!(
@@ -658,21 +691,14 @@ impl ConnectIPEndpoint for Connection {
             packet.len()
         );
 
-        if !check_packet_src_dst(
+        return check_packet_src_dst(
             src,
             dst,
             &self.capsule_state.local_addresses,
             &self.capsule_state.local_routes,
             &self.capsule_state.remote_addresses,
             &self.capsule_state.remote_routes,
-        ) {
-            debug!(
-                "dropping packet from TUN with invalid src/dst: {} -> {}",
-                src, dst
-            );
-            return false;
-        }
-        true
+        );
     }
 
     async fn forward_ingress_packet(&mut self, packet: &[u8]) -> Result<()> {
