@@ -63,7 +63,7 @@ pub fn ip_range_to_net(start: IpAddr, end: IpAddr) -> Result<IpNet, Error> {
 }
 
 pub async fn get_next_avail_subnet(
-    available_nets: &Arc<Mutex<Vec<IpNet>>>,
+    available_nets: Arc<Mutex<Vec<IpNet>>>,
     ipv4: bool,
     prefix_len: u8,
 ) -> Option<IpNet> {
@@ -99,7 +99,7 @@ pub async fn return_subnet(available_nets: &Arc<Mutex<Vec<IpNet>>>, subnet: IpNe
 }
 
 pub async fn get_specific_subnet(
-    available_nets: &Arc<Mutex<Vec<IpNet>>>,
+    available_nets: Arc<Mutex<Vec<IpNet>>>,
     desired_subnet: IpNet,
 ) -> Option<IpNet> {
     let mut pool = available_nets.lock().await;

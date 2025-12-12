@@ -1,73 +1,60 @@
-use std::net::IpAddr;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use ipnet::IpNet;
-use octets::{Octets, OctetsMut};
-use pnet::packet::ipv4::Ipv4Packet;
-use pnet::packet::ipv6::Ipv6Packet;
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::client::{CHANNEL_CAPACITY, MAX_DATAGRAM_SIZE};
-use crate::connect_ip::capsule::{
-    AddressRequestCapsule, Capsule, CapsuleError, DatagramCapsule, RequestedAddress,
-};
-use crate::connect_ip::capsule_protocol::{
-    ConnectIPEndpoint, RoutingState, handle_capsule_data, prepare_address_and_route_assignment,
-};
+use crate::connect_ip::capsule::{AddressRequestCapsule, Capsule, RequestedAddress};
 use crate::connect_ip::request::{build_request, check_response, headers_to_strings};
-use crate::net::icmp::build_icmp_response;
-use crate::net::quic::{DEFAULT_TIMEOUT, KEEPALIVE_INTERVAL};
-use crate::net::tun::MAX_TUN_MTU;
-use crate::net::{ForwardingDecision, UdpPacket, ZERO_IPV4_ADDRESS, check_packet_src_dst, tun};
+use crate::net::quic::{DEFAULT_TIMEOUT, HTTP3_STREAM_OVERHEAD, KEEPALIVE_INTERVAL};
+use crate::net::{ForwardingDecision, UdpPacket, ZERO_IPV4_ADDRESS, tun};
 
-const SEND_BUFFER_SIZE: usize = 65535; // bytes
-const RCV_BUFFER_SIZE: usize = 65535; // bytes
 const RCV_MANY_CAPACITY: usize = 10; // number of packets
 const SEND_ADDRESS_REQUEST_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
-const MAX_TUN_MTU_FOR_DATAGRAMS: usize = MAX_DATAGRAM_SIZE - 50;
 
 struct TunnelStatus {
+    http_request_stream: Option<u64>,
     established: bool,
     addresses_assigned: bool,
     address_requested: bool,
 }
 
+pub struct Config {
+    pub server_name: String,
+    pub quic_config: quiche::Config,
+    pub local: scion_proto::address::SocketAddr,
+    pub remote: scion_proto::address::SocketAddr,
+    pub tun_name: String,
+    pub configured_mtu: u16,
+    pub routes: Vec<IpNet>,
+}
+
 pub struct Connection {
-    local: scion_proto::address::SocketAddr,
-    remote: scion_proto::address::SocketAddr,
+    config: Config,
     conn: quiche::Connection,
     h3_conn: Option<quiche::h3::Connection>,
+    connect_ip_endpoint: Option<crate::connect_ip::capsule_protocol::Endpoint>,
     rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
     tx_quic_to_udp: mpsc::Sender<UdpPacket>,
-    tun_name: String,
     tx_tun_configuration: Option<mpsc::Sender<tun::TunConfiguration>>,
     tx_quic_to_tun: Option<mpsc::Sender<Vec<u8>>>,
     cancel_token: CancellationToken,
     available_addresses: Arc<Mutex<Vec<IpNet>>>,
-    routing_state: RoutingState,
     tunnel_status: TunnelStatus,
     address_request_timer: std::time::Instant,
-    stream_data_received: Vec<u8>, // data received from the stream, not yet processed
-    stream_data_to_send: Vec<u8>, // needs to be sent on the stream, not yet sent due to flow control
 }
 
 impl Connection {
     pub fn new(
-        server_name: String,
-        mut quic_config: quiche::Config,
-        local: scion_proto::address::SocketAddr,
-        remote: scion_proto::address::SocketAddr,
+        mut config: Config,
         rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
         tx_quic_to_udp: mpsc::Sender<UdpPacket>,
-        tun_name: String,
-        configured_mtu: u16,
         cancel_token: CancellationToken,
         available_addresses: Arc<Mutex<Vec<IpNet>>>,
-        routes: Vec<IpNet>,
     ) -> Result<Self> {
         // Generate a random source connection ID for the connection.
         let mut scid = [0; quiche::MAX_CONN_ID_LEN];
@@ -78,66 +65,57 @@ impl Connection {
 
         // Create a QUIC connection and initiate handshake.
         let conn = quiche::connect(
-            Some(&server_name),
+            Some(&config.server_name),
             &scid,
-            local.local_address().ok_or(anyhow::anyhow!(
+            config.local.local_address().ok_or(anyhow::anyhow!(
                 "failed to get local address from {:?}",
-                local
+                config.local
             ))?,
-            remote.local_address().ok_or(anyhow::anyhow!(
+            config.remote.local_address().ok_or(anyhow::anyhow!(
                 "failed to get remote address from {:?}",
-                remote
+                config.remote
             ))?,
-            &mut quic_config,
+            &mut config.quic_config,
         )?;
 
         info!(
             "connecting to {:} from {:} with scid {:?}",
-            remote, local, scid
+            config.remote, config.local, scid
         );
 
         Ok(Connection {
-            local,
-            remote,
+            config,
             conn,
             h3_conn: None,
+            connect_ip_endpoint: None,
             rx_udp_to_quic,
             tx_quic_to_udp,
-            tun_name,
             tx_tun_configuration: None,
             tx_quic_to_tun: None,
             cancel_token,
             available_addresses,
-            routing_state: RoutingState {
-                stream_id: None,
-                mtu: configured_mtu,
-                remote_addresses: vec![],
-                local_addresses: vec![],
-                local_routes: routes,
-                remote_routes: vec![],
-            },
             tunnel_status: TunnelStatus {
+                http_request_stream: None,
                 established: false,
                 addresses_assigned: false,
                 address_requested: false,
             },
             address_request_timer: std::time::Instant::now(),
-            stream_data_received: Vec::with_capacity(RCV_BUFFER_SIZE),
-            stream_data_to_send: Vec::with_capacity(SEND_BUFFER_SIZE),
         })
     }
 
     pub async fn start_connection_handling(&mut self) -> Result<()> {
         let mut buf = [0; MAX_DATAGRAM_SIZE];
+        let mut stream_buf = [0; 65535];
 
         // Channels between TUN and QUIC tasks. Contents are IP packets.
         let (tx_quic_to_tun, rx_quic_to_tun) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
         let (tx_tun_to_quic, mut rx_tun_to_quic) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
 
         let mut tun = tun::Tun::new(
-            &self.tun_name,
+            &self.config.tun_name,
             tx_tun_to_quic.clone(),
-            self.routing_state.mtu,
+            self.config.configured_mtu,
         )?;
         let (tx_tun_configuration, rx_tun_configuration) =
             mpsc::channel::<tun::TunConfiguration>(CHANNEL_CAPACITY);
@@ -157,11 +135,11 @@ impl Connection {
             .send(UdpPacket {
                 data: buf[..write].to_vec(),
                 src: scion_proto::address::SocketAddr::from_std(
-                    self.local.isd_asn(),
+                    self.config.local.isd_asn(),
                     send_info.from,
                 ),
                 dst: scion_proto::address::SocketAddr::from_std(
-                    self.remote.isd_asn(),
+                    self.config.remote.isd_asn(),
                     send_info.to,
                 ),
             })
@@ -231,36 +209,64 @@ impl Connection {
                 break;
             }
 
-            if !self.stream_data_to_send.is_empty() {
-                let to_send = self.stream_data_to_send.split_off(0);
-                if let Some(stream_id) = self.routing_state.stream_id {
-                    match self.h3_conn.as_mut().unwrap().send_body(
-                        &mut self.conn,
-                        stream_id,
-                        &to_send,
-                        false,
-                    ) {
-                        Ok(sent) => {
-                            debug!("send_body sent {} bytes on stream {}", sent, stream_id);
-                            if sent < to_send.len() {
-                                debug!(
-                                    "only sent {} out of {} bytes, storing remaining",
-                                    sent,
-                                    to_send.len()
-                                );
-                                self.stream_data_to_send.extend_from_slice(&to_send[sent..]);
-                            }
+            if let Some(connect_ip_endpoint) = &mut self.connect_ip_endpoint {
+                // Send pending datagrams from Connect-IP endpoint
+                while !self.conn.is_dgram_send_queue_full()
+                    && let Some(datagram) = connect_ip_endpoint.send_datagram()
+                {
+                    match self.conn.dgram_send(&datagram) {
+                        Ok(()) => {
+                            debug!("sent {} bytes datagram via QUIC", datagram.len());
                         }
-                        Err(quiche::h3::Error::Done) => {
-                            self.stream_data_to_send.extend_from_slice(&to_send);
+                        Err(quiche::Error::Done) => {
+                            debug!("dgram_send would block, buffering datagram");
+                            connect_ip_endpoint.return_datagram(&datagram);
+                            break;
                         }
                         Err(e) => {
-                            error!("send_body failed: {:?}", e);
-                            return Err(anyhow!("send_body failed: {:?}", e));
+                            error!("dgram_send failed: {:?}", e);
+                            return Err(anyhow!("dgram_send failed: {:?}", e));
                         }
                     }
-                } else {
-                    warn!("no stream id for sending data, dropping");
+                }
+
+                let stream_capacity = self.conn.stream_capacity(connect_ip_endpoint.stream_id)?;
+                if stream_capacity > HTTP3_STREAM_OVERHEAD {
+                    let sent = connect_ip_endpoint
+                        .send_stream_data(&mut stream_buf, stream_capacity - HTTP3_STREAM_OVERHEAD);
+                    if sent > 0 {
+                        match self.h3_conn.as_mut().unwrap().send_body(
+                            &mut self.conn,
+                            connect_ip_endpoint.stream_id,
+                            &stream_buf[..sent],
+                            false,
+                        ) {
+                            Ok(sent_h3) => {
+                                debug!(
+                                    "send_body sent {} bytes on stream {}",
+                                    sent_h3, connect_ip_endpoint.stream_id
+                                );
+                                if sent_h3 < sent {
+                                    // This should generally not happen, since we checked stream capacity before.
+                                    // However, quiche may handle flow control however it wants to. There we handle it.
+                                    debug!(
+                                        "send_body would block, buffering unsent data, sent {}/{} bytes",
+                                        sent_h3, sent
+                                    );
+                                    connect_ip_endpoint
+                                        .return_stream_data(&stream_buf[sent_h3..sent]);
+                                }
+                            }
+                            Err(quiche::h3::Error::Done) => {
+                                debug!("send_body would block, buffering unsent data");
+                                connect_ip_endpoint.return_stream_data(&stream_buf[..sent]);
+                            }
+                            Err(e) => {
+                                error!("send_body failed: {:?}", e);
+                                return Err(anyhow!("send_body failed: {:?}", e));
+                            }
+                        }
+                    }
                 }
             }
 
@@ -280,11 +286,11 @@ impl Connection {
                     .send(UdpPacket {
                         data: buf[..write].to_vec(),
                         src: scion_proto::address::SocketAddr::from_std(
-                            self.local.isd_asn(),
+                            self.config.local.isd_asn(),
                             send_info.from,
                         ),
                         dst: scion_proto::address::SocketAddr::from_std(
-                            self.remote.isd_asn(),
+                            self.config.remote.isd_asn(),
                             send_info.to,
                         ),
                     })
@@ -312,6 +318,7 @@ impl Connection {
         packet_buf: &mut [UdpPacket],
         num_packets: usize,
     ) -> Result<()> {
+        let mut buf = [0; MAX_DATAGRAM_SIZE];
         for packet in packet_buf.iter_mut().take(num_packets) {
             let recv_info = quiche::RecvInfo {
                 from: packet
@@ -333,50 +340,14 @@ impl Connection {
         // Handle address negotiation (initial address assignment and route advertisement)
         self.handle_address_negotiation().await?;
 
-        // Handle datagrams and forward to TUN if tunnel is established
-        if self.conn.is_established() && self.tunnel_status.established {
+        // Handle datagrams if connection is established
+        if self.conn.is_established() && !self.conn.is_in_early_data() {
             // Receive datagrams from QUIC and forward to TUN
-            let mut buf = [0; MAX_DATAGRAM_SIZE];
             while let Ok(len) = self.conn.dgram_recv(&mut buf) {
-                let mut octets = Octets::with_slice(&buf[..len]);
-                let stream_id = octets.get_varint()? * 4;
-                let context_id = octets.get_varint()?;
-                let packet_start = octets.off();
-
-                if self.routing_state.stream_id != Some(stream_id) {
-                    error!(
-                        "{} received datagram on unknown stream id {}",
-                        self.conn.trace_id(),
-                        stream_id
-                    );
-                    continue;
-                }
-
-                if context_id != 0 {
-                    error!(
-                        "{} received datagram with unknown context id {}",
-                        self.conn.trace_id(),
-                        context_id
-                    );
-                    continue;
-                }
-
-                let ip_packet = &buf[packet_start..len];
-                match self.check_ingress_packet(ip_packet) {
-                    ForwardingDecision::Drop => {
-                        debug!("dropping invalid packet from Datagram");
-                        continue;
-                    }
-                    ForwardingDecision::Forward => {
-                        self.forward_egress_packet(ip_packet)?;
-                    }
-                    ForwardingDecision::RespondWithIcmp(icmp_type) => {
-                        if let Some(icmp_response) = build_icmp_response(ip_packet, icmp_type) {
-                            self.forward_egress_packet(&icmp_response)?;
-                        } else {
-                            debug!("could not build ICMP error message, dropping packet");
-                        }
-                    }
+                if let Some(connect_ip_endpoint) = &mut self.connect_ip_endpoint {
+                    connect_ip_endpoint.recv_datagram(&buf[..len]).await?;
+                } else {
+                    debug!("Connect-IP connection not established yet, dropping datagram.");
                 }
             }
         }
@@ -385,17 +356,20 @@ impl Connection {
     }
 
     async fn process_tun_packet(&mut self, ip_packet: &[u8]) -> Result<()> {
-        match self.check_egress_packet(ip_packet) {
-            ForwardingDecision::Drop => {
-                debug!("dropping invalid packet from TUN");
-                return Ok(());
+        if let Some(connect_ip_endpoint) = &mut self.connect_ip_endpoint {
+            match connect_ip_endpoint.check_egress_packet(ip_packet) {
+                ForwardingDecision::Drop => {
+                    debug!("dropping invalid packet from TUN");
+                }
+                ForwardingDecision::Forward => {
+                    connect_ip_endpoint.forward_egress_packet(ip_packet)?;
+                }
+                ForwardingDecision::RespondWithIcmp(_) => {
+                    // For now, we do not send ICMP for invalid tun packets (since this should be handled by the OS)
+                }
             }
-            ForwardingDecision::Forward => {
-                self.forward_egress_packet(ip_packet)?;
-            }
-            ForwardingDecision::RespondWithIcmp(_) => {
-                // For now, we do not send ICMP for invalid tun packets (since this should be handled by the OS)
-            }
+        } else {
+            debug!("Connect-IP connection not established yet, dropping packet.");
         }
 
         Ok(())
@@ -414,16 +388,16 @@ impl Connection {
 
         // Send HTTP requests.
         if let Some(h3_conn) = &mut self.h3_conn
-            && self.routing_state.stream_id.is_none()
+            && self.tunnel_status.http_request_stream.is_none()
         {
             let req = build_request(
                 "localhost".to_string(),
                 "/vpn".to_string(),
-                self.routing_state.mtu,
+                self.config.configured_mtu,
             );
             debug!("sending HTTP request {req:?}");
             let stream_id = h3_conn.send_request(&mut self.conn, &req, false)?;
-            self.routing_state.stream_id = Some(stream_id);
+            self.tunnel_status.http_request_stream = Some(stream_id);
             debug!("sent CONNECT request on stream {}", stream_id);
         }
 
@@ -438,7 +412,7 @@ impl Connection {
                             headers_to_strings(&list),
                             stream_id
                         );
-                        if Some(stream_id) != self.routing_state.stream_id {
+                        if Some(stream_id) != self.tunnel_status.http_request_stream {
                             error!(
                                 "{} got headers on unknown stream id {}. Closing connection.",
                                 self.conn.trace_id(),
@@ -450,14 +424,26 @@ impl Connection {
                         let (valid, tun_mtu) = check_response(&list);
                         if valid {
                             self.tunnel_status.established = true;
-                            if let Some(mtu) = tun_mtu {
-                                self.routing_state.mtu = mtu;
+                            let tun_mtu = tun_mtu.unwrap_or(self.config.configured_mtu);
+                            if let Some(tx_tun_update) = &self.tx_tun_configuration {
+                                tx_tun_update
+                                    .send(tun::TunConfiguration::SetMTU(tun_mtu))
+                                    .await?;
                             }
-                            self.update_tun_interface(tun::TunConfiguration::SetMTU(
-                                self.routing_state.mtu,
-                            ))
-                            .await?;
-                            info!("connected. negotiated TUN MTU: {}", self.routing_state.mtu);
+
+                            info!("connected. negotiated TUN MTU: {}", tun_mtu);
+
+                            // Create Connect-IP endpoint
+                            self.connect_ip_endpoint =
+                                Some(crate::connect_ip::capsule_protocol::Endpoint::new(
+                                    self.tunnel_status.http_request_stream.unwrap(),
+                                    tun_mtu,
+                                    self.available_addresses.clone(),
+                                    self.config.routes.clone(),
+                                    self.tx_quic_to_tun.clone().unwrap(),
+                                    self.tx_tun_configuration.clone().unwrap(),
+                                    self.conn.dgram_max_writable_len().is_some(),
+                                ));
                         } else {
                             error!("unexpected response from server, closing connection");
                             self.conn.close(true, 0x100, b"unexpected response")?;
@@ -466,12 +452,6 @@ impl Connection {
                     }
 
                     Ok((stream_id, quiche::h3::Event::Data)) => {
-                        trace!(
-                            "{} got data on stream id {}",
-                            self.conn.trace_id(),
-                            stream_id
-                        );
-
                         let mut buf = [0; RCV_MANY_CAPACITY * MAX_DATAGRAM_SIZE];
 
                         while let Ok(read) = self.h3_conn.as_mut().unwrap().recv_body(
@@ -481,33 +461,27 @@ impl Connection {
                         ) {
                             trace!("got {read} bytes of response data on stream {stream_id}");
 
-                            let mut data = self.stream_data_received.split_off(0);
-                            data.extend_from_slice(&buf[..read]);
-                            let mut consumed = 0;
-                            'process_capsule_data: while consumed < data.len() {
-                                match handle_capsule_data(
-                                    &data[consumed..],
-                                    &self.available_addresses.clone(),
-                                    self,
-                                )
-                                .await
-                                {
-                                    Ok(len) => {
-                                        trace!(
-                                            "processed capsule data of length {} on stream {}",
-                                            len, stream_id
-                                        );
-                                        consumed += len;
-                                    }
-                                    Err(err) => {
-                                        if let Some(capsule_err) =
-                                            err.downcast_ref::<CapsuleError>()
-                                            && matches!(capsule_err, CapsuleError::Buffer(_))
-                                        {
-                                            trace!("need more data to process capsule.");
-                                            break 'process_capsule_data;
-                                        }
+                            if self.connect_ip_endpoint.is_none() {
+                                error!(
+                                    "got data before successful request on stream id {}. Closing connection.",
+                                    stream_id
+                                );
+                                self.conn.close(true, 0x109, b"data on unknown stream")?;
+                                break 'h3_events;
+                            }
+                            if let Some(connect_ip_endpoint) = &mut self.connect_ip_endpoint {
+                                if connect_ip_endpoint.stream_id != stream_id {
+                                    error!(
+                                        "got data on unknown stream id {}. Closing connection.",
+                                        stream_id
+                                    );
+                                    self.conn.close(true, 0x109, b"data on unknown stream")?;
+                                    break 'h3_events;
+                                }
 
+                                match connect_ip_endpoint.recv_stream_data(&buf[..read]).await {
+                                    Ok(()) => {}
+                                    Err(err) => {
                                         error!(
                                             "error handling capsule data: {:?}, closing connection",
                                             err
@@ -517,8 +491,6 @@ impl Connection {
                                     }
                                 }
                             }
-                            self.stream_data_received
-                                .extend_from_slice(&data[consumed..]);
                         }
                     }
 
@@ -552,11 +524,13 @@ impl Connection {
                 }
             }
         }
+
         Ok(())
     }
 
     async fn handle_address_negotiation(&mut self) -> Result<()> {
-        if self.routing_state.local_addresses.is_empty()
+        if let Some(connect_ip_endpoint) = &mut self.connect_ip_endpoint
+            && connect_ip_endpoint.routing_state.local_addresses.is_empty()
             && !self.tunnel_status.address_requested
             && self.tunnel_status.established
         {
@@ -570,30 +544,9 @@ impl Connection {
 
         if !self.tunnel_status.addresses_assigned
             && self.tunnel_status.established
-            && self.routing_state.stream_id.is_some()
+            && let Some(connect_ip_endpoint) = &mut self.connect_ip_endpoint
         {
-            let mut buf = [0; 1000];
-            let mut octets = OctetsMut::with_slice(&mut buf);
-            let assigned_address = prepare_address_and_route_assignment(
-                &mut self.routing_state,
-                self.available_addresses.clone(),
-                &mut octets,
-            )
-            .await?;
-
-            if let Some(assigned_address) = assigned_address {
-                self.update_tun_interface(tun::TunConfiguration::AddRoute(assigned_address))
-                    .await?;
-            }
-
-            let payload_len = octets.off();
-            if payload_len == 0 {
-                error!("no capsule prepared, not sending");
-                return Ok(());
-            }
-
-            self.stream_data_to_send
-                .extend_from_slice(&buf[..payload_len]);
+            connect_ip_endpoint.handle_initial_routing_setup().await?;
 
             self.tunnel_status.addresses_assigned = true;
         }
@@ -610,202 +563,11 @@ impl Connection {
             }],
         };
         let capsule = Capsule::AddressRequest(addr_req);
-        let mut buf = [0; 30];
-        let mut octets_mut = octets::OctetsMut::with_slice(&mut buf);
-        capsule.append(&mut octets_mut)?;
-        let payload_len = octets_mut.off();
-        self.stream_data_to_send
-            .extend_from_slice(&buf[..payload_len]);
+        self.connect_ip_endpoint
+            .as_mut()
+            .ok_or_else(|| anyhow!("Connect-IP endpoint not established"))?
+            .send_capsule(&capsule, true)?;
 
         Ok(())
-    }
-}
-
-impl ConnectIPEndpoint for Connection {
-    fn check_ingress_packet(&mut self, packet: &[u8]) -> ForwardingDecision {
-        if packet.len() > self.routing_state.mtu as usize {
-            debug!(
-                "packet size {} exceeds TUN MTU {}",
-                packet.len(),
-                self.routing_state.mtu
-            );
-            return ForwardingDecision::RespondWithIcmp(crate::net::icmp::IcmpType::PacketTooBig(
-                self.routing_state.mtu as u32,
-            ));
-        }
-
-        let (src, dst) = if let Some(ipv4) = Ipv4Packet::new(packet)
-            && ipv4.get_version() == 4
-        {
-            (
-                IpAddr::V4(ipv4.get_source()),
-                IpAddr::V4(ipv4.get_destination()),
-            )
-        } else if let Some(ipv6) = Ipv6Packet::new(packet) {
-            (
-                IpAddr::V6(ipv6.get_source()),
-                IpAddr::V6(ipv6.get_destination()),
-            )
-        } else {
-            error!("received non-IP packet in datagram, dropping");
-            return ForwardingDecision::Drop;
-        };
-
-        debug!(
-            "received IP packet from QUIC connection: {} -> {}, {} bytes",
-            src,
-            dst,
-            packet.len()
-        );
-
-        check_packet_src_dst(
-            src,
-            dst,
-            &self.routing_state.remote_addresses,
-            &self.routing_state.remote_routes,
-            &self.routing_state.local_addresses,
-            &self.routing_state.local_routes,
-        )
-    }
-
-    fn check_egress_packet(&mut self, packet: &[u8]) -> ForwardingDecision {
-        if packet.len() > self.routing_state.mtu as usize {
-            debug!(
-                "packet size {} exceeds TUN MTU {}",
-                packet.len(),
-                self.routing_state.mtu
-            );
-            return ForwardingDecision::RespondWithIcmp(crate::net::icmp::IcmpType::PacketTooBig(
-                self.routing_state.mtu as u32,
-            ));
-        }
-
-        let (src, dst) = if let Some(ipv4) = Ipv4Packet::new(packet)
-            && ipv4.get_version() == 4
-        {
-            (
-                IpAddr::V4(ipv4.get_source()),
-                IpAddr::V4(ipv4.get_destination()),
-            )
-        } else if let Some(ipv6) = Ipv6Packet::new(packet)
-            && ipv6.get_version() == 6
-        {
-            (
-                IpAddr::V6(ipv6.get_source()),
-                IpAddr::V6(ipv6.get_destination()),
-            )
-        } else {
-            error!("received non-IP packet from tun, dropping");
-            return ForwardingDecision::Drop;
-        };
-
-        debug!(
-            "received IP packet from TUN: {} -> {}, {} bytes",
-            src,
-            dst,
-            packet.len()
-        );
-
-        check_packet_src_dst(
-            src,
-            dst,
-            &self.routing_state.local_addresses,
-            &self.routing_state.local_routes,
-            &self.routing_state.remote_addresses,
-            &self.routing_state.remote_routes,
-        )
-    }
-
-    async fn forward_ingress_packet(&mut self, packet: &[u8]) -> Result<()> {
-        if let Some(tx_quic_to_tun) = &self.tx_quic_to_tun {
-            tx_quic_to_tun.send(packet.to_vec()).await?;
-        } else {
-            error!("no channel to TUN available, dropping packet");
-        }
-
-        Ok(())
-    }
-
-    fn forward_egress_packet(&mut self, packet: &[u8]) -> Result<()> {
-        if self.conn.is_established()
-            && let Some(stream_id) = self.routing_state.stream_id
-        {
-            let mut buf = [0; MAX_TUN_MTU + 32];
-            if self.conn.dgram_max_writable_len().is_some()
-                && self.routing_state.mtu as usize <= MAX_TUN_MTU_FOR_DATAGRAMS
-            {
-                let mut octets = OctetsMut::with_slice(&mut buf);
-                octets.put_varint(stream_id / 4)?;
-                octets.put_varint(0)?;
-                octets.put_bytes(packet)?;
-                let len = octets.off();
-                match self.conn.dgram_send(&buf[..len]) {
-                    Ok(_) => {}
-                    Err(quiche::Error::Done) => {
-                        debug!("datagram send queue full, dropping packet");
-                    }
-                    Err(e) => {
-                        error!("failed to send datagram: {:?}", e);
-                    }
-                }
-            } else {
-                let mut datagram_data = [0u8; MAX_TUN_MTU + 8];
-                let mut datagram_octets = OctetsMut::with_slice(&mut datagram_data);
-                datagram_octets.put_varint(0)?;
-                datagram_octets.put_bytes(packet)?;
-                let len = datagram_octets.off();
-                let datagram_capsule = DatagramCapsule {
-                    data: datagram_data[..len].to_vec(),
-                };
-                let capsule = Capsule::Datagram(datagram_capsule);
-                let mut octets = OctetsMut::with_slice(&mut buf);
-                capsule.append(&mut octets)?;
-                let len = octets.off();
-                if self.stream_data_to_send.len() + len > SEND_BUFFER_SIZE {
-                    debug!(
-                        "too much remaining data to send ({} bytes), dropping packet",
-                        self.stream_data_to_send.len() + len
-                    );
-                    return Ok(());
-                }
-                self.stream_data_to_send.extend_from_slice(&buf[..len]);
-            }
-        } else {
-            debug!("connection not established yet, dropping packet");
-        }
-        Ok(())
-    }
-
-    async fn update_tun_interface(&self, update: tun::TunConfiguration) -> Result<()> {
-        if let Some(tx_tun_configuration) = &self.tx_tun_configuration {
-            tx_tun_configuration.send(update).await?;
-        } else {
-            error!("no channel to TUN available, cannot update configuration");
-        }
-        Ok(())
-    }
-
-    async fn send_capsule(&mut self, capsule: Capsule) -> Result<()> {
-        let mut buf = [0; MAX_TUN_MTU + 32];
-        let mut octets = OctetsMut::with_slice(&mut buf);
-        capsule.append(&mut octets)?;
-        let len = octets.off();
-        if self.stream_data_to_send.len() + len > SEND_BUFFER_SIZE {
-            debug!(
-                "too much remaining data to send ({} bytes), dropping capsule",
-                self.stream_data_to_send.len() + len
-            );
-            return Ok(());
-        }
-        self.stream_data_to_send.extend_from_slice(&buf[..len]);
-        Ok(())
-    }
-
-    fn get_routing_state(&self) -> RoutingState {
-        self.routing_state.clone()
-    }
-
-    fn set_routing_state(&mut self, state: RoutingState) {
-        self.routing_state = state;
     }
 }
