@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
-use crate::client::connection::Connection;
+use crate::client::connection::{Config, Connection};
 use crate::net::UdpPacket;
 use crate::net::quic::MAX_DATAGRAM_SIZE;
 
@@ -71,21 +71,26 @@ impl Client {
             // Get local address.
             let local_addr = socket.local_addr()?;
 
-            let mut connection = Connection::new(
-                self.config
+            let config = Config {
+                server_name: self
+                    .config
                     .host
                     .clone()
                     .unwrap_or("connect-ip-rust-scion".to_string()),
                 quic_config,
-                scion_proto::address::SocketAddr::from_std(IsdAsn::WILDCARD, local_addr),
-                self.config.remote,
+                local: scion_proto::address::SocketAddr::from_std(IsdAsn::WILDCARD, local_addr),
+                remote: self.config.remote,
+                tun_name: self.config.tun_name.clone(),
+                configured_mtu: self.config.tun_mtu,
+                routes: self.config.routes.clone(),
+            };
+
+            let mut connection = Connection::new(
+                config,
                 rx_udp_to_quic,
                 tx_quic_to_udp,
-                self.config.tun_name.clone(),
-                self.config.tun_mtu,
                 cancel_token.clone(),
                 available_addresses,
-                self.config.routes.clone(),
             )?;
 
             // Spawn connection handler task
@@ -132,7 +137,7 @@ impl Client {
                             }
                             Err(e) => {
                                 info!("QUIC task panicked: {}", e);
-                                break Err(anyhow!("QUIC task panicked: {}", e));
+                                break Err(anyhow!("QUIC task panicked: {:?}", e));
                             }
                         }
                     }
@@ -181,18 +186,26 @@ impl Client {
             // Get local address.
             let local_addr = socket.local_addr();
 
-            let mut connection = Connection::new(
-                self.config.host.clone().unwrap_or("localhost".to_string()),
+            let config = Config {
+                server_name: self
+                    .config
+                    .host
+                    .clone()
+                    .unwrap_or("connect-ip-rust-scion".to_string()),
                 quic_config,
-                local_addr,
-                self.config.remote,
+                local: local_addr,
+                remote: self.config.remote,
+                tun_name: self.config.tun_name.clone(),
+                configured_mtu: self.config.tun_mtu,
+                routes: self.config.routes.clone(),
+            };
+
+            let mut connection = Connection::new(
+                config,
                 rx_udp_to_quic,
                 tx_quic_to_udp,
-                self.config.tun_name.clone(),
-                self.config.tun_mtu,
                 cancel_token.clone(),
                 available_addresses,
-                self.config.routes.clone(),
             )?;
 
             // Spawn connection handler task

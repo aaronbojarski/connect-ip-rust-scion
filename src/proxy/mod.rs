@@ -18,7 +18,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::net::quic::MAX_DATAGRAM_SIZE;
 use crate::net::{UdpPacket, return_subnet};
-use crate::proxy::connection::Connection;
+use crate::proxy::connection::{Config, Connection};
 
 const TOKEN_PREFIX: &[u8] = b"connect-ip-rust-scion";
 const HMAC_TAG_LEN: usize = 32;
@@ -389,18 +389,22 @@ impl Proxy {
             let tun_name = format!("tun{}", self.next_client);
             self.next_client += 1;
 
+            let config = Config {
+                tun_name,
+                local_isd_as: local_scion_socket.isd_asn(),
+                remote_isd_as: src_scion_socket.isd_asn(),
+                mtu: self.config.tun_mtu,
+                routes: self.config.routes.clone(),
+            };
+
             // Store connection info
             let mut client_conn = Connection::new(
+                config,
                 conn,
-                local_scion_socket.isd_asn(),
-                src_scion_socket.isd_asn(),
                 rx_from_main,
                 tx_quic_to_udp.clone(),
-                tun_name,
-                self.config.tun_mtu,
                 cancel_token.clone(),
                 self.available_addresses.clone(),
-                self.config.routes.clone(),
             );
             self.connections.lock().await.insert(
                 scid.clone().into_owned(),
@@ -423,9 +427,11 @@ impl Proxy {
                     error!("connection {:?} error: {:?}", scid_owned, e);
                 }
                 connections_clone.lock().await.remove(&scid_owned);
-                for addr in client_conn.routing_state.remote_addresses.iter() {
-                    info!("Releasing address {}", addr);
-                    return_subnet(&available_nets, *addr).await;
+                if let Some(connect_ip_endpoint) = client_conn.connect_ip_endpoint {
+                    for addr in connect_ip_endpoint.routing_state.remote_addresses.iter() {
+                        info!("Releasing address {}", addr);
+                        return_subnet(&available_nets, *addr).await;
+                    }
                 }
             });
         } else {
