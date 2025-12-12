@@ -8,7 +8,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::connect_ip::capsule_protocol::Endpoint;
+use crate::connect_ip::Endpoint;
 use crate::connect_ip::request::{build_response, headers_to_strings};
 use crate::net::quic::{
     DEFAULT_TIMEOUT, HTTP3_STREAM_OVERHEAD, KEEPALIVE_INTERVAL, MAX_DATAGRAM_SIZE,
@@ -34,7 +34,7 @@ pub struct Connection {
     pub config: Config,
     conn: quiche::Connection,
     h3_conn: Option<quiche::h3::Connection>,
-    pub connect_ip_endpoint: Option<crate::connect_ip::capsule_protocol::Endpoint>,
+    pub connect_ip_endpoint: Option<crate::connect_ip::Endpoint>,
     rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
     tx_quic_to_udp: mpsc::Sender<UdpPacket>,
     tx_quic_to_tun: Option<mpsc::Sender<Vec<u8>>>,

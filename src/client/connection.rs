@@ -37,7 +37,7 @@ pub struct Connection {
     config: Config,
     conn: quiche::Connection,
     h3_conn: Option<quiche::h3::Connection>,
-    connect_ip_endpoint: Option<crate::connect_ip::capsule_protocol::Endpoint>,
+    connect_ip_endpoint: Option<crate::connect_ip::Endpoint>,
     rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
     tx_quic_to_udp: mpsc::Sender<UdpPacket>,
     tx_tun_configuration: Option<mpsc::Sender<tun::TunConfiguration>>,
@@ -434,16 +434,15 @@ impl Connection {
                             info!("connected. negotiated TUN MTU: {}", tun_mtu);
 
                             // Create Connect-IP endpoint
-                            self.connect_ip_endpoint =
-                                Some(crate::connect_ip::capsule_protocol::Endpoint::new(
-                                    self.tunnel_status.http_request_stream.unwrap(),
-                                    tun_mtu,
-                                    self.available_addresses.clone(),
-                                    self.config.routes.clone(),
-                                    self.tx_quic_to_tun.clone().unwrap(),
-                                    self.tx_tun_configuration.clone().unwrap(),
-                                    self.conn.dgram_max_writable_len().is_some(),
-                                ));
+                            self.connect_ip_endpoint = Some(crate::connect_ip::Endpoint::new(
+                                self.tunnel_status.http_request_stream.unwrap(),
+                                tun_mtu,
+                                self.available_addresses.clone(),
+                                self.config.routes.clone(),
+                                self.tx_quic_to_tun.clone().unwrap(),
+                                self.tx_tun_configuration.clone().unwrap(),
+                                self.conn.dgram_max_writable_len().is_some(),
+                            ));
                         } else {
                             error!("unexpected response from server, closing connection");
                             self.conn.close(true, 0x100, b"unexpected response")?;
