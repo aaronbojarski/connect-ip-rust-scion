@@ -3,6 +3,17 @@
 version = 4
 
 [[package]]
+name = "aes"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
+dependencies = [
+ "cfg-if",
+ "cipher",
+ "cpufeatures",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -37,6 +48,49 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94fb8275041c72129eb51b7d0322c29b8387a0386127718b096429201a5d6ece"
 dependencies = [
  "alloc-no-stdlib",
+]
+
+[[package]]
+name = "anapaya-quinn"
+version = "0.11.9-ana.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ddb3b7040c0a7c5eceddff046895003684d1e4e00fd9c3db652594a0337fa0e"
+dependencies = [
+ "anapaya-quinn-proto",
+ "bytes",
+ "cfg_aliases",
+ "pin-project-lite",
+ "quinn-udp",
+ "rustc-hash",
+ "rustls",
+ "socket2",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+ "web-time",
+]
+
+[[package]]
+name = "anapaya-quinn-proto"
+version = "0.11.13-ana.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df03dea9c2219f4368fcc22eadf4776468c94c62f5db9da941a05dbb7ef88c4e"
+dependencies = [
+ "bytes",
+ "fastbloom",
+ "getrandom 0.3.4",
+ "lru-slab",
+ "rand",
+ "ring",
+ "rustc-hash",
+ "rustls",
+ "rustls-pki-types",
+ "rustls-platform-verifier",
+ "slab",
+ "thiserror 2.0.17",
+ "tinyvec",
+ "tracing",
+ "web-time",
 ]
 
 [[package]]
@@ -362,6 +416,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cipher"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
+dependencies = [
+ "crypto-common",
+ "inout",
+]
+
+[[package]]
 name = "clap"
 version = "4.5.53"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -400,6 +464,17 @@ name = "clap_lex"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1d728cc89cf3aee9ff92b05e62b19ee65a02b5702cff7d5a377e32c6ae29d8d"
+
+[[package]]
+name = "cmac"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8543454e3c3f5126effff9cd44d562af4e31fb8ce1cc0d3dcd8f084515dbc1aa"
+dependencies = [
+ "cipher",
+ "dbl",
+ "digest",
+]
 
 [[package]]
 name = "cmake"
@@ -561,6 +636,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dbl"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd2735a791158376708f9347fe8faba9667589d82427ef3aed6794a8981de3d9"
+dependencies = [
+ "generic-array",
+]
+
+[[package]]
 name = "debug_panic"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -630,6 +714,7 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer",
  "crypto-common",
+ "subtle",
 ]
 
 [[package]]
@@ -691,7 +776,7 @@ dependencies = [
 [[package]]
 name = "endhost-api"
 version = "0.2.0"
-source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=acl#0a8152b43894eddd728b8f878943fe18bcf672fd"
+source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=main#e8f97085a516f28db4f80860d657bd48e669e85d"
 dependencies = [
  "axum",
  "endhost-api-models",
@@ -703,7 +788,7 @@ dependencies = [
 [[package]]
 name = "endhost-api-client"
 version = "0.2.0"
-source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=acl#0a8152b43894eddd728b8f878943fe18bcf672fd"
+source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=main#e8f97085a516f28db4f80860d657bd48e669e85d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -720,7 +805,7 @@ dependencies = [
 [[package]]
 name = "endhost-api-models"
 version = "0.2.0"
-source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=acl#0a8152b43894eddd728b8f878943fe18bcf672fd"
+source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=main#e8f97085a516f28db4f80860d657bd48e669e85d"
 dependencies = [
  "async-trait",
  "scion-proto",
@@ -731,7 +816,7 @@ dependencies = [
 [[package]]
 name = "endhost-api-protobuf"
 version = "0.2.0"
-source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=acl#0a8152b43894eddd728b8f878943fe18bcf672fd"
+source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=main#e8f97085a516f28db4f80860d657bd48e669e85d"
 dependencies = [
  "endhost-api-models",
  "prost",
@@ -1350,6 +1435,15 @@ dependencies = [
  "hashbrown",
  "serde",
  "serde_core",
+]
+
+[[package]]
+name = "inout"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
+dependencies = [
+ "generic-array",
 ]
 
 [[package]]
@@ -2260,7 +2354,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1906b49b0c3bc04b5fe5d86a77925ae6524a19b816ae38ce1e426255f1d8a31"
 dependencies = [
  "bytes",
- "fastbloom",
  "getrandom 0.3.4",
  "lru-slab",
  "rand",
@@ -2268,7 +2361,6 @@ dependencies = [
  "rustc-hash",
  "rustls",
  "rustls-pki-types",
- "rustls-platform-verifier",
  "slab",
  "thiserror 2.0.17",
  "tinyvec",
@@ -2631,10 +2723,12 @@ dependencies = [
 [[package]]
 name = "scion-proto"
 version = "0.2.0"
-source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=acl#0a8152b43894eddd728b8f878943fe18bcf672fd"
+source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=main#e8f97085a516f28db4f80860d657bd48e669e85d"
 dependencies = [
+ "aes",
  "bytes",
  "chrono",
+ "cmac",
  "prost",
  "rand",
  "scion-protobuf",
@@ -2649,7 +2743,7 @@ dependencies = [
 [[package]]
 name = "scion-protobuf"
 version = "0.2.0"
-source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=acl#0a8152b43894eddd728b8f878943fe18bcf672fd"
+source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=main#e8f97085a516f28db4f80860d657bd48e669e85d"
 dependencies = [
  "prost",
  "prost-types",
@@ -2660,7 +2754,7 @@ dependencies = [
 [[package]]
 name = "scion-sdk-address-manager"
 version = "0.2.0"
-source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=acl#0a8152b43894eddd728b8f878943fe18bcf672fd"
+source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=main#e8f97085a516f28db4f80860d657bd48e669e85d"
 dependencies = [
  "anyhow",
  "hex",
@@ -2678,7 +2772,7 @@ dependencies = [
 [[package]]
 name = "scion-sdk-axum-connect-rpc"
 version = "0.2.0"
-source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=acl#0a8152b43894eddd728b8f878943fe18bcf672fd"
+source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=main#e8f97085a516f28db4f80860d657bd48e669e85d"
 dependencies = [
  "axum",
  "bytes",
@@ -2691,7 +2785,7 @@ dependencies = [
 [[package]]
 name = "scion-sdk-common-types"
 version = "0.2.0"
-source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=acl#0a8152b43894eddd728b8f878943fe18bcf672fd"
+source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=main#e8f97085a516f28db4f80860d657bd48e669e85d"
 dependencies = [
  "ed25519-dalek",
  "jsonwebtoken",
@@ -2702,7 +2796,7 @@ dependencies = [
 [[package]]
 name = "scion-sdk-observability"
 version = "0.2.0"
-source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=acl#0a8152b43894eddd728b8f878943fe18bcf672fd"
+source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=main#e8f97085a516f28db4f80860d657bd48e669e85d"
 dependencies = [
  "axum",
  "http",
@@ -2724,7 +2818,7 @@ dependencies = [
 [[package]]
 name = "scion-sdk-reqwest-connect-rpc"
 version = "0.2.0"
-source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=acl#0a8152b43894eddd728b8f878943fe18bcf672fd"
+source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=main#e8f97085a516f28db4f80860d657bd48e669e85d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2743,7 +2837,7 @@ dependencies = [
 [[package]]
 name = "scion-sdk-token-validator"
 version = "0.2.0"
-source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=acl#0a8152b43894eddd728b8f878943fe18bcf672fd"
+source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=main#e8f97085a516f28db4f80860d657bd48e669e85d"
 dependencies = [
  "ed25519-dalek",
  "jsonwebtoken",
@@ -2755,12 +2849,13 @@ dependencies = [
 [[package]]
 name = "scion-sdk-utils"
 version = "0.2.0"
-source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=acl#0a8152b43894eddd728b8f878943fe18bcf672fd"
+source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=main#e8f97085a516f28db4f80860d657bd48e669e85d"
 dependencies = [
+ "anapaya-quinn",
  "ed25519-dalek",
  "num-traits",
  "pem",
- "quinn",
+ "rand",
  "rcgen",
  "rustls",
  "serde",
@@ -2774,8 +2869,9 @@ dependencies = [
 [[package]]
 name = "scion-stack"
 version = "0.2.0"
-source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=acl#0a8152b43894eddd728b8f878943fe18bcf672fd"
+source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=main#e8f97085a516f28db4f80860d657bd48e669e85d"
 dependencies = [
+ "anapaya-quinn",
  "anyhow",
  "arc-swap",
  "bytes",
@@ -2787,7 +2883,6 @@ dependencies = [
  "futures",
  "pin-project-lite",
  "prost",
- "quinn",
  "rand",
  "rand_chacha",
  "rustls",
@@ -3020,7 +3115,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 [[package]]
 name = "snap-control"
 version = "0.2.0"
-source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=acl#0a8152b43894eddd728b8f878943fe18bcf672fd"
+source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=main#e8f97085a516f28db4f80860d657bd48e669e85d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3057,15 +3152,15 @@ dependencies = [
 [[package]]
 name = "snap-dataplane"
 version = "0.2.0"
-source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=acl#0a8152b43894eddd728b8f878943fe18bcf672fd"
+source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=main#e8f97085a516f28db4f80860d657bd48e669e85d"
 dependencies = [
+ "anapaya-quinn",
  "anyhow",
  "bytes",
  "ed25519-dalek",
  "jsonwebtoken",
  "pem",
  "prometheus",
- "quinn",
  "rand",
  "scion-proto",
  "scion-sdk-address-manager",
@@ -3088,7 +3183,7 @@ dependencies = [
 [[package]]
 name = "snap-tokens"
 version = "0.2.0"
-source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=acl#0a8152b43894eddd728b8f878943fe18bcf672fd"
+source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=main#e8f97085a516f28db4f80860d657bd48e669e85d"
 dependencies = [
  "jsonwebtoken",
  "pem",
@@ -3101,8 +3196,9 @@ dependencies = [
 [[package]]
 name = "snap-tun"
 version = "0.2.0"
-source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=acl#0a8152b43894eddd728b8f878943fe18bcf672fd"
+source = "git+https://github.com/aaronbojarski/scion-sdk.git?branch=main#e8f97085a516f28db4f80860d657bd48e669e85d"
 dependencies = [
+ "anapaya-quinn",
  "assert_matches",
  "bytes",
  "chrono",
@@ -3111,7 +3207,6 @@ dependencies = [
  "ipnet",
  "prometheus",
  "prost",
- "quinn",
  "scion-proto",
  "scion-sdk-observability",
  "scion-sdk-token-validator",
