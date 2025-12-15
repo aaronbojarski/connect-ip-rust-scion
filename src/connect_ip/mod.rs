@@ -21,8 +21,8 @@ use crate::net::icmp::build_icmp_response;
 use crate::net::quic::MAX_DATAGRAM_SIZE;
 use crate::net::tun::MAX_TUN_MTU;
 use crate::net::{
-    ForwardingDecision, ZERO_IPV4_ADDRESS, ZERO_IPV6_ADDRESS, check_packet_src_dst,
-    get_next_avail_subnet, get_specific_subnet, is_ipv4, is_zero_address, tun,
+    ForwardingDecision, IpVersion, ZERO_IPV4_ADDRESS, ZERO_IPV6_ADDRESS, check_packet_src_dst,
+    get_next_avail_subnet, get_specific_subnet, is_zero_address, tun,
 };
 
 const SEND_BUFFER_SIZE: usize = 65535;
@@ -441,7 +441,7 @@ impl Endpoint {
                     let assigned_net = if is_zero_address(&requested_address.ip_net) {
                         get_next_avail_subnet(
                             self.available_addresses.clone(),
-                            is_ipv4(&requested_address.ip_net),
+                            IpVersion::from(&requested_address.ip_net),
                             requested_address.ip_net.prefix_len(),
                         )
                         .await
@@ -519,9 +519,13 @@ impl Endpoint {
     pub async fn handle_initial_routing_setup(&mut self) -> Result<()> {
         // Assign a /128 IPv6 or /32 IPv4 address from the address pool to peer
         let mut assigned_addresses = vec![];
-        if let Some(addr) = get_next_avail_subnet(self.available_addresses.clone(), false, 128)
-            .await
-            .or(get_next_avail_subnet(self.available_addresses.clone(), true, 32).await)
+        if let Some(addr) =
+            get_next_avail_subnet(self.available_addresses.clone(), IpVersion::V6, 128)
+                .await
+                .or(
+                    get_next_avail_subnet(self.available_addresses.clone(), IpVersion::V4, 32)
+                        .await,
+                )
         {
             info!("assigning address to peer: {}", addr);
             self.routing_state.remote_addresses.push(addr);

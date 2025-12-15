@@ -13,6 +13,7 @@ use crate::net::{add_route, remove_route};
 
 pub const MAX_TUN_MTU: usize = 9000;
 
+/// Configuration commands for the TUN device.
 pub enum TunConfiguration {
     AddAddress(IpNet),
     RemoveAddress(IpNet),
@@ -21,8 +22,15 @@ pub enum TunConfiguration {
     SetMTU(u16),
 }
 
+/// A TUN device handler that manages a network (tun) interface.
+///
+/// Creates and manages a TUN device, forwarding packets between the device
+/// and QUIC connections via channels. Supports dynamic address and route
+/// configuration through a control channel.
 pub struct Tun {
+    /// Name of the TUN interface (e.g., "tun0")
     pub name: String,
+    /// Channel for sending packets from TUN device to QUIC
     pub tx_tun_to_quic: Sender<Vec<u8>>,
     pub handle: Option<JoinHandle<()>>,
     pub mtu: u16,
@@ -55,7 +63,7 @@ impl Tun {
         let handle = tokio::spawn(
             async move {
                 let result: Result<()> = async {
-                    let mut buf = [0; 65536];
+                    let mut buf = [0; MAX_TUN_MTU];
                     loop {
                         tokio::select! {
                             // Check for cancellation signal

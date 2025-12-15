@@ -13,32 +13,69 @@ use tracing::debug;
 
 use crate::net::icmp::IcmpType;
 
-pub const ZERO_IPV4_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
-pub const ZERO_IPV6_ADDRESS: IpAddr = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0));
+/// IP version selector for network operations
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpVersion {
+    V4,
+    V6,
+}
 
-pub fn is_zero_address(ip_net: &IpNet) -> bool {
-    match ip_net.addr() {
-        IpAddr::V4(addr) => addr == ZERO_IPV4_ADDRESS,
-        IpAddr::V6(addr) => addr == ZERO_IPV6_ADDRESS,
+impl IpVersion {
+    pub fn matches(&self, net: &IpNet) -> bool {
+        matches!(
+            (self, net),
+            (IpVersion::V4, IpNet::V4(_)) | (IpVersion::V6, IpNet::V6(_))
+        )
     }
 }
 
-pub fn is_ipv4(ip_net: &IpNet) -> bool {
-    matches!(ip_net, IpNet::V4(_))
+impl From<&IpNet> for IpVersion {
+    fn from(net: &IpNet) -> Self {
+        match net {
+            IpNet::V4(_) => IpVersion::V4,
+            IpNet::V6(_) => IpVersion::V6,
+        }
+    }
 }
 
-pub fn is_ipv6(ip_net: &IpNet) -> bool {
-    matches!(ip_net, IpNet::V6(_))
+pub const ZERO_IPV4_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+pub const ZERO_IPV6_ADDRESS: IpAddr = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
+
+/// Checks if the given network is an unspecified (zero) address.
+///
+/// # Returns
+/// `true` if the address is 0.0.0.0 (IPv4) or :: (IPv6), `false` otherwise
+pub fn is_zero_address(ip_net: &IpNet) -> bool {
+    ip_net.addr().is_unspecified()
 }
 
+/// Represents a UDP packet with SCION addressing.
+///
+/// Contains source and destination SCION addresses along with the packet payload.
 pub struct UdpPacket {
     pub src: scion_proto::address::SocketAddr,
     pub dst: scion_proto::address::SocketAddr,
     pub data: Vec<u8>,
 }
 
+/// Converts an IP range to a CIDR network.
+///
+/// Calculates the appropriate prefix length based on the difference between
+/// the start and end addresses.
+///
+/// # Arguments
+/// * `start` - The starting IP address of the range
+/// * `end` - The ending IP address of the range
+///
+/// # Returns
+/// A `Result` containing the IP network or an error if:
+/// - The addresses are of different versions (IPv4 vs IPv6)
+/// - The resulting prefix length is invalid
+///
+/// # Limitations
+/// Currently assumes that start and end define a valid CIDR block.
+/// This should be validated in future versions.
 pub fn ip_range_to_net(start: IpAddr, end: IpAddr) -> Result<IpNet, Error> {
-    // TODO: currently we assume that start and end define a valid CIDR block. This should be validated or handled properly.
     match (start, end) {
         (IpAddr::V4(start_v4), IpAddr::V4(end_v4)) => {
             let start_u32 = u32::from(start_v4);
@@ -62,9 +99,23 @@ pub fn ip_range_to_net(start: IpAddr, end: IpAddr) -> Result<IpNet, Error> {
     }
 }
 
+/// Allocates the next available subnet from a pool of IP networks.
+///
+/// Searches through the available network pool for a subnet that matches
+/// the requested IP version and can accommodate the specified prefix length.
+/// The allocated subnet is removed from the pool, and any remaining space
+/// is returned to the pool as smaller subnets.
+///
+/// # Arguments
+/// * `available_nets` - Shared pool of available IP networks
+/// * `ip_version` - The IP version (V4 or V6) to allocate
+/// * `prefix_len` - The desired prefix length for the subnet
+///
+/// # Returns
+/// `Some(IpNet)` if a suitable subnet is found, `None` if no subnet is available
 pub async fn get_next_avail_subnet(
     available_nets: Arc<Mutex<Vec<IpNet>>>,
-    ipv4: bool,
+    ip_version: IpVersion,
     prefix_len: u8,
 ) -> Option<IpNet> {
     let mut pool = available_nets.lock().await;
@@ -72,8 +123,7 @@ pub async fn get_next_avail_subnet(
 
     while idx < pool.len() {
         let net = pool[idx];
-        let family_matches = (ipv4 && is_ipv4(&net)) || (!ipv4 && is_ipv6(&net));
-        if !family_matches || net.prefix_len() > prefix_len {
+        if !ip_version.matches(&net) || net.prefix_len() > prefix_len {
             idx += 1;
             continue;
         }
@@ -92,12 +142,31 @@ pub async fn get_next_avail_subnet(
     None
 }
 
+/// Returns a subnet to the pool of available IP networks.
+///
+/// Adds the subnet back to the available networks pool and aggregates
+/// adjacent networks to optimize the pool.
+///
+/// # Arguments
+/// * `available_nets` - Shared pool of available IP networks
+/// * `subnet` - The subnet to return to the pool
 pub async fn return_subnet(available_nets: &Arc<Mutex<Vec<IpNet>>>, subnet: IpNet) {
     let mut available_nets = available_nets.lock().await;
     available_nets.push(subnet);
     *available_nets = IpNet::aggregate(&available_nets);
 }
 
+/// Allocates a specific subnet from the pool of available IP networks.
+///
+/// Searches for a network in the pool that contains the desired subnet,
+/// removes the desired subnet, and returns any remaining space to the pool.
+///
+/// # Arguments
+/// * `available_nets` - Shared pool of available IP networks
+/// * `desired_subnet` - The specific subnet to allocate
+///
+/// # Returns
+/// `Some(IpNet)` if the desired subnet is available, `None` if it cannot be allocated
 pub async fn get_specific_subnet(
     available_nets: Arc<Mutex<Vec<IpNet>>>,
     desired_subnet: IpNet,
@@ -128,17 +197,32 @@ pub async fn get_specific_subnet(
     None
 }
 
+/// Builds IP route command arguments based on IP version and operation
+fn build_ip_route_args(destination: &IpNet, operation: &str) -> Vec<String> {
+    match destination {
+        IpNet::V4(_) => vec!["route".to_string(), operation.to_string()],
+        IpNet::V6(_) => vec!["-6".to_string(), "route".to_string(), operation.to_string()],
+    }
+}
+
+/// Adds a routing table entry for the specified destination network.
+///
+/// Checks if the route already exists before adding it. Uses the `ip` command
+/// to configure the system routing table.
+///
+/// # Arguments
+/// * `destination` - The destination network for the route
+/// * `dev` - The network device/interface name (e.g., "tun0")
+///
+/// # Returns
+/// * `Ok(true)` - Route was added successfully
+/// * `Ok(false)` - Route already exists
+/// * `Err(_)` - Failed to execute the ip command or command returned an error
 pub fn add_route(destination: &IpNet, dev: &str) -> Result<bool, Error> {
     let existing_routes = {
         let mut cmd = Command::new("ip");
-        match destination {
-            IpNet::V4(_) => {
-                cmd.args(["route", "show"]);
-            }
-            IpNet::V6(_) => {
-                cmd.args(["-6", "route", "show"]);
-            }
-        };
+        let args = build_ip_route_args(destination, "show");
+        cmd.args(args);
         let dest = destination.to_string();
         cmd.arg(&dest).args(["dev", dev]);
         run_ip_command(cmd)?
@@ -149,30 +233,29 @@ pub fn add_route(destination: &IpNet, dev: &str) -> Result<bool, Error> {
     }
 
     let mut add_cmd = Command::new("ip");
-    match destination {
-        IpNet::V4(_) => {
-            add_cmd.args(["route", "add"]);
-        }
-        IpNet::V6(_) => {
-            add_cmd.args(["-6", "route", "add"]);
-        }
-    };
+    let args = build_ip_route_args(destination, "add");
+    add_cmd.args(args);
     let dest = destination.to_string();
     add_cmd.arg(&dest).args(["dev", dev]);
     run_ip_command(add_cmd)?;
     Ok(true)
 }
 
+/// Removes a routing table entry for the specified destination network.
+///
+/// Uses the `ip` command to remove the route from the system routing table.
+///
+/// # Arguments
+/// * `destination` - The destination network of the route to remove
+/// * `dev` - The network device/interface name (e.g., "tun0")
+///
+/// # Returns
+/// * `Ok(())` - Route was removed successfully
+/// * `Err(_)` - Failed to execute the ip command or command returned an error
 pub fn remove_route(destination: &IpNet, dev: &str) -> Result<(), Error> {
     let mut del_cmd = Command::new("ip");
-    match destination {
-        IpNet::V4(_) => {
-            del_cmd.args(["route", "del"]);
-        }
-        IpNet::V6(_) => {
-            del_cmd.args(["-6", "route", "del"]);
-        }
-    };
+    let args = build_ip_route_args(destination, "del");
+    del_cmd.args(args);
     let dest = destination.to_string();
     del_cmd.arg(&dest).args(["dev", dev]);
     run_ip_command(del_cmd)?;
@@ -180,16 +263,12 @@ pub fn remove_route(destination: &IpNet, dev: &str) -> Result<(), Error> {
 }
 
 fn run_ip_command(mut cmd: Command) -> Result<std::process::Output, Error> {
-    let program = cmd.get_program().to_string_lossy().into_owned();
+    let program = cmd.get_program().to_string_lossy();
     let args = cmd
         .get_args()
-        .map(|a| a.to_string_lossy().into_owned())
+        .map(|a| a.to_string_lossy())
         .collect::<Vec<_>>();
-    let display_cmd = if args.is_empty() {
-        program.clone()
-    } else {
-        format!("{} {}", program, args.join(" "))
-    };
+    let display_cmd = format!("{} {}", program, args.join(" ")).trim().to_string();
 
     let output = cmd
         .output()
@@ -215,6 +294,23 @@ pub enum ForwardingDecision {
     RespondWithIcmp(IcmpType),
 }
 
+/// Validates packet source and destination addresses against allowed networks.
+///
+/// Checks if both the source and destination addresses of a packet fall within
+/// the allowed network ranges. Returns a forwarding decision based on the validation.
+///
+/// # Arguments
+/// * `packet_src` - Source IP address of the packet
+/// * `packet_dst` - Destination IP address of the packet
+/// * `allowed_src_1` - First set of allowed source networks
+/// * `allowed_src_2` - Second set of allowed source networks
+/// * `allowed_dst_1` - First set of allowed destination networks
+/// * `allowed_dst_2` - Second set of allowed destination networks
+///
+/// # Returns
+/// * `ForwardingDecision::Forward` - Both source and destination are valid
+/// * `ForwardingDecision::RespondWithIcmp(SourceRouteFailed)` - Invalid source address
+/// * `ForwardingDecision::RespondWithIcmp(DestinationUnreachable)` - Invalid destination address
 pub fn check_packet_src_dst(
     packet_src: IpAddr,
     packet_dst: IpAddr,

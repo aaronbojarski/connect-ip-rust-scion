@@ -4,7 +4,9 @@ use tracing::info;
 pub const MAX_DATAGRAM_SIZE: usize = 1200;
 pub const KEEPALIVE_INTERVAL: u64 = 5000; // in milliseconds
 pub const DEFAULT_TIMEOUT: u64 = 30_000; // in milliseconds
-pub const HTTP3_STREAM_OVERHEAD: usize = 5; // Difference between QUIC stream data and HTTP/3 data
+
+/// Difference between QUIC stream data and HTTP/3 data
+pub const HTTP3_STREAM_OVERHEAD: usize = 5;
 
 pub fn configure_quic(
     ca_cert_path: &std::path::Path,
