@@ -235,22 +235,6 @@ jobs:
           echo $! > proxy.pid
           sleep 2
 
-      - name: Wait for SNAP address assignment
-        run: |
-          echo "Waiting for SNAP to assign 10.1.0.2 to proxy..."
-          for i in {1..30}; do
-            if sudo ip netns exec proxy_ns ip addr show | grep -q "10.1.0.2"; then
-              echo "SNAP address assigned!"
-              sudo ip netns exec proxy_ns ip addr
-              break
-            fi
-            if [ $i -eq 30 ]; then
-              echo "Timeout waiting for SNAP address assignment"
-              exit 1
-            fi
-            sleep 1
-          done
-
       - name: Start client in background
         run: |
           sudo ip netns exec client_ns ./target/debug/connect-ip-rust-scion client \
