@@ -1,8 +1,8 @@
 # Test Network Setup
 
-To start the test network, run the `testnet.sh` script.
+To start the IP test network, run the `testnet.sh` script.
 ```bash
-sudo bash ./testnet/testnet.sh up
+sudo bash ./testnet/ip/testnet.sh up
 ```
 
 All necessary certificats can be generated with the `generate_certs.sh` script.
@@ -41,5 +41,5 @@ sudo ip netns exec eh1ns ping 10.248.1.1
 
 Finally, the test network can be torn down.
 ```bash
-sudo bash ./testnet/testnet.sh down
+sudo bash ./testnet/ip/testnet.sh down
 ```

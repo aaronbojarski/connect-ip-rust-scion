@@ -1,0 +1,21 @@
+[package]
+name = "scion_testnet"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+clap = { version = "4", features = ["derive"] }
+ipnet = "2.11.0"
+pocketscion = { git = "https://github.com/aaronbojarski/scion-sdk.git", branch = "main" }
+rand = "0.9.2"
+rand_chacha = { version = "0.9", features = ["serde"] }
+scion-proto = { git = "https://github.com/aaronbojarski/scion-sdk.git", branch = "main" }
+scion-stack = { git = "https://github.com/aaronbojarski/scion-sdk.git", branch = "main" }
+snap-tokens = { git = "https://github.com/aaronbojarski/scion-sdk.git", branch = "main" }
+tokio = { version = "1.28.1", features = ["full"] }
+tokio-util = "0.7.16"
+tracing = "0.1.41"
+tracing-futures = "0.2.5"
+tracing-subscriber = { version = "0.3.0", default-features = false, features = ["env-filter", "fmt", "ansi", "time", "local-time"] }
+url = "2.5.7"
