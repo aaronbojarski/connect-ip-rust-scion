@@ -10,9 +10,12 @@ eh1_address="10.248.2.1"
 client00_address="10.248.1.10"
 proxy10_address="10.248.2.10"
 
+client02_address="10.248.100.10"
+proxy12_address="10.248.200.10"
+
 # pocketscion addresses
 pocketscion_client_address="10.248.100.20"
-pocketscion_proxy_address="10.248.101.21"
+pocketscion_proxy_address="10.248.200.20"
 
 # mac addresses of interfaces
 eh0mac="00:76:65:74:68:13"
@@ -111,8 +114,8 @@ function testnet_up() {
 	sudo ip link set dev $ps_proxy netns $pocketscion_ns
 
 	# configure pocketscion namespace interfaces
-	sudo ip -n $client_ns address add 10.248.100.10/24 dev $client02
-	sudo ip -n $proxy_ns address add 10.248.101.11/24 dev $proxy12
+	sudo ip -n $client_ns address add $client02_address/24 dev $client02
+	sudo ip -n $proxy_ns address add $proxy12_address/24 dev $proxy12
 	sudo ip -n $pocketscion_ns address add $pocketscion_client_address/24 dev $ps_client
 	sudo ip -n $pocketscion_ns address add $pocketscion_proxy_address/24 dev $ps_proxy
 

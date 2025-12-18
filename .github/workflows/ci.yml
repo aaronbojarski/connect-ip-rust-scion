@@ -190,33 +190,25 @@ jobs:
       - name: Make binaries executable
         run: chmod +x target/debug/connect-ip-rust-scion
 
-      - name: Install Protoc
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-
-      - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-
-      - name: Build pocket runtime
-        run: |
-          cd testnet/scion
-          cargo build
-          cd ../..
-
       - name: Generate self-signed certificate
         run: bash ./testnet/generate_certs.sh
 
       - name: Set up SCION test network
         run: sudo bash ./testnet/scion/testnet.sh up
 
-      - name: Start pocket runtime in background
+      - name: Download and extract pocketscion-configurator
         run: |
-          sudo ip netns exec pocketscion_ns ./testnet/scion/target/debug/scion_testnet > pocket.log 2>&1 &
-          echo $! > pocket.pid
-          sleep 5
+          cd testnet/scion
+          curl -LO https://github.com/aaronbojarski/pocketscion-configurator/releases/download/v0.1.0/pocketscion-configurator-x86-64-deb.tar.gz
+          tar -xvf pocketscion-configurator-x86-64-deb.tar.gz
+          chmod +x pocketscion-configurator
+          cd ../..
+
+      - name: Configure pocketscion
+        run: |
+          sudo ip netns exec pocketscion_ns ./testnet/scion/pocketscion-configurator --config ./testnet/scion/pocketscion_config.json > pocketscion.log 2>&1 &
+          echo $! > pocketscion.pid
+          sleep 2
 
       - name: Enable IP forwarding
         run: |
@@ -230,7 +222,7 @@ jobs:
             --routes 10.248.2.0/24 \
             --address-pool 10.248.2.128/25 \
             --endhost-api http://10.248.101.21:10001 \
-            --snap-token ./testnet/scion/snap.dummytoken \
+            --snap-token ./snap.token \
             --log info > proxy.log 2>&1 &
           echo $! > proxy.pid
           sleep 2
@@ -280,7 +272,7 @@ jobs:
         if: failure()
         run: |
           echo "=== Pocket Runtime Logs ==="
-          cat pocket.log || echo "No pocket logs available"
+          cat pocketscion.log || echo "No pocketscion logs available"
           echo ""
           echo "=== Proxy Logs ==="
           cat proxy.log || echo "No proxy logs available"
@@ -297,17 +289,14 @@ jobs:
           sudo ip netns exec proxy_ns ip addr || true
           sudo ip netns exec proxy_ns ip route || true
           echo ""
-          echo "Pocket namespace:"
+          echo "Pocketscion namespace:"
           sudo ip netns exec pocketscion_ns ip addr || true
           sudo ip netns exec pocketscion_ns ip route || true
 
       - name: Clean up
         if: always()
         run: |
-          # Kill pocket runtime, proxy and client processes
-          if [ -f pocket.pid ]; then
-            sudo kill $(cat pocket.pid) 2>/dev/null || true
-          fi
+          # Kill proxy and client processes
           if [ -f proxy.pid ]; then
             sudo kill $(cat proxy.pid) 2>/dev/null || true
           fi
@@ -315,10 +304,10 @@ jobs:
             sudo kill $(cat client.pid) 2>/dev/null || true
           fi
 
-          # Tear down test network
+          # Tear down test network (this will also clean up pocketscion)
           sudo bash ./testnet/scion/testnet.sh down || true
 
           # Clean up any remaining processes
-          sudo pkill -f "scion_testnet" || true
           sudo pkill -f "target/debug/proxy" || true
           sudo pkill -f "target/debug/client" || true
+          sudo pkill -f "pocketscion" || true

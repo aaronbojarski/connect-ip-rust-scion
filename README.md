@@ -61,7 +61,9 @@ To run the client and proxy over IP instead of SCION the wildcard ISD-AS `0-0` c
 
 
 ## Test Network
-A test network setup is provided in the `testnet` directory. It sets up network namespaces to allow running (the IP version) of the client and proxy locally.
+Test network setups for local testing are provided in the `testnet` directory. 
+- [`./testnet/ip`](./testnet/ip) contains a setup based on network namespaces to allow running the IP version of the client and proxy.
+- [`./testnet/scion`](./testnet/scion) contains a setup based on `pocketscion` and network namespaces to run the SCION version of the client and proxy.
 
 
 ## Acknowledgements
@@ -71,6 +73,15 @@ This project took inspiration from the following implementations. We thank the a
 
 
 ## TODO:
-- Connect-IP
+- Code Improvements
+  - Documentation (especially public APIs)
   - Better error handling
-  - Simplify Packet forwarding in different modes (streams/datagrams)
+    - use custom error types when possible
+    - handle errors more gracefully when allowed
+
+- SCION Integration
+  - Update sdk version once SNAP is done
+  - Check if path can be selected when connectivity is not working
+
+- Setup
+  - Provide systemd service files for client and proxy

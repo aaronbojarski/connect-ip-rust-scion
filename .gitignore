@@ -33,3 +33,6 @@ target
 
 # tokens
 *.token
+
+# pocketscion configurator
+pocketscion-configurator*

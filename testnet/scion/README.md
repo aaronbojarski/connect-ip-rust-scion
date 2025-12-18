@@ -5,11 +5,12 @@ To start the SCION test network, run the `testnet.sh` script.
 sudo bash ./testnet/scion/testnet.sh up
 ```
 
-Then the pocket runtime can be built and started.
+We use the [pocketscion-configurator](https://github.com/aaronbojarski/pocketscion-configurator) to set up the pocketscion instance inside the `pocketscion_ns` namespace. First, fetch and build the configurator or use the prebuilt binary.
 ```bash
 cd testnet/scion
-cargo build
-sudo ip netns exec pocketscion_ns ./target/debug/scion_testnet
+curl -LO https://github.com/aaronbojarski/pocketscion-configurator/releases/download/v0.1.0/pocketscion-configurator-x86-64-deb.tar.gz
+tar -xvf pocketscion-configurator-x86-64-deb.tar.gz
+sudo ip netns exec pocketscion_ns ./pocketscion-configurator --config ./pocketscion_config.json
 cd ../..
 ```
 
@@ -22,12 +23,12 @@ cd ..
 
 Then start the server the corresponding namespace.
 ```bash
-sudo ip netns exec proxy_ns ./target/debug/connect-ip-rust-scion proxy --listen [2-2,10.1.0.2]:4433 --routes 10.248.2.0/24 --address-pool 10.248.2.128/25 --ca-cert ./testnet/ca-cert.pem --cert ./testnet/proxy-cert.pem --key ./testnet/proxy-key.pem --endhost-api http://10.248.101.21:10001 --snap-token ./testnet/scion/snap.dummytoken
+sudo ip netns exec proxy_ns ./target/debug/connect-ip-rust-scion proxy --listen [2-3,10.248.200.10]:4433 --routes 10.248.2.0/24 --address-pool 10.248.2.128/25 --ca-cert ./testnet/ca-cert.pem --cert ./testnet/proxy-cert.pem --key ./testnet/proxy-key.pem --endhost-api http://10.248.200.20:10231
 ```
 
-Then start the client in another terminal. Make sure that the SNAP actually assigned 10.1.0.2 to the proxy before starting the client.
+Then start the client in another terminal.
 ```bash
-sudo ip netns exec client_ns ./target/debug/connect-ip-rust-scion client [2-2,10.1.0.2]:4433 --host localhost --routes 10.248.1.0/24 --address-pool 10.248.1.128/25 --ca-cert ./testnet/ca-cert.pem --cert ./testnet/client-cert.pem --key ./testnet/client-key.pem --endhost-api http://10.248.100.20:10003 --snap-token ./testnet/scion/snap.dummytoken
+sudo ip netns exec client_ns ./target/debug/connect-ip-rust-scion client [2-3,10.248.200.10]:4433 --host localhost --routes 10.248.1.0/24 --address-pool 10.248.1.128/25 --ca-cert ./testnet/ca-cert.pem --cert ./testnet/client-cert.pem --key ./testnet/client-key.pem --endhost-api http://10.248.100.20:10142 --snap-token ./testnet/scion/snap.token
 ```
 
 Enable packet forwading in the server and client namespaces.
