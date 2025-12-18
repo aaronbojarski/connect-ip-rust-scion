@@ -28,7 +28,7 @@ sudo ip netns exec proxy_ns ./target/debug/connect-ip-rust-scion proxy --listen 
 
 Then start the client in another terminal.
 ```bash
-sudo ip netns exec client_ns ./target/debug/connect-ip-rust-scion client [2-3,10.248.200.10]:4433 --host localhost --routes 10.248.1.0/24 --address-pool 10.248.1.128/25 --ca-cert ./testnet/ca-cert.pem --cert ./testnet/client-cert.pem --key ./testnet/client-key.pem --endhost-api http://10.248.100.20:10142 --snap-token ./testnet/scion/snap.token
+sudo ip netns exec client_ns ./target/debug/connect-ip-rust-scion client [2-3,10.248.200.10]:4433 --host localhost --routes 10.248.1.0/24 --address-pool 10.248.1.128/25 --ca-cert ./testnet/ca-cert.pem --cert ./testnet/client-cert.pem --key ./testnet/client-key.pem --endhost-api http://10.248.100.20:10143 --snap-token ./testnet/scion/snap.token
 ```
 
 Enable packet forwading in the server and client namespaces.

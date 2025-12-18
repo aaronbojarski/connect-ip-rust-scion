@@ -218,11 +218,10 @@ jobs:
       - name: Start proxy in background
         run: |
           sudo ip netns exec proxy_ns ./target/debug/connect-ip-rust-scion proxy \
-            --listen [2-2,10.1.0.2]:4433 \
+            --listen [2-3,10.248.200.10]:4433 \
             --routes 10.248.2.0/24 \
             --address-pool 10.248.2.128/25 \
-            --endhost-api http://10.248.101.21:10001 \
-            --snap-token ./snap.token \
+            --endhost-api  http://10.248.200.20:10231 \
             --log info > proxy.log 2>&1 &
           echo $! > proxy.pid
           sleep 2
@@ -230,12 +229,12 @@ jobs:
       - name: Start client in background
         run: |
           sudo ip netns exec client_ns ./target/debug/connect-ip-rust-scion client \
-            [2-2,10.1.0.2]:4433 \
+            [2-3,10.248.200.10]:4433 \
             --host localhost \
             --routes 10.248.1.0/24 \
             --address-pool 10.248.1.128/25 \
-            --endhost-api http://10.248.100.20:10003 \
-            --snap-token ./testnet/scion/snap.dummytoken \
+            --endhost-api http://10.248.100.20:10143 \
+            --snap-token ./snap.token \
             --log info > client.log 2>&1 &
           echo $! > client.pid
           sleep 5
