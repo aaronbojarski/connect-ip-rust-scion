@@ -806,7 +806,7 @@ dependencies = [
 [[package]]
 name = "endhost-api"
 version = "0.2.0"
-source = "git+https://github.com/Anapaya/scion-sdk.git?branch=main#4ff09c1b1621570d1f25af149f390addf15a2de6"
+source = "git+https://github.com/Anapaya/scion-sdk.git?rev=4ff09c1b1621570d1f25af149f390addf15a2de6#4ff09c1b1621570d1f25af149f390addf15a2de6"
 dependencies = [
  "axum",
  "endhost-api-models",
@@ -818,7 +818,7 @@ dependencies = [
 [[package]]
 name = "endhost-api-client"
 version = "0.2.0"
-source = "git+https://github.com/Anapaya/scion-sdk.git?branch=main#4ff09c1b1621570d1f25af149f390addf15a2de6"
+source = "git+https://github.com/Anapaya/scion-sdk.git?rev=4ff09c1b1621570d1f25af149f390addf15a2de6#4ff09c1b1621570d1f25af149f390addf15a2de6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -835,7 +835,7 @@ dependencies = [
 [[package]]
 name = "endhost-api-models"
 version = "0.2.0"
-source = "git+https://github.com/Anapaya/scion-sdk.git?branch=main#4ff09c1b1621570d1f25af149f390addf15a2de6"
+source = "git+https://github.com/Anapaya/scion-sdk.git?rev=4ff09c1b1621570d1f25af149f390addf15a2de6#4ff09c1b1621570d1f25af149f390addf15a2de6"
 dependencies = [
  "async-trait",
  "scion-proto",
@@ -846,7 +846,7 @@ dependencies = [
 [[package]]
 name = "endhost-api-protobuf"
 version = "0.2.0"
-source = "git+https://github.com/Anapaya/scion-sdk.git?branch=main#4ff09c1b1621570d1f25af149f390addf15a2de6"
+source = "git+https://github.com/Anapaya/scion-sdk.git?rev=4ff09c1b1621570d1f25af149f390addf15a2de6#4ff09c1b1621570d1f25af149f390addf15a2de6"
 dependencies = [
  "endhost-api-models",
  "prost",
@@ -2788,7 +2788,7 @@ dependencies = [
 [[package]]
 name = "scion-proto"
 version = "0.2.0"
-source = "git+https://github.com/Anapaya/scion-sdk.git?branch=main#4ff09c1b1621570d1f25af149f390addf15a2de6"
+source = "git+https://github.com/Anapaya/scion-sdk.git?rev=4ff09c1b1621570d1f25af149f390addf15a2de6#4ff09c1b1621570d1f25af149f390addf15a2de6"
 dependencies = [
  "aes",
  "bytes",
@@ -2808,7 +2808,7 @@ dependencies = [
 [[package]]
 name = "scion-protobuf"
 version = "0.2.0"
-source = "git+https://github.com/Anapaya/scion-sdk.git?branch=main#4ff09c1b1621570d1f25af149f390addf15a2de6"
+source = "git+https://github.com/Anapaya/scion-sdk.git?rev=4ff09c1b1621570d1f25af149f390addf15a2de6#4ff09c1b1621570d1f25af149f390addf15a2de6"
 dependencies = [
  "prost",
  "prost-types",
@@ -2819,7 +2819,7 @@ dependencies = [
 [[package]]
 name = "scion-sdk-axum-connect-rpc"
 version = "0.2.0"
-source = "git+https://github.com/Anapaya/scion-sdk.git?branch=main#4ff09c1b1621570d1f25af149f390addf15a2de6"
+source = "git+https://github.com/Anapaya/scion-sdk.git?rev=4ff09c1b1621570d1f25af149f390addf15a2de6#4ff09c1b1621570d1f25af149f390addf15a2de6"
 dependencies = [
  "axum",
  "bytes",
@@ -2832,7 +2832,7 @@ dependencies = [
 [[package]]
 name = "scion-sdk-observability"
 version = "0.2.0"
-source = "git+https://github.com/Anapaya/scion-sdk.git?branch=main#4ff09c1b1621570d1f25af149f390addf15a2de6"
+source = "git+https://github.com/Anapaya/scion-sdk.git?rev=4ff09c1b1621570d1f25af149f390addf15a2de6#4ff09c1b1621570d1f25af149f390addf15a2de6"
 dependencies = [
  "axum",
  "http",
@@ -2854,7 +2854,7 @@ dependencies = [
 [[package]]
 name = "scion-sdk-reqwest-connect-rpc"
 version = "0.2.0"
-source = "git+https://github.com/Anapaya/scion-sdk.git?branch=main#4ff09c1b1621570d1f25af149f390addf15a2de6"
+source = "git+https://github.com/Anapaya/scion-sdk.git?rev=4ff09c1b1621570d1f25af149f390addf15a2de6#4ff09c1b1621570d1f25af149f390addf15a2de6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2873,7 +2873,7 @@ dependencies = [
 [[package]]
 name = "scion-sdk-token-validator"
 version = "0.2.0"
-source = "git+https://github.com/Anapaya/scion-sdk.git?branch=main#4ff09c1b1621570d1f25af149f390addf15a2de6"
+source = "git+https://github.com/Anapaya/scion-sdk.git?rev=4ff09c1b1621570d1f25af149f390addf15a2de6#4ff09c1b1621570d1f25af149f390addf15a2de6"
 dependencies = [
  "ed25519-dalek",
  "jsonwebtoken",
@@ -2885,7 +2885,7 @@ dependencies = [
 [[package]]
 name = "scion-sdk-utils"
 version = "0.2.0"
-source = "git+https://github.com/Anapaya/scion-sdk.git?branch=main#4ff09c1b1621570d1f25af149f390addf15a2de6"
+source = "git+https://github.com/Anapaya/scion-sdk.git?rev=4ff09c1b1621570d1f25af149f390addf15a2de6#4ff09c1b1621570d1f25af149f390addf15a2de6"
 dependencies = [
  "anapaya-quinn",
  "ed25519-dalek",
@@ -2905,7 +2905,7 @@ dependencies = [
 [[package]]
 name = "scion-stack"
 version = "0.2.0"
-source = "git+https://github.com/Anapaya/scion-sdk.git?branch=main#4ff09c1b1621570d1f25af149f390addf15a2de6"
+source = "git+https://github.com/Anapaya/scion-sdk.git?rev=4ff09c1b1621570d1f25af149f390addf15a2de6#4ff09c1b1621570d1f25af149f390addf15a2de6"
 dependencies = [
  "anapaya-quinn",
  "anyhow",
@@ -3150,7 +3150,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 [[package]]
 name = "snap-control"
 version = "0.2.0"
-source = "git+https://github.com/Anapaya/scion-sdk.git?branch=main#4ff09c1b1621570d1f25af149f390addf15a2de6"
+source = "git+https://github.com/Anapaya/scion-sdk.git?rev=4ff09c1b1621570d1f25af149f390addf15a2de6#4ff09c1b1621570d1f25af149f390addf15a2de6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3186,7 +3186,7 @@ dependencies = [
 [[package]]
 name = "snap-tokens"
 version = "0.2.0"
-source = "git+https://github.com/Anapaya/scion-sdk.git?branch=main#4ff09c1b1621570d1f25af149f390addf15a2de6"
+source = "git+https://github.com/Anapaya/scion-sdk.git?rev=4ff09c1b1621570d1f25af149f390addf15a2de6#4ff09c1b1621570d1f25af149f390addf15a2de6"
 dependencies = [
  "jsonwebtoken",
  "pem",
@@ -3199,7 +3199,7 @@ dependencies = [
 [[package]]
 name = "snap-tun"
 version = "0.2.0"
-source = "git+https://github.com/Anapaya/scion-sdk.git?branch=main#4ff09c1b1621570d1f25af149f390addf15a2de6"
+source = "git+https://github.com/Anapaya/scion-sdk.git?rev=4ff09c1b1621570d1f25af149f390addf15a2de6#4ff09c1b1621570d1f25af149f390addf15a2de6"
 dependencies = [
  "anapaya-quinn",
  "assert_matches",
