@@ -138,18 +138,12 @@ impl Proxy {
                 .await
                 .context("error building proxy SCION stack")?;
 
-            let proxy_addr = scion_network_stack
-                .local_addresses()
-                .first()
-                .cloned()
-                .context("proxy did not get any address assigned")?;
-
-            let socket_address = scion_proto::address::SocketAddr::new(proxy_addr.into(), 4433);
-            info!("proxy listening on: {}", socket_address);
-            if socket_address != self.config.listen {
-                warn!(
-                    "requested listening SCION address {} does not match assigned address {}",
-                    self.config.listen, socket_address
+            let proxy_ias = scion_network_stack.local_ases();
+            if !proxy_ias.contains(&self.config.listen.isd_asn()) {
+                anyhow::bail!(
+                    "configured listen ISD-AS {} is not among the local ASes of the SCION stack: {:?}",
+                    self.config.listen.isd_asn(),
+                    proxy_ias
                 );
             }
 
@@ -162,7 +156,7 @@ impl Proxy {
             }
 
             let socket = scion_network_stack
-                .bind_with_config(Some(socket_address), socket_config)
+                .bind_with_config(Some(self.config.listen), socket_config)
                 .await?;
 
             let local_scion_addr = socket.local_addr();

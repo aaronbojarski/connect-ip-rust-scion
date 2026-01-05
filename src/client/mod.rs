@@ -21,7 +21,7 @@ pub const UDP_PACKET_BUFFER_SIZE: usize = 65535;
 
 #[derive(Clone)]
 pub struct ClientConfig {
-    pub bind: scion_proto::address::SocketAddr,
+    pub bind: Option<scion_proto::address::SocketAddr>,
     pub remote: scion_proto::address::SocketAddr,
     pub host: Option<String>,
     pub endhost_api_address: Option<url::Url>,
@@ -62,11 +62,16 @@ impl Client {
         let cancel_token = CancellationToken::new();
 
         let result = if self.config.remote.isd_asn() == IsdAsn::WILDCARD {
-            let addr = self
-                .config
-                .bind
-                .local_address()
-                .ok_or_else(|| anyhow!("invalid local address in bind socket addr"))?;
+            let addr = match self.config.bind {
+                Some(addr) => addr
+                    .local_address()
+                    .ok_or_else(|| anyhow!("invalid local address in bind socket addr"))?,
+                None => std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                    std::net::Ipv4Addr::UNSPECIFIED,
+                    0,
+                )),
+            };
+
             let socket = tokio::net::UdpSocket::bind(addr).await?;
             // Get local address.
             let local_addr = socket.local_addr()?;
@@ -162,14 +167,17 @@ impl Client {
             let client_network_stack = builder.build().await?;
 
             // When using SNAP, we will get an address assigned.
-            let assigned_addr = client_network_stack
-                .local_addresses()
-                .first()
-                .cloned()
-                .context("client did not get any address assigned")?;
+            let local_ias = client_network_stack.local_ases();
 
-            let socket_address = scion_proto::address::SocketAddr::new(assigned_addr.into(), 10111);
-            info!("client SCION address: {}", socket_address);
+            if let Some(bind) = &self.config.bind {
+                if !local_ias.contains(&bind.isd_asn()) {
+                    anyhow::bail!(
+                        "configured bind ISD-AS {} is not among the local ASes of the SCION stack: {:?}",
+                        bind.isd_asn(),
+                        local_ias
+                    );
+                }
+            }
 
             let mut socket_config = scion_stack::scionstack::SocketConfig::new();
             if let Some(policy) = &self.config.acl_policy {
@@ -180,7 +188,7 @@ impl Client {
             }
 
             let socket = client_network_stack
-                .bind_with_config(Some(socket_address), socket_config)
+                .bind_with_config(self.config.bind, socket_config)
                 .await?;
 
             // Get local address.

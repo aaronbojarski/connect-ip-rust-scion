@@ -81,8 +81,8 @@ struct ClientOpt {
     host: Option<String>,
 
     /// Local address to bind to
-    #[clap(long = "bind", default_value = "[0-0,0.0.0.0]:0")]
-    bind: scion_proto::address::SocketAddr,
+    #[clap(long = "bind")]
+    bind: Option<scion_proto::address::SocketAddr>,
 
     /// Address of the endhost API to connect to for scion path resolution. Required when using SCION.
     #[clap(long = "endhost-api")]
