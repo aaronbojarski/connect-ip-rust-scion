@@ -9,7 +9,7 @@ use tracing::{debug, error, info_span, warn};
 use tracing_futures::Instrument as _;
 use tun_rs::DeviceBuilder;
 
-use crate::net::{add_route, remove_route};
+use crate::net::route::{add_route, remove_route};
 
 pub const MAX_TUN_MTU: usize = 9000;
 

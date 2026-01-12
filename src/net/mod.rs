@@ -1,12 +1,12 @@
 pub mod icmp;
 pub mod quic;
+pub mod route;
 pub mod tun;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::process::Command;
 use std::sync::Arc;
 
-use anyhow::{Context, Error};
+use anyhow::Error;
 use ipnet::IpNet;
 use tokio::sync::Mutex;
 use tracing::debug;
@@ -195,96 +195,6 @@ pub async fn get_specific_subnet(
     }
 
     None
-}
-
-/// Builds IP route command arguments based on IP version and operation
-fn build_ip_route_args(destination: &IpNet, operation: &str) -> Vec<String> {
-    match destination {
-        IpNet::V4(_) => vec!["route".to_string(), operation.to_string()],
-        IpNet::V6(_) => vec!["-6".to_string(), "route".to_string(), operation.to_string()],
-    }
-}
-
-/// Adds a routing table entry for the specified destination network.
-///
-/// Checks if the route already exists before adding it. Uses the `ip` command
-/// to configure the system routing table.
-///
-/// # Arguments
-/// * `destination` - The destination network for the route
-/// * `dev` - The network device/interface name (e.g., "tun0")
-///
-/// # Returns
-/// * `Ok(true)` - Route was added successfully
-/// * `Ok(false)` - Route already exists
-/// * `Err(_)` - Failed to execute the ip command or command returned an error
-pub fn add_route(destination: &IpNet, dev: &str) -> Result<bool, Error> {
-    let existing_routes = {
-        let mut cmd = Command::new("ip");
-        let args = build_ip_route_args(destination, "show");
-        cmd.args(args);
-        let dest = destination.to_string();
-        cmd.arg(&dest).args(["dev", dev]);
-        run_ip_command(cmd)?
-    };
-
-    if !existing_routes.stdout.is_empty() {
-        return Ok(false);
-    }
-
-    let mut add_cmd = Command::new("ip");
-    let args = build_ip_route_args(destination, "add");
-    add_cmd.args(args);
-    let dest = destination.to_string();
-    add_cmd.arg(&dest).args(["dev", dev]);
-    run_ip_command(add_cmd)?;
-    Ok(true)
-}
-
-/// Removes a routing table entry for the specified destination network.
-///
-/// Uses the `ip` command to remove the route from the system routing table.
-///
-/// # Arguments
-/// * `destination` - The destination network of the route to remove
-/// * `dev` - The network device/interface name (e.g., "tun0")
-///
-/// # Returns
-/// * `Ok(())` - Route was removed successfully
-/// * `Err(_)` - Failed to execute the ip command or command returned an error
-pub fn remove_route(destination: &IpNet, dev: &str) -> Result<(), Error> {
-    let mut del_cmd = Command::new("ip");
-    let args = build_ip_route_args(destination, "del");
-    del_cmd.args(args);
-    let dest = destination.to_string();
-    del_cmd.arg(&dest).args(["dev", dev]);
-    run_ip_command(del_cmd)?;
-    Ok(())
-}
-
-fn run_ip_command(mut cmd: Command) -> Result<std::process::Output, Error> {
-    let program = cmd.get_program().to_string_lossy();
-    let args = cmd
-        .get_args()
-        .map(|a| a.to_string_lossy())
-        .collect::<Vec<_>>();
-    let display_cmd = format!("{} {}", program, args.join(" ")).trim().to_string();
-
-    let output = cmd
-        .output()
-        .with_context(|| format!("failed to execute `{}`", display_cmd))?;
-
-    if !output.status.success() {
-        return Err(anyhow::anyhow!(
-            "`{}` exited with {}.\nstderr: {}\nstdout: {}",
-            display_cmd,
-            output.status,
-            String::from_utf8_lossy(&output.stderr),
-            String::from_utf8_lossy(&output.stdout)
-        ));
-    }
-
-    Ok(output)
 }
 
 #[derive(Debug)]
