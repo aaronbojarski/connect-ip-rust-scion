@@ -18,6 +18,11 @@ cargo build
 ```
 This will produce the `connect-ip-rust-scion` binary in the `target/debug` directory.
 
+We also provide configuration for cross compiling.
+```console
+cross build --release --target aarch64-unknown-linux-gnu
+```
+
 Unit tests can also be run using cargo.
 ```console
 cargo test
@@ -73,6 +78,12 @@ This project took inspiration from the following implementations. We thank the a
 
 
 ## TODO:
+- Usability
+  - Use Client certificate to identify clients
+    - currently client certificates are only used for authentication
+    - we could use the certificate's subject to identify clients and assign routes/addresses based on that
+    - specifically this could solve the issue of a reconnecting client getting a different address
+
 - Code Improvements
   - Documentation (especially public APIs)
   - Better error handling
@@ -80,8 +91,4 @@ This project took inspiration from the following implementations. We thank the a
     - handle errors more gracefully when allowed
 
 - SCION Integration
-  - Update sdk version once SNAP is done
   - Check if path can be selected when connectivity is not working
-
-- Setup
-  - Provide systemd service files for client and proxy
