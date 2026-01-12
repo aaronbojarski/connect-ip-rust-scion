@@ -81,7 +81,7 @@ impl Proxy {
         let (tx_quic_to_udp, mut rx_quic_to_udp) =
             mpsc::channel::<UdpPacket>(MAIN_CHANNEL_CAPACITY);
 
-        let mut buf = [0; UDP_PACKET_BUFFER_SIZE];
+        let mut buf = vec![0; UDP_PACKET_BUFFER_SIZE];
 
         if self.config.listen.isd_asn() == IsdAsn::WILDCARD {
             let local_addr = self

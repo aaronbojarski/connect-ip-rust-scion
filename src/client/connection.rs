@@ -106,7 +106,7 @@ impl Connection {
 
     pub async fn start_connection_handling(&mut self) -> Result<()> {
         let mut buf = [0; MAX_DATAGRAM_SIZE];
-        let mut stream_buf = [0; 65535];
+        let mut stream_buf = vec![0; 65535];
 
         // Channels between TUN and QUIC tasks. Contents are IP packets.
         let (tx_quic_to_tun, rx_quic_to_tun) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);

@@ -46,7 +46,7 @@ impl Client {
     }
 
     pub async fn run(&self) -> Result<()> {
-        let mut buf = [0; UDP_PACKET_BUFFER_SIZE];
+        let mut buf = vec![0; UDP_PACKET_BUFFER_SIZE];
         let quic_config = crate::net::quic::configure_quic(
             &self.config.ca_cert_path,
             &self.config.cert_path,

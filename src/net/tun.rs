@@ -63,7 +63,8 @@ impl Tun {
         let handle = tokio::spawn(
             async move {
                 let result: Result<()> = async {
-                    let mut buf = [0; MAX_TUN_MTU];
+                    debug!("TUN device handler task started");
+                    let mut buf = vec![0; MAX_TUN_MTU];
                     loop {
                         tokio::select! {
                             // Check for cancellation signal
