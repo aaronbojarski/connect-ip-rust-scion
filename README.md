@@ -18,6 +18,8 @@ cargo build
 ```
 This will produce the `connect-ip-rust-scion` binary in the `target/debug` directory.
 
+For building on windows there are some additional dependencies required. You can find more information in the docs under [docs/windows.md](docs/windows.md).
+
 We also provide configuration for cross compiling.
 ```console
 cross build --release --target aarch64-unknown-linux-gnu
