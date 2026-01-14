@@ -50,10 +50,10 @@ All other options can be viewed by running with the `--help` flag.
 ### Client
 The client subcommand starts the Connect-IP client. It connects to the proxy server and forwards traffic between the tun interface and the SCION network.
 ```console
-sudo ./connect-ip-rust-scion client [SCION_PROXY_ADDRESS]:PORT --endhost-api ENDHOST_API_ADDRESS --routes ROUTES --address-pool ADDRESS_POOL
+sudo ./connect-ip-rust-scion client --remote [SCION_PROXY_ADDRESS]:PORT --endhost-api ENDHOST_API_ADDRESS --routes ROUTES --address-pool ADDRESS_POOL
 ```
 The client requires the following parameters:
-- `[SCION_PROXY_ADDRESS]:PORT`: The SCION address and port of the proxy server.
+- `--remote [SCION_PROXY_ADDRESS]:PORT`: The SCION address and port of the proxy server.
 - `--endhost-api ENDHOST_API_ADDRESS`: The address of the endhost API to discover SCION underlays, addresses and routes.
 - `--snap-token SNAP_TOKEN`: (optional) The SNAP token to use for authentication with the endhost API service.
 
@@ -91,6 +91,8 @@ This project took inspiration from the following implementations. We thank the a
   - Better error handling
     - use custom error types when possible
     - handle errors more gracefully when allowed
+  - Remove channels from connect-ip implementation
+  - Potentially simplify client and proxy connection management by moving tun handling into connection module
 
 - SCION Integration
   - Check if path can be selected when connectivity is not working

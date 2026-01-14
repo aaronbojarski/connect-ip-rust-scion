@@ -104,7 +104,7 @@ jobs:
       - name: Start client in background
         run: |
           sudo ip netns exec client_ns ./target/debug/connect-ip-rust-scion client \
-            [0-0,10.248.100.11]:4433 \
+            --remote [0-0,10.248.100.11]:4433 \
             --host localhost \
             --routes 10.248.1.0/24 \
             --address-pool 10.248.1.128/25 \
@@ -229,7 +229,7 @@ jobs:
       - name: Start client in background
         run: |
           sudo ip netns exec client_ns ./target/debug/connect-ip-rust-scion client \
-            [2-3,10.248.200.10]:4433 \
+            --remote [2-3,10.248.200.10]:4433 \
             --host localhost \
             --routes 10.248.1.0/24 \
             --address-pool 10.248.1.128/25 \
