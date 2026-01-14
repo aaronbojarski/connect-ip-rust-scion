@@ -95,6 +95,9 @@ jobs:
         run: |
           sudo ip netns exec proxy_ns ./target/debug/connect-ip-rust-scion proxy \
             --listen [0-0,10.248.100.11]:4433 \
+            --ca-cert ./ca-cert.pem \
+            --cert ./proxy-cert.pem \
+            --key ./proxy-key.pem \
             --routes 10.248.2.0/24 \
             --address-pool 10.248.2.128/25 \
             --log info > proxy.log 2>&1 &
@@ -106,6 +109,9 @@ jobs:
           sudo ip netns exec client_ns ./target/debug/connect-ip-rust-scion client \
             --remote [0-0,10.248.100.11]:4433 \
             --host localhost \
+            --ca-cert ./ca-cert.pem \
+            --cert ./client-cert.pem \
+            --key ./client-key.pem \
             --routes 10.248.1.0/24 \
             --address-pool 10.248.1.128/25 \
             --log info > client.log 2>&1 &
@@ -219,6 +225,9 @@ jobs:
         run: |
           sudo ip netns exec proxy_ns ./target/debug/connect-ip-rust-scion proxy \
             --listen [2-3,10.248.200.10]:4433 \
+            --ca-cert ./ca-cert.pem \
+            --cert ./proxy-cert.pem \
+            --key ./proxy-key.pem \
             --routes 10.248.2.0/24 \
             --address-pool 10.248.2.128/25 \
             --endhost-api  http://10.248.200.20:10231 \
@@ -231,6 +240,9 @@ jobs:
           sudo ip netns exec client_ns ./target/debug/connect-ip-rust-scion client \
             --remote [2-3,10.248.200.10]:4433 \
             --host localhost \
+            --ca-cert ./ca-cert.pem \
+            --cert ./client-cert.pem \
+            --key ./client-key.pem \
             --routes 10.248.1.0/24 \
             --address-pool 10.248.1.128/25 \
             --endhost-api http://10.248.100.20:10143 \
