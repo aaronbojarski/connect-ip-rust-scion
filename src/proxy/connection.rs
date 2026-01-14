@@ -7,6 +7,7 @@ use scion_proto::address::IsdAsn;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
+use x509_parser::prelude::{FromDer, X509Certificate};
 
 use crate::connect_ip::Endpoint;
 use crate::connect_ip::request::{build_response, headers_to_strings};
@@ -41,9 +42,12 @@ pub struct Connection {
     tx_tun_configuration: Option<mpsc::Sender<tun::TunConfiguration>>,
     cancel_token: CancellationToken,
     available_addresses: Arc<Mutex<Vec<IpNet>>>,
+    active_clients: Arc<Mutex<HashMap<String, CancellationToken>>>,
     partial_responses: HashMap<u64, PartialResponse>,
     assign_addresses_and_routes_done: bool,
     client_cert_timer: std::time::Instant,
+    client_cert_processed: bool,
+    pub client_cert_subject_cn: Option<String>,
 }
 
 impl Connection {
@@ -54,6 +58,7 @@ impl Connection {
         tx_quic_to_udp: mpsc::Sender<UdpPacket>,
         cancel_token: CancellationToken,
         available_addresses: Arc<Mutex<Vec<IpNet>>>,
+        active_clients: Arc<Mutex<HashMap<String, CancellationToken>>>,
     ) -> Self {
         Connection {
             config,
@@ -66,9 +71,12 @@ impl Connection {
             tx_tun_configuration: None,
             cancel_token,
             available_addresses,
+            active_clients,
             partial_responses: HashMap::new(),
             assign_addresses_and_routes_done: false,
             client_cert_timer: std::time::Instant::now(),
+            client_cert_processed: false,
+            client_cert_subject_cn: None,
         }
     }
 
@@ -318,6 +326,53 @@ impl Connection {
                 self.conn.close(true, 0x100, b"no client certificate")?;
             }
             return Ok(());
+        }
+
+        // 1. Check if the client certificate has already been processed
+        //    If so, skip re-processing
+        // 2. Parse the certificate and get the subject common name
+        //    If none is set, just continue processing
+        // 3. Check if the client has an open connection
+        //    If so, tear down the existing connection and get the routing info for this client
+
+        if !self.client_cert_processed {
+            let res = X509Certificate::from_der(self.conn.peer_cert().unwrap());
+            match res {
+                Ok((_, cert)) => {
+                    let cn = cert
+                        .tbs_certificate
+                        .subject
+                        .iter_common_name()
+                        .next()
+                        .and_then(|cn| cn.as_str().ok())
+                        .map(|s| s.to_string());
+                    self.client_cert_subject_cn = cn.clone();
+                }
+                _ => {
+                    warn!("failed to parse client certificate");
+                }
+            }
+            if let Some(cn) = &self.client_cert_subject_cn {
+                info!("client certificate CN: {}", cn);
+
+                // TODO: Instead of doing this, we could ask the main task to close the existing connection and notify us when done.
+                let existing_token = self.active_clients.lock().await.get(cn).cloned();
+                if let Some(token) = existing_token {
+                    info!("existing connection found for {}, cancelling it", cn);
+                    token.cancel();
+
+                    // TODO: This wait time might not be sufficient. We should implement a proper notification from the main task when the connection is closed.
+                    // The main issue is that we want to reuse the addresses and routes. Instead of waiting here, we could just remove them from the tun interface. (Especially once we have just one TUN for all connections.)
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+
+                self.active_clients
+                    .lock()
+                    .await
+                    .insert(cn.clone(), self.cancel_token.clone());
+            }
+
+            self.client_cert_processed = true;
         }
 
         // Handle HTTP/3 connection establishment and process HTTP/3 data
