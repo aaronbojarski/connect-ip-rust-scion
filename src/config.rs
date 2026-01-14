@@ -67,7 +67,7 @@ pub struct ProxyOpt {
     routes: Vec<IpNet>,
 
     /// Address pool to assign addresses to clients from
-    #[clap(long, required = true)]
+    #[clap(long)]
     address_pool: Vec<IpNet>,
 
     /// MTU for the interface

@@ -28,7 +28,8 @@ async fn run_proxy(opt: ProxyOpt) -> Result<(), anyhow::Error> {
         None
     };
 
-    let (config, log_level) = combine_proxy_config(opt, config_file)?;
+    let (config, log_level) = combine_proxy_config(opt, config_file)
+        .map_err(|e| anyhow!("Invalid Config Parameters: {}", e))?;
 
     tracing_subscriber::fmt()
         .with_max_level(log_level)
@@ -51,7 +52,8 @@ async fn run_client(opt: ClientOpt) -> Result<(), anyhow::Error> {
         None
     };
 
-    let (config, log_level) = combine_client_config(opt, config_file)?;
+    let (config, log_level) = combine_client_config(opt, config_file)
+        .map_err(|e| anyhow!("Invalid Config Parameters: {}", e))?;
 
     tracing_subscriber::fmt()
         .with_max_level(log_level)

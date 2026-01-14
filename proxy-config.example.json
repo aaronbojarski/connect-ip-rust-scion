@@ -1,0 +1,13 @@
+{
+    "listen": "[0-0,10.248.100.11]:4433",
+    "ca_cert_path": "./testnet/ca-cert.pem",
+    "cert_path": "./testnet/proxy-cert.pem",
+    "key_path": "./testnet/proxy-key.pem",
+    "address_pool": [
+        "10.248.2.128/25"
+    ],
+    "routes": [
+        "10.248.2.0/24"
+    ],
+    "log_level": "debug"
+}

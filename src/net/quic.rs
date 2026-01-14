@@ -20,21 +20,39 @@ pub fn configure_quic(
     info!("Loading CA cert from {}", ca_cert_path.display());
 
     config.verify_peer(true);
-    config.load_cert_chain_from_pem_file(
-        cert_path
-            .to_str()
-            .ok_or_else(|| anyhow!("Invalid certificate path"))?,
-    )?;
-    config.load_priv_key_from_pem_file(
-        key_path
-            .to_str()
-            .ok_or_else(|| anyhow!("Invalid key path"))?,
-    )?;
-    config.load_verify_locations_from_file(
-        ca_cert_path
-            .to_str()
-            .ok_or_else(|| anyhow!("Invalid CA certificate path"))?,
-    )?;
+    config
+        .load_cert_chain_from_pem_file(
+            cert_path
+                .to_str()
+                .ok_or_else(|| anyhow!("Invalid certificate path"))?,
+        )
+        .map_err(|e| {
+            anyhow!(
+                "Failed to load certificate from file {:?}. {}",
+                cert_path,
+                e
+            )
+        })?;
+    config
+        .load_priv_key_from_pem_file(
+            key_path
+                .to_str()
+                .ok_or_else(|| anyhow!("Invalid key path"))?,
+        )
+        .map_err(|e| anyhow!("Failed to load private key from file {:?}. {}", key_path, e))?;
+    config
+        .load_verify_locations_from_file(
+            ca_cert_path
+                .to_str()
+                .ok_or_else(|| anyhow!("Invalid CA certificate path"))?,
+        )
+        .map_err(|e| {
+            anyhow!(
+                "Failed to load CA certificate from file {:?}. {}",
+                ca_cert_path,
+                e
+            )
+        })?;
 
     config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
     config.set_max_idle_timeout(DEFAULT_TIMEOUT);
