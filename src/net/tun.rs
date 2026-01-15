@@ -2,10 +2,10 @@ use std::net::IpAddr;
 
 use anyhow::{Context, Result};
 use ipnet::IpNet;
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::{Permit, Receiver, Sender};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info_span, warn};
+use tracing::{debug, error, info, info_span, warn};
 use tracing_futures::Instrument as _;
 use tun_rs::DeviceBuilder;
 
@@ -127,15 +127,33 @@ impl Tun {
                             result = async {
                                 let permit = tx_tun_to_quic.reserve().await
                                     .context("channel closed")?;
-                                let len = dev.recv(&mut buf).await?;
-                                permit.send(buf[..len].to_vec());
-                                Ok::<(), anyhow::Error>(())
+                                dev.readable().await?;
+                                Ok::<Permit<'_, Vec<u8>>, anyhow::Error>(permit)
                             } => {
-                                if let Err(e) = result {
-                                    warn!("Failed to read from TUN device {}: {}, shutting down", name, e);
-                                    break;
+                                match result {
+                                    Ok(permit) => {
+                                        match dev.try_recv(&mut buf) {
+                                            Ok(n) => {
+                                                let packet = buf[..n].to_vec();
+                                                permit.send(packet);
+                                                info!("TUN device {} read {} bytes and forwarded to QUIC", name, n);
+                                            },
+                                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                                // This should not happen as we awaited readability. However, apparently those false positives are possible.
+                                                continue;
+                                            }
+                                            Err(e) => {
+                                                warn!("TUN device {} read error: {}, shutting down", name, e);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("TUN device {} channel closed: {}, shutting down", name, e);
+                                        break;
+                                    }
                                 }
-                            }
+                            },
 
                             // Receive from main task and write to TUN device
                             Some(packet) = rx_in_tun.recv() => {
