@@ -1,4 +1,5 @@
 pub mod connection;
+pub mod tun;
 
 use std::fs;
 use std::sync::Arc;
@@ -13,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
 use crate::client::connection::{Config, Connection};
+use crate::connect_ip::RoutingUpdates;
 use crate::net::UdpPacket;
 use crate::net::quic::MAX_DATAGRAM_SIZE;
 
@@ -54,12 +56,26 @@ impl Client {
         )?;
         let available_addresses = Arc::new(Mutex::new(self.config.address_pool.clone()));
 
+        // Create cancellation token for graceful shutdown
+        let cancel_token = CancellationToken::new();
+
         // Channels between UDP and QUIC tasks. Contents are UDP datagrams (usually encrypted QUIC packets) with source address.
         let (tx_udp_to_quic, rx_udp_to_quic) = mpsc::channel::<UdpPacket>(CHANNEL_CAPACITY);
         let (tx_quic_to_udp, mut rx_quic_to_udp) = mpsc::channel::<UdpPacket>(CHANNEL_CAPACITY);
 
-        // Create cancellation token for graceful shutdown
-        let cancel_token = CancellationToken::new();
+        // Channels between TUN and QUIC tasks. Contents are IP packets.
+        let (tx_quic_to_tun, rx_quic_to_tun) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
+        let (tx_tun_to_quic, rx_tun_to_quic) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
+
+        let mut tun = tun::Tun::new(
+            &self.config.tun_name,
+            tx_tun_to_quic.clone(),
+            self.config.tun_mtu,
+        )?;
+        let (tx_tun_configuration, rx_tun_configuration) =
+            mpsc::channel::<RoutingUpdates>(CHANNEL_CAPACITY);
+        tun.start(rx_quic_to_tun, rx_tun_configuration, cancel_token.clone())
+            .await?;
 
         let result = if self.config.remote.isd_asn() == IsdAsn::WILDCARD {
             let addr = match self.config.bind {
@@ -94,6 +110,9 @@ impl Client {
                 config,
                 rx_udp_to_quic,
                 tx_quic_to_udp,
+                tx_tun_configuration,
+                tx_quic_to_tun,
+                rx_tun_to_quic,
                 cancel_token.clone(),
                 available_addresses,
             )?;
@@ -211,6 +230,9 @@ impl Client {
                 config,
                 rx_udp_to_quic,
                 tx_quic_to_udp,
+                tx_tun_configuration,
+                tx_quic_to_tun,
+                rx_tun_to_quic,
                 cancel_token.clone(),
                 available_addresses,
             )?;

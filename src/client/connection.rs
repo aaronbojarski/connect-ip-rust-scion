@@ -7,11 +7,12 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::client::{CHANNEL_CAPACITY, MAX_DATAGRAM_SIZE};
+use crate::client::MAX_DATAGRAM_SIZE;
+use crate::connect_ip::RoutingUpdates;
 use crate::connect_ip::capsule::{AddressRequestCapsule, Capsule, RequestedAddress};
 use crate::connect_ip::request::{build_request, check_response, headers_to_strings};
 use crate::net::quic::{DEFAULT_TIMEOUT, HTTP3_STREAM_OVERHEAD, KEEPALIVE_INTERVAL};
-use crate::net::{ForwardingDecision, UdpPacket, ZERO_IPV4_ADDRESS, tun};
+use crate::net::{ForwardingDecision, UdpPacket, ZERO_IPV4_ADDRESS};
 
 const RCV_MANY_CAPACITY: usize = 10; // number of packets
 const SEND_ADDRESS_REQUEST_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
@@ -40,8 +41,9 @@ pub struct Connection {
     connect_ip_endpoint: Option<crate::connect_ip::Endpoint>,
     rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
     tx_quic_to_udp: mpsc::Sender<UdpPacket>,
-    tx_tun_configuration: Option<mpsc::Sender<tun::TunConfiguration>>,
-    tx_quic_to_tun: Option<mpsc::Sender<Vec<u8>>>,
+    tx_tun_configuration: mpsc::Sender<RoutingUpdates>,
+    tx_quic_to_tun: mpsc::Sender<Vec<u8>>,
+    rx_tun_to_quic: mpsc::Receiver<Vec<u8>>,
     cancel_token: CancellationToken,
     available_addresses: Arc<Mutex<Vec<IpNet>>>,
     tunnel_status: TunnelStatus,
@@ -53,6 +55,9 @@ impl Connection {
         mut config: Config,
         rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
         tx_quic_to_udp: mpsc::Sender<UdpPacket>,
+        tx_tun_configuration: mpsc::Sender<RoutingUpdates>,
+        tx_quic_to_tun: mpsc::Sender<Vec<u8>>,
+        rx_tun_to_quic: mpsc::Receiver<Vec<u8>>,
         cancel_token: CancellationToken,
         available_addresses: Arc<Mutex<Vec<IpNet>>>,
     ) -> Result<Self> {
@@ -90,8 +95,9 @@ impl Connection {
             connect_ip_endpoint: None,
             rx_udp_to_quic,
             tx_quic_to_udp,
-            tx_tun_configuration: None,
-            tx_quic_to_tun: None,
+            tx_tun_configuration,
+            tx_quic_to_tun,
+            rx_tun_to_quic,
             cancel_token,
             available_addresses,
             tunnel_status: TunnelStatus {
@@ -107,27 +113,6 @@ impl Connection {
     pub async fn start_connection_handling(&mut self) -> Result<()> {
         let mut buf = [0; MAX_DATAGRAM_SIZE];
         let mut stream_buf = vec![0; 65535];
-
-        // Channels between TUN and QUIC tasks. Contents are IP packets.
-        let (tx_quic_to_tun, rx_quic_to_tun) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
-        let (tx_tun_to_quic, mut rx_tun_to_quic) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
-
-        let mut tun = tun::Tun::new(
-            &self.config.tun_name,
-            tx_tun_to_quic.clone(),
-            self.config.configured_mtu,
-        )?;
-        let (tx_tun_configuration, rx_tun_configuration) =
-            mpsc::channel::<tun::TunConfiguration>(CHANNEL_CAPACITY);
-        tun.start(
-            rx_quic_to_tun,
-            rx_tun_configuration,
-            self.cancel_token.clone(),
-        )
-        .await?;
-
-        self.tx_tun_configuration = Some(tx_tun_configuration);
-        self.tx_quic_to_tun = Some(tx_quic_to_tun);
 
         // Send initial packet
         let (write, send_info) = self.conn.send(&mut buf)?;
@@ -179,7 +164,7 @@ impl Connection {
                 }
 
                 // Handle outgoing IP packets from TUN
-                num_packets = rx_tun_to_quic.recv_many(&mut tun_packet_buf, RCV_MANY_CAPACITY) => {
+                num_packets = self.rx_tun_to_quic.recv_many(&mut tun_packet_buf, RCV_MANY_CAPACITY) => {
                     for packet in tun_packet_buf.iter().take(num_packets) {
                         self.process_tun_packet(packet).await?;
                     }
@@ -212,9 +197,7 @@ impl Connection {
             if let Some(connect_ip_endpoint) = &mut self.connect_ip_endpoint {
                 // Handle routing updates
                 while let Some(tun_update) = connect_ip_endpoint.next_routing_update() {
-                    if let Some(tx_tun_configuration) = &self.tx_tun_configuration {
-                        tx_tun_configuration.send(tun_update).await?;
-                    }
+                    self.tx_tun_configuration.send(tun_update).await?;
                 }
 
                 // Send pending datagrams from Connect-IP endpoint
@@ -278,9 +261,7 @@ impl Connection {
 
                 // Handle outgoing TUN packets from Connect-IP endpoint
                 while let Some(tun_packet) = connect_ip_endpoint.send_tun_packet() {
-                    if let Some(tx_quic_to_tun) = &self.tx_quic_to_tun {
-                        tx_quic_to_tun.send(tun_packet).await?;
-                    }
+                    self.tx_quic_to_tun.send(tun_packet).await?;
                 }
             }
 
@@ -317,11 +298,8 @@ impl Connection {
             }
         }
 
-        // Graceful shutdown of TUN task
+        // Graceful shutdown of remaining tasks
         self.cancel_token.cancel();
-        if let Some(tun_handle) = tun.handle.take() {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), tun_handle).await;
-        }
 
         info!("QUIC connection handler exiting");
         Ok(())
@@ -439,11 +417,9 @@ impl Connection {
                         if valid {
                             self.tunnel_status.established = true;
                             let tun_mtu = tun_mtu.unwrap_or(self.config.configured_mtu);
-                            if let Some(tx_tun_update) = &self.tx_tun_configuration {
-                                tx_tun_update
-                                    .send(tun::TunConfiguration::SetMTU(tun_mtu))
-                                    .await?;
-                            }
+                            self.tx_tun_configuration
+                                .send(RoutingUpdates::SetMTU(tun_mtu))
+                                .await?;
 
                             info!("connected. negotiated TUN MTU: {}", tun_mtu);
 

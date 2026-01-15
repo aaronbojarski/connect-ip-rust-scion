@@ -22,12 +22,21 @@ use crate::net::quic::MAX_DATAGRAM_SIZE;
 use crate::net::tun::MAX_TUN_MTU;
 use crate::net::{
     ForwardingDecision, IpVersion, ZERO_IPV4_ADDRESS, ZERO_IPV6_ADDRESS, check_packet_src_dst,
-    get_next_avail_subnet, get_specific_subnet, is_zero_address, tun,
+    get_next_avail_subnet, get_specific_subnet, is_zero_address,
 };
 
 const SEND_BUFFER_SIZE: usize = 65535;
 const RCV_BUFFER_SIZE: usize = 65535;
 const MAX_TUN_MTU_FOR_DATAGRAMS: usize = MAX_DATAGRAM_SIZE - 50;
+
+/// Configuration commands for the TUN device.
+pub enum RoutingUpdates {
+    AddAddress(IpNet),
+    RemoveAddress(IpNet),
+    AddRoute(IpNet),
+    RemoveRoute(IpNet),
+    SetMTU(u16),
+}
 
 /// Addresses and routes negotiated through capsule protocol.
 #[derive(Clone, Debug)]
@@ -48,7 +57,7 @@ pub struct Endpoint {
     pub stream_id: u64,
     pub routing_state: RoutingState,
     available_addresses: Arc<Mutex<Vec<IpNet>>>,
-    routing_updates: VecDeque<tun::TunConfiguration>,
+    routing_updates: VecDeque<RoutingUpdates>,
     peer_supports_datagrams: bool,
     stream_data_received: VecDeque<u8>, // data received from the stream, not yet processed
     stream_data_to_send: VecDeque<u8>, // needs to be sent on the stream, not yet sent due to flow control
@@ -263,7 +272,7 @@ impl Endpoint {
         Ok(())
     }
 
-    pub fn next_routing_update(&mut self) -> Option<tun::TunConfiguration> {
+    pub fn next_routing_update(&mut self) -> Option<RoutingUpdates> {
         self.routing_updates.pop_front()
     }
 
@@ -391,7 +400,7 @@ impl Endpoint {
                 // Remove old addresses as they are no longer valid
                 for addr in self.routing_state.local_addresses.iter() {
                     self.routing_updates
-                        .push_back(tun::TunConfiguration::RemoveAddress(*addr));
+                        .push_back(RoutingUpdates::RemoveAddress(*addr));
                 }
 
                 self.routing_state.local_addresses.clear();
@@ -405,7 +414,7 @@ impl Endpoint {
                     info!("received address from peer: {}", assigned_address.ip_net);
 
                     self.routing_updates
-                        .push_back(tun::TunConfiguration::AddAddress(assigned_address.ip_net));
+                        .push_back(RoutingUpdates::AddAddress(assigned_address.ip_net));
                     self.routing_state
                         .local_addresses
                         .push(assigned_address.ip_net);
@@ -419,7 +428,7 @@ impl Endpoint {
                     .chain(self.routing_state.remote_routes.iter())
                 {
                     self.routing_updates
-                        .push_back(tun::TunConfiguration::AddRoute(*route));
+                        .push_back(RoutingUpdates::AddRoute(*route));
                 }
             }
             Capsule::AddressRequest(request_capsule) => {
@@ -460,7 +469,7 @@ impl Endpoint {
                         assigned_addresses.push(assigned_address);
 
                         self.routing_updates
-                            .push_back(tun::TunConfiguration::AddRoute(assigned_subnet));
+                            .push_back(RoutingUpdates::AddRoute(assigned_subnet));
                         self.routing_state.remote_addresses.push(assigned_subnet);
                     } else {
                         let zero_ipnet = match requested_address.ip_net {
@@ -497,7 +506,7 @@ impl Endpoint {
                 // remove old routes
                 for route in self.routing_state.remote_routes.iter() {
                     self.routing_updates
-                        .push_back(tun::TunConfiguration::RemoveRoute(*route));
+                        .push_back(RoutingUpdates::RemoveRoute(*route));
                 }
                 self.routing_state.remote_routes.clear();
 
@@ -505,7 +514,7 @@ impl Endpoint {
                 for route in route_capsule.routes {
                     info!("received route advertisement from peer: {}", route.ip_net);
                     self.routing_updates
-                        .push_back(tun::TunConfiguration::AddRoute(route.ip_net));
+                        .push_back(RoutingUpdates::AddRoute(route.ip_net));
 
                     self.routing_state.remote_routes.push(route.ip_net);
                 }
@@ -541,7 +550,7 @@ impl Endpoint {
             self.send_capsule(&capsule, true)?;
 
             self.routing_updates
-                .push_back(tun::TunConfiguration::AddRoute(addr));
+                .push_back(RoutingUpdates::AddRoute(addr));
         } else {
             error!("no available addresses to assign to peer");
         }
