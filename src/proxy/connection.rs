@@ -186,6 +186,13 @@ impl Connection {
             }
 
             if let Some(connect_ip_endpoint) = &mut self.connect_ip_endpoint {
+                // Handle routing updates
+                while let Some(tun_update) = connect_ip_endpoint.next_routing_update() {
+                    if let Some(tx_tun_configuration) = &self.tx_tun_configuration {
+                        tx_tun_configuration.send(tun_update).await?;
+                    }
+                }
+
                 // Send pending datagrams from Connect-IP endpoint
                 while !self.conn.is_dgram_send_queue_full()
                     && let Some(datagram) = connect_ip_endpoint.send_datagram()
@@ -241,6 +248,13 @@ impl Connection {
                                 return Err(anyhow!("send_body failed: {:?}", e));
                             }
                         }
+                    }
+                }
+
+                // Handle outgoing TUN packets from Connect-IP endpoint
+                while let Some(tun_packet) = connect_ip_endpoint.send_tun_packet() {
+                    if let Some(tx_quic_to_tun) = &self.tx_quic_to_tun {
+                        tx_quic_to_tun.send(tun_packet).await?;
                     }
                 }
             }
@@ -534,8 +548,6 @@ impl Connection {
                     negotiated_mtu,
                     self.available_addresses.clone(),
                     self.config.routes.clone(),
-                    self.tx_quic_to_tun.as_ref().unwrap().clone(),
-                    self.tx_tun_configuration.as_ref().unwrap().clone(),
                     self.conn.dgram_max_writable_len().is_some(),
                 );
 

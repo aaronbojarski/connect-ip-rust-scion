@@ -10,7 +10,7 @@ use ipnet::IpNet;
 use octets::{Octets, OctetsMut};
 use pnet::packet::ipv4::Ipv4Packet;
 use pnet::packet::ipv6::Ipv6Packet;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::Mutex;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::connect_ip::capsule::{
@@ -48,12 +48,12 @@ pub struct Endpoint {
     pub stream_id: u64,
     pub routing_state: RoutingState,
     available_addresses: Arc<Mutex<Vec<IpNet>>>,
-    tx_forward_ingress: mpsc::Sender<Vec<u8>>,
-    tx_routing_update: mpsc::Sender<tun::TunConfiguration>,
+    routing_updates: VecDeque<tun::TunConfiguration>,
     peer_supports_datagrams: bool,
     stream_data_received: VecDeque<u8>, // data received from the stream, not yet processed
     stream_data_to_send: VecDeque<u8>, // needs to be sent on the stream, not yet sent due to flow control
     datagrams_to_send: VecDeque<Vec<u8>>, // datagrams to send, not yet sent due to flow control
+    tun_packets_to_send: VecDeque<Vec<u8>>, // packets to send to the tun interface
 }
 
 impl Endpoint {
@@ -62,8 +62,6 @@ impl Endpoint {
         mtu: u16,
         available_addresses: Arc<Mutex<Vec<IpNet>>>,
         routes: Vec<IpNet>,
-        tx_forward_ingress: mpsc::Sender<Vec<u8>>,
-        tx_routing_update: mpsc::Sender<tun::TunConfiguration>,
         peer_supports_datagrams: bool,
     ) -> Self {
         Self {
@@ -76,12 +74,12 @@ impl Endpoint {
                 remote_routes: vec![],
             },
             available_addresses,
-            tx_forward_ingress,
-            tx_routing_update,
+            routing_updates: VecDeque::new(),
             peer_supports_datagrams,
             stream_data_received: VecDeque::with_capacity(RCV_BUFFER_SIZE),
             stream_data_to_send: VecDeque::with_capacity(SEND_BUFFER_SIZE),
             datagrams_to_send: VecDeque::new(),
+            tun_packets_to_send: VecDeque::new(),
         }
     }
 
@@ -188,7 +186,7 @@ impl Endpoint {
     }
 
     pub async fn forward_ingress_packet(&mut self, packet: &[u8]) -> Result<()> {
-        self.tx_forward_ingress.send(packet.to_vec()).await?;
+        self.tun_packets_to_send.push_back(packet.to_vec());
         Ok(())
     }
 
@@ -265,6 +263,14 @@ impl Endpoint {
         Ok(())
     }
 
+    pub fn next_routing_update(&mut self) -> Option<tun::TunConfiguration> {
+        self.routing_updates.pop_front()
+    }
+
+    pub fn send_tun_packet(&mut self) -> Option<Vec<u8>> {
+        self.tun_packets_to_send.pop_front()
+    }
+
     pub fn send_datagram(&mut self) -> Option<Vec<u8>> {
         self.datagrams_to_send.pop_front()
     }
@@ -330,11 +336,6 @@ impl Endpoint {
         Ok(())
     }
 
-    pub async fn update_tun_interface(&self, update: tun::TunConfiguration) -> Result<()> {
-        self.tx_routing_update.send(update).await?;
-        Ok(())
-    }
-
     pub async fn process_capsule_data(&mut self, start: usize) -> Result<usize> {
         self.stream_data_received.make_contiguous();
         let mut octets = Octets::with_slice(&self.stream_data_received.as_slices().0[start..]);
@@ -389,8 +390,8 @@ impl Endpoint {
 
                 // Remove old addresses as they are no longer valid
                 for addr in self.routing_state.local_addresses.iter() {
-                    self.update_tun_interface(tun::TunConfiguration::RemoveAddress(*addr))
-                        .await?;
+                    self.routing_updates
+                        .push_back(tun::TunConfiguration::RemoveAddress(*addr));
                 }
 
                 self.routing_state.local_addresses.clear();
@@ -403,10 +404,8 @@ impl Endpoint {
                     }
                     info!("received address from peer: {}", assigned_address.ip_net);
 
-                    self.update_tun_interface(tun::TunConfiguration::AddAddress(
-                        assigned_address.ip_net,
-                    ))
-                    .await?;
+                    self.routing_updates
+                        .push_back(tun::TunConfiguration::AddAddress(assigned_address.ip_net));
                     self.routing_state
                         .local_addresses
                         .push(assigned_address.ip_net);
@@ -419,8 +418,8 @@ impl Endpoint {
                     .iter()
                     .chain(self.routing_state.remote_routes.iter())
                 {
-                    self.update_tun_interface(tun::TunConfiguration::AddRoute(*route))
-                        .await?;
+                    self.routing_updates
+                        .push_back(tun::TunConfiguration::AddRoute(*route));
                 }
             }
             Capsule::AddressRequest(request_capsule) => {
@@ -460,8 +459,8 @@ impl Endpoint {
                         };
                         assigned_addresses.push(assigned_address);
 
-                        self.update_tun_interface(tun::TunConfiguration::AddRoute(assigned_subnet))
-                            .await?;
+                        self.routing_updates
+                            .push_back(tun::TunConfiguration::AddRoute(assigned_subnet));
                         self.routing_state.remote_addresses.push(assigned_subnet);
                     } else {
                         let zero_ipnet = match requested_address.ip_net {
@@ -497,16 +496,16 @@ impl Endpoint {
 
                 // remove old routes
                 for route in self.routing_state.remote_routes.iter() {
-                    self.update_tun_interface(tun::TunConfiguration::RemoveRoute(*route))
-                        .await?;
+                    self.routing_updates
+                        .push_back(tun::TunConfiguration::RemoveRoute(*route));
                 }
                 self.routing_state.remote_routes.clear();
 
                 // add new routes
                 for route in route_capsule.routes {
                     info!("received route advertisement from peer: {}", route.ip_net);
-                    self.update_tun_interface(tun::TunConfiguration::AddRoute(route.ip_net))
-                        .await?;
+                    self.routing_updates
+                        .push_back(tun::TunConfiguration::AddRoute(route.ip_net));
 
                     self.routing_state.remote_routes.push(route.ip_net);
                 }
@@ -541,8 +540,8 @@ impl Endpoint {
             let capsule = Capsule::AddressAssign(address_assign_capsule);
             self.send_capsule(&capsule, true)?;
 
-            self.update_tun_interface(tun::TunConfiguration::AddRoute(addr))
-                .await?;
+            self.routing_updates
+                .push_back(tun::TunConfiguration::AddRoute(addr));
         } else {
             error!("no available addresses to assign to peer");
         }
