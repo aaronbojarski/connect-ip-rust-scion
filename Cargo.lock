@@ -575,6 +575,7 @@ dependencies = [
  "tracing-subscriber",
  "tun-rs",
  "url",
+ "x509-parser",
 ]
 
 [[package]]
