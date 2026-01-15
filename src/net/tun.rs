@@ -122,17 +122,18 @@ impl Tun {
                             }
 
                             // Read from TUN device and send to main task
-                            len = dev.recv(&mut buf) => {
-                                let len = len?;
-                                match tx_tun_to_quic.try_send(buf[..len].to_vec()) {
-                                    Ok(_) => {}
-                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                        debug!("TUN to QUIC channel full, dropping packet from TUN device {}", name);
-                                    }
-                                    Err(e) => {
-                                        warn!("Failed to send packet from TUN device {}: {}, shutting down", name, e);
-                                        break;
-                                    }
+                            // Reserve channel space first, then read - this blocks reading when channel is full
+                            // while allowing other select branches to continue
+                            result = async {
+                                let permit = tx_tun_to_quic.reserve().await
+                                    .context("channel closed")?;
+                                let len = dev.recv(&mut buf).await?;
+                                permit.send(buf[..len].to_vec());
+                                Ok::<(), anyhow::Error>(())
+                            } => {
+                                if let Err(e) = result {
+                                    warn!("Failed to read from TUN device {}: {}, shutting down", name, e);
+                                    break;
                                 }
                             }
 

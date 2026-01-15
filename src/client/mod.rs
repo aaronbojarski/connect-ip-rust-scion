@@ -16,7 +16,7 @@ use crate::client::connection::{Config, Connection};
 use crate::net::UdpPacket;
 use crate::net::quic::MAX_DATAGRAM_SIZE;
 
-pub const CHANNEL_CAPACITY: usize = 200;
+pub const CHANNEL_CAPACITY: usize = 100;
 pub const UDP_PACKET_BUFFER_SIZE: usize = 65535;
 
 #[derive(Clone)]
@@ -166,17 +166,16 @@ impl Client {
             }
             let client_network_stack = builder.build().await?;
 
-            // When using SNAP, we will get an address assigned.
+            // Get the available local ISD-ASNs
             let local_ias = client_network_stack.local_ases();
-
-            if let Some(bind) = &self.config.bind {
-                if !local_ias.contains(&bind.isd_asn()) {
-                    anyhow::bail!(
-                        "configured bind ISD-AS {} is not among the local ASes of the SCION stack: {:?}",
-                        bind.isd_asn(),
-                        local_ias
-                    );
-                }
+            if let Some(bind) = &self.config.bind
+                && !local_ias.contains(&bind.isd_asn())
+            {
+                anyhow::bail!(
+                    "configured bind ISD-AS {} is not among the local ASes of the SCION stack: {:?}",
+                    bind.isd_asn(),
+                    local_ias
+                );
             }
 
             let mut socket_config = scion_stack::scionstack::SocketConfig::new();
