@@ -11,7 +11,8 @@ use scion_proto::path::policy::acl::AclPolicy;
 use scion_stack::scionstack::ScionStackBuilder;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, info_span};
+use tracing_futures::Instrument;
 
 use crate::client::connection::{Config, Connection};
 use crate::connect_ip::RoutingUpdates;
@@ -67,15 +68,25 @@ impl Client {
         let (tx_quic_to_tun, rx_quic_to_tun) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
         let (tx_tun_to_quic, rx_tun_to_quic) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
 
-        let mut tun = tun::Tun::new(
-            &self.config.tun_name,
-            tx_tun_to_quic.clone(),
-            self.config.tun_mtu,
-        )?;
         let (tx_tun_configuration, rx_tun_configuration) =
             mpsc::channel::<RoutingUpdates>(CHANNEL_CAPACITY);
-        tun.start(rx_quic_to_tun, rx_tun_configuration, cancel_token.clone())
-            .await?;
+
+        let mut tun = tun::Tun::new(
+            &self.config.tun_name,
+            self.config.tun_mtu,
+            tx_tun_to_quic.clone(),
+            rx_quic_to_tun,
+            rx_tun_configuration,
+            cancel_token.clone(),
+        )?;
+        let mut tun_handle = tokio::spawn(async move {
+            if let Err(e) = tun.start().await {
+                error!("TUN device handler exited with error: {}", e);
+            } else {
+                info!("TUN device handler exited normally");
+            }
+        })
+        .instrument(info_span!("tun_handler", tun_name = %self.config.tun_name));
 
         let result = if self.config.remote.isd_asn() == IsdAsn::WILDCARD {
             let addr = match self.config.bind {
@@ -162,6 +173,19 @@ impl Client {
                             Err(e) => {
                                 info!("QUIC task panicked: {}", e);
                                 break Err(anyhow!("QUIC task panicked: {:?}", e));
+                            }
+                        }
+                    }
+                    // TUN handler exited
+                    tun_result = &mut tun_handle => {
+                        match tun_result {
+                            Ok(()) => {
+                                info!("TUN device handler closed normally");
+                                break Ok(());
+                            }
+                            Err(e) => {
+                                info!("TUN device handler panicked: {}", e);
+                                break Err(anyhow!("TUN device handler panicked: {}", e));
                             }
                         }
                     }
@@ -281,6 +305,19 @@ impl Client {
                             Err(e) => {
                                 info!("QUIC task panicked: {}", e);
                                 break Err(anyhow!("QUIC task panicked: {}", e));
+                            }
+                        }
+                    }
+                    // TUN handler exited
+                    tun_result = &mut tun_handle => {
+                        match tun_result {
+                            Ok(()) => {
+                                info!("TUN device handler closed normally");
+                                break Ok(());
+                            }
+                            Err(e) => {
+                                info!("TUN device handler panicked: {}", e);
+                                break Err(anyhow!("TUN device handler panicked: {}", e));
                             }
                         }
                     }
