@@ -5,7 +5,8 @@ use ipnet::IpNet;
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, info_span, trace, warn};
+use tracing_futures::Instrument;
 
 use crate::client::{CHANNEL_CAPACITY, MAX_DATAGRAM_SIZE};
 use crate::connect_ip;
@@ -39,10 +40,12 @@ pub struct Connection {
     conn: quiche::Connection,
     h3_conn: Option<quiche::h3::Connection>,
     connect_ip_endpoint: Option<crate::connect_ip::Endpoint>,
+    tun: Option<tun::Tun>,
     rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
     tx_quic_to_udp: mpsc::Sender<UdpPacket>,
-    tx_tun_configuration: Option<mpsc::Sender<connect_ip::RoutingUpdate>>,
-    tx_quic_to_tun: Option<mpsc::Sender<Vec<u8>>>,
+    tx_routing_updates: mpsc::Sender<connect_ip::RoutingUpdate>,
+    rx_tun_to_quic: mpsc::Receiver<Vec<u8>>,
+    tx_quic_to_tun: mpsc::Sender<Vec<u8>>,
     cancel_token: CancellationToken,
     available_addresses: Arc<Mutex<Vec<IpNet>>>,
     tunnel_status: TunnelStatus,
@@ -57,6 +60,23 @@ impl Connection {
         cancel_token: CancellationToken,
         available_addresses: Arc<Mutex<Vec<IpNet>>>,
     ) -> Result<Self> {
+        // Channel for TUN routing configuration updates.
+        let (tx_routing_updates, rx_routing_updates) =
+            mpsc::channel::<connect_ip::RoutingUpdate>(CHANNEL_CAPACITY);
+
+        // Channels between TUN and QUIC tasks. Contents are IP packets.
+        let (tx_quic_to_tun, rx_quic_to_tun) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
+        let (tx_tun_to_quic, rx_tun_to_quic) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
+
+        let tun = tun::Tun::new(
+            &config.tun_name,
+            config.configured_mtu,
+            tx_tun_to_quic,
+            rx_quic_to_tun,
+            rx_routing_updates,
+            cancel_token.clone(),
+        );
+
         // Generate a random source connection ID for the connection.
         let mut scid = [0; quiche::MAX_CONN_ID_LEN];
         if let Err(e) = SystemRandom::new().fill(&mut scid[..]) {
@@ -89,10 +109,12 @@ impl Connection {
             conn,
             h3_conn: None,
             connect_ip_endpoint: None,
+            tun: Some(tun),
             rx_udp_to_quic,
             tx_quic_to_udp,
-            tx_tun_configuration: None,
-            tx_quic_to_tun: None,
+            tx_routing_updates,
+            rx_tun_to_quic,
+            tx_quic_to_tun,
             cancel_token,
             available_addresses,
             tunnel_status: TunnelStatus {
@@ -109,26 +131,15 @@ impl Connection {
         let mut buf = [0; MAX_DATAGRAM_SIZE];
         let mut stream_buf = vec![0; 65535];
 
-        // Channels between TUN and QUIC tasks. Contents are IP packets.
-        let (tx_quic_to_tun, rx_quic_to_tun) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
-        let (tx_tun_to_quic, mut rx_tun_to_quic) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
-
-        let mut tun = tun::Tun::new(
-            &self.config.tun_name,
-            tx_tun_to_quic.clone(),
-            self.config.configured_mtu,
-        )?;
-        let (tx_tun_configuration, rx_tun_configuration) =
-            mpsc::channel::<connect_ip::RoutingUpdate>(CHANNEL_CAPACITY);
-        tun.start(
-            rx_quic_to_tun,
-            rx_tun_configuration,
-            self.cancel_token.clone(),
-        )
-        .await?;
-
-        self.tx_tun_configuration = Some(tx_tun_configuration);
-        self.tx_quic_to_tun = Some(tx_quic_to_tun);
+        let mut tun = self.tun.take().unwrap();
+        let mut tun_handle = tokio::spawn(async move {
+            if let Err(e) = tun.start().await {
+                error!("TUN device handler exited with error: {}", e);
+            } else {
+                info!("TUN device handler exited normally");
+            }
+        })
+        .instrument(info_span!("tun_handler", tun_name = %self.config.tun_name));
 
         // Send initial packet
         let (write, send_info) = self.conn.send(&mut buf)?;
@@ -180,9 +191,23 @@ impl Connection {
                 }
 
                 // Handle outgoing IP packets from TUN
-                num_packets = rx_tun_to_quic.recv_many(&mut tun_packet_buf, RCV_MANY_CAPACITY) => {
+                num_packets = self.rx_tun_to_quic.recv_many(&mut tun_packet_buf, RCV_MANY_CAPACITY) => {
                     for packet in tun_packet_buf.iter().take(num_packets) {
                         self.process_tun_packet(packet).await?;
+                    }
+                }
+
+                // TUN handler exited
+                tun_result = &mut tun_handle => {
+                    match tun_result {
+                        Ok(()) => {
+                            info!("TUN device handler closed normally");
+                            break;
+                        }
+                        Err(e) => {
+                            error!("TUN device handler panicked: {}", e);
+                            break;
+                        }
                     }
                 }
 
@@ -213,9 +238,7 @@ impl Connection {
             if let Some(connect_ip_endpoint) = &mut self.connect_ip_endpoint {
                 // Handle routing updates
                 while let Some(tun_update) = connect_ip_endpoint.next_routing_update() {
-                    if let Some(tx_tun_configuration) = &self.tx_tun_configuration {
-                        tx_tun_configuration.send(tun_update).await?;
-                    }
+                    self.tx_routing_updates.send(tun_update).await?;
                 }
 
                 // Send pending datagrams from Connect-IP endpoint
@@ -279,9 +302,7 @@ impl Connection {
 
                 // Handle outgoing TUN packets from Connect-IP endpoint
                 while let Some(tun_packet) = connect_ip_endpoint.send_tun_packet() {
-                    if let Some(tx_quic_to_tun) = &self.tx_quic_to_tun {
-                        tx_quic_to_tun.send(tun_packet).await?;
-                    }
+                    self.tx_quic_to_tun.send(tun_packet).await?;
                 }
             }
 
@@ -320,9 +341,7 @@ impl Connection {
 
         // Graceful shutdown of TUN task
         self.cancel_token.cancel();
-        if let Some(tun_handle) = tun.handle.take() {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), tun_handle).await;
-        }
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), tun_handle).await;
 
         info!("QUIC connection handler exiting");
         Ok(())
@@ -440,11 +459,9 @@ impl Connection {
                         if valid {
                             self.tunnel_status.established = true;
                             let tun_mtu = tun_mtu.unwrap_or(self.config.configured_mtu);
-                            if let Some(tx_tun_update) = &self.tx_tun_configuration {
-                                tx_tun_update
-                                    .send(connect_ip::RoutingUpdate::SetMTU(tun_mtu))
-                                    .await?;
-                            }
+                            self.tx_routing_updates
+                                .send(connect_ip::RoutingUpdate::SetMTU(tun_mtu))
+                                .await?;
 
                             info!("connected. negotiated TUN MTU: {}", tun_mtu);
 
