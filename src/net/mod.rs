@@ -1,7 +1,6 @@
 pub mod icmp;
 pub mod quic;
 pub mod route;
-pub mod tun;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;

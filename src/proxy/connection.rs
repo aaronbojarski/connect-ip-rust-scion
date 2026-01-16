@@ -14,8 +14,9 @@ use crate::connect_ip::{Endpoint, RoutingUpdates};
 use crate::net::quic::{
     DEFAULT_TIMEOUT, HTTP3_STREAM_OVERHEAD, KEEPALIVE_INTERVAL, MAX_DATAGRAM_SIZE,
 };
-use crate::net::{ForwardingDecision, UdpPacket, tun};
+use crate::net::{ForwardingDecision, UdpPacket};
 use crate::proxy::CLIENT_CHANNEL_CAPACITY;
+use crate::proxy::tun::TunClientRegistration;
 
 const RCV_MANY_CAPACITY: usize = 10; // number of packets to receive at once
 
@@ -33,13 +34,19 @@ pub struct Config {
 
 pub struct Connection {
     pub config: Config,
+    scid: quiche::ConnectionId<'static>,
     conn: quiche::Connection,
     h3_conn: Option<quiche::h3::Connection>,
     pub connect_ip_endpoint: Option<crate::connect_ip::Endpoint>,
     rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
     tx_quic_to_udp: mpsc::Sender<UdpPacket>,
-    tx_quic_to_tun: Option<mpsc::Sender<Vec<u8>>>,
-    tx_tun_configuration: Option<mpsc::Sender<RoutingUpdates>>,
+    tx_quic_to_tun: mpsc::Sender<Vec<u8>>,
+    tx_tun_registration: mpsc::Sender<TunClientRegistration>,
+    tx_tun_configuration: mpsc::Sender<(
+        quiche::ConnectionId<'static>,
+        Option<String>,
+        RoutingUpdates,
+    )>,
     cancel_token: CancellationToken,
     available_addresses: Arc<Mutex<Vec<IpNet>>>,
     active_clients: Arc<Mutex<HashMap<String, CancellationToken>>>,
@@ -53,22 +60,32 @@ pub struct Connection {
 impl Connection {
     pub fn new(
         config: Config,
+        scid: quiche::ConnectionId<'static>,
         conn: quiche::Connection,
         rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
         tx_quic_to_udp: mpsc::Sender<UdpPacket>,
+        tx_quic_to_tun: mpsc::Sender<Vec<u8>>,
+        tx_tun_registration: mpsc::Sender<TunClientRegistration>,
+        tx_tun_configuration: mpsc::Sender<(
+            quiche::ConnectionId<'static>,
+            Option<String>,
+            RoutingUpdates,
+        )>,
         cancel_token: CancellationToken,
         available_addresses: Arc<Mutex<Vec<IpNet>>>,
         active_clients: Arc<Mutex<HashMap<String, CancellationToken>>>,
     ) -> Self {
         Connection {
             config,
+            scid,
             conn,
             h3_conn: None,
             connect_ip_endpoint: None,
             rx_udp_to_quic,
             tx_quic_to_udp,
-            tx_quic_to_tun: None,
-            tx_tun_configuration: None,
+            tx_quic_to_tun,
+            tx_tun_registration,
+            tx_tun_configuration,
             cancel_token,
             available_addresses,
             active_clients,
@@ -82,6 +99,8 @@ impl Connection {
 
     pub async fn handle_client_connection(&mut self) -> Result<()> {
         let mut buf = [0; MAX_DATAGRAM_SIZE];
+
+        debug!("client connection handler started");
 
         // Send initial response packets
         loop {
@@ -109,26 +128,15 @@ impl Connection {
             self.tx_quic_to_udp.send(packet).await?;
         }
 
-        info!(
-            "starting connection handler with TUN {}",
-            self.config.tun_name
-        );
-        // Create cancellation token for clean shutdown
-        let cancel_token = CancellationToken::new();
-
-        // Create TUN interface for this connection
-        let (tx_quic_to_tun, rx_quic_to_tun) = mpsc::channel::<Vec<u8>>(CLIENT_CHANNEL_CAPACITY);
+        // Register channel with TUN for this connection
         let (tx_tun_to_quic, mut rx_tun_to_quic) =
             mpsc::channel::<Vec<u8>>(CLIENT_CHANNEL_CAPACITY);
-        let mut tun = tun::Tun::new(&self.config.tun_name, tx_tun_to_quic, self.config.mtu)?;
-
-        let (tx_tun_configuration, rx_address_updates) =
-            mpsc::channel::<RoutingUpdates>(CLIENT_CHANNEL_CAPACITY);
-        tun.start(rx_quic_to_tun, rx_address_updates, cancel_token.clone())
+        self.tx_tun_registration
+            .send(TunClientRegistration::Add(
+                self.scid.clone(),
+                tx_tun_to_quic,
+            ))
             .await?;
-
-        self.tx_quic_to_tun = Some(tx_quic_to_tun.clone());
-        self.tx_tun_configuration = Some(tx_tun_configuration.clone());
 
         let mut udp_packet_buf: Vec<UdpPacket> = Vec::with_capacity(RCV_MANY_CAPACITY); // buffer for incoming UDP packets. Used for processing multiple packets at once.
         let mut tun_packet_buf: Vec<Vec<u8>> = Vec::with_capacity(RCV_MANY_CAPACITY); // buffer for incoming TUN packets. Used for processing multiple packets at once.
@@ -196,9 +204,13 @@ impl Connection {
             if let Some(connect_ip_endpoint) = &mut self.connect_ip_endpoint {
                 // Handle routing updates
                 while let Some(tun_update) = connect_ip_endpoint.next_routing_update() {
-                    if let Some(tx_tun_configuration) = &self.tx_tun_configuration {
-                        tx_tun_configuration.send(tun_update).await?;
-                    }
+                    self.tx_tun_configuration
+                        .send((
+                            self.scid.clone(),
+                            self.client_cert_subject_cn.clone(),
+                            tun_update,
+                        ))
+                        .await?;
                 }
 
                 // Send pending datagrams from Connect-IP endpoint
@@ -261,9 +273,7 @@ impl Connection {
 
                 // Handle outgoing TUN packets from Connect-IP endpoint
                 while let Some(tun_packet) = connect_ip_endpoint.send_tun_packet() {
-                    if let Some(tx_quic_to_tun) = &self.tx_quic_to_tun {
-                        tx_quic_to_tun.send(tun_packet).await?;
-                    }
+                    self.tx_quic_to_tun.send(tun_packet).await?;
                 }
             }
 
@@ -292,14 +302,6 @@ impl Connection {
                     })
                     .await?;
             }
-        }
-
-        info!("connection handler exiting, stopping TUN interface",);
-        cancel_token.cancel();
-
-        // Wait for TUN task to finish with timeout
-        if let Some(tun_handle) = tun.handle {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), tun_handle).await;
         }
 
         Ok(())
@@ -369,15 +371,10 @@ impl Connection {
             if let Some(cn) = &self.client_cert_subject_cn {
                 info!("client certificate CN: {}", cn);
 
-                // TODO: Instead of doing this, we could ask the main task to close the existing connection and notify us when done.
                 let existing_token = self.active_clients.lock().await.get(cn).cloned();
                 if let Some(token) = existing_token {
                     info!("existing connection found for {}, cancelling it", cn);
                     token.cancel();
-
-                    // TODO: This wait time might not be sufficient. We should implement a proper notification from the main task when the connection is closed.
-                    // The main issue is that we want to reuse the addresses and routes. Instead of waiting here, we could just remove them from the tun interface. (Especially once we have just one TUN for all connections.)
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
 
                 self.active_clients
@@ -537,7 +534,7 @@ impl Connection {
                     }
 
                     Err(e) => {
-                        error!("{} HTTP/3 error {:?}", self.conn.trace_id(), e);
+                        error!("HTTP/3 error {:?}", e);
                         self.conn.close(true, 0x102, b"HTTP/3 error")?;
                         break;
                     }
@@ -566,14 +563,6 @@ impl Connection {
 
         let (headers, negotiated_mtu, status) = build_response(headers, self.config.mtu);
 
-        if let Some(tx_tun_update) = &self.tx_tun_configuration
-            && let Err(e) = tx_tun_update
-                .send(RoutingUpdates::SetMTU(negotiated_mtu))
-                .await
-        {
-            error!("failed to send MTU update to TUN: {}", e);
-        }
-
         if let Some(http3_conn) = &mut self.h3_conn {
             match http3_conn.send_response(&mut self.conn, stream_id, &headers, false) {
                 Ok(v) => v,
@@ -587,11 +576,7 @@ impl Connection {
                 }
 
                 Err(e) => {
-                    error!(
-                        "{} stream send response failed {:?}",
-                        self.conn.trace_id(),
-                        e
-                    );
+                    error!("stream send response failed {:?}", e);
                     return Err(e);
                 }
             }
@@ -650,7 +635,7 @@ impl Connection {
                 }
 
                 Err(e) => {
-                    error!("{} stream send failed {:?}", self.conn.trace_id(), e);
+                    error!("stream send failed {:?}", e);
                     return;
                 }
             }

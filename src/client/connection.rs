@@ -406,8 +406,7 @@ impl Connection {
                         );
                         if Some(stream_id) != self.tunnel_status.http_request_stream {
                             error!(
-                                "{} got headers on unknown stream id {}. Closing connection.",
-                                self.conn.trace_id(),
+                                "got headers on unknown stream id {}. Closing connection.",
                                 stream_id
                             );
                             self.conn.close(true, 0x108, b"headers on unknown stream")?;

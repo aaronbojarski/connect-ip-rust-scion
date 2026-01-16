@@ -70,6 +70,10 @@ pub struct ProxyOpt {
     #[clap(long)]
     address_pool: Vec<IpNet>,
 
+    /// Name of the TUN interface to create
+    #[clap(long = "tun-name")]
+    tun_name: Option<String>,
+
     /// MTU for the interface
     #[clap(long)]
     mtu: Option<u16>,
@@ -130,7 +134,7 @@ pub struct ClientOpt {
     key_path: Option<PathBuf>,
 
     /// Name of the TUN interface to create
-    #[clap(long = "tun")]
+    #[clap(long = "tun-name")]
     tun_name: Option<String>,
 
     /// MTU for the interface
@@ -320,7 +324,16 @@ pub fn combine_proxy_config(
         Vec::new()
     };
 
-    let mtu = cli_config
+    let tun_name = cli_config
+        .tun_name
+        .or_else(|| {
+            file_config
+                .as_ref()
+                .and_then(|config| config.tun_name.clone())
+        })
+        .unwrap_or(DEFAULT_TUN_NAME.to_string());
+
+    let tun_mtu = cli_config
         .mtu
         .or_else(|| file_config.as_ref().and_then(|config| config.mtu))
         .unwrap_or(DEFAULT_TUN_MTU);
@@ -346,7 +359,8 @@ pub fn combine_proxy_config(
             key_path,
             routes,
             address_pool,
-            tun_mtu: mtu,
+            tun_name,
+            tun_mtu,
         },
         log_level,
     ))

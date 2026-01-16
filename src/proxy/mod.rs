@@ -1,4 +1,5 @@
 pub mod connection;
+pub mod tun;
 
 use std::collections::HashMap;
 use std::fs;
@@ -16,9 +17,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::instrument::Instrument;
 use tracing::{debug, error, info, trace, warn};
 
+use crate::connect_ip::RoutingUpdates;
 use crate::net::quic::MAX_DATAGRAM_SIZE;
 use crate::net::{UdpPacket, return_subnet};
 use crate::proxy::connection::{Config, Connection};
+use crate::proxy::tun::TunClientRegistration;
 
 const TOKEN_PREFIX: &[u8] = b"connect-ip-rust-scion";
 const HMAC_TAG_LEN: usize = 32;
@@ -42,6 +45,7 @@ pub struct ProxyConfig {
     pub key_path: std::path::PathBuf,
     pub routes: Vec<IpNet>,
     pub address_pool: Vec<IpNet>,
+    pub tun_name: String,
     pub tun_mtu: u16,
 }
 
@@ -83,6 +87,36 @@ impl Proxy {
         let (tx_quic_to_udp, mut rx_quic_to_udp) =
             mpsc::channel::<UdpPacket>(MAIN_CHANNEL_CAPACITY);
 
+        // Create TUN interface
+        // Cancellation token for graceful shutdown of TUN handler
+        let cancel_token = CancellationToken::new();
+
+        // This is a shared channel used from all connections
+        let (tx_quic_to_tun, rx_quic_to_tun) = mpsc::channel::<Vec<u8>>(CLIENT_CHANNEL_CAPACITY);
+        let (tx_tun_configuration, rx_address_updates) = mpsc::channel::<(
+            quiche::ConnectionId<'static>,
+            Option<String>,
+            RoutingUpdates,
+        )>(CLIENT_CHANNEL_CAPACITY);
+
+        let (tx_tun_registration, rx_tun_registration) =
+            mpsc::channel::<TunClientRegistration>(CLIENT_CHANNEL_CAPACITY);
+
+        let mut tun = crate::proxy::tun::Tun::new(
+            &self.config.tun_name,
+            self.config.tun_mtu,
+            rx_quic_to_tun,
+            rx_tun_registration,
+            rx_address_updates,
+            cancel_token.clone(),
+        )?;
+
+        let mut tun_handle = tokio::spawn(async move {
+            if let Err(e) = tun.start().await {
+                error!("TUN device handler error: {:?}", e);
+            }
+        });
+
         let mut buf = vec![0; UDP_PACKET_BUFFER_SIZE];
 
         if self.config.listen.isd_asn() == IsdAsn::WILDCARD {
@@ -102,7 +136,7 @@ impl Proxy {
                             src,
                         );
                         debug!("received {} bytes on socket from {}", len, src);
-                        self.handle_udp_packet(&mut buf[..len], src, src_scion, local_addr, self.config.listen, &tx_quic_to_udp).await?;
+                        self.handle_udp_packet(&mut buf[..len], src, src_scion, local_addr, self.config.listen, &tx_quic_to_udp, &tx_quic_to_tun, &tx_tun_registration, &tx_tun_configuration).await?;
                     }
 
                     // Send QUIC packets over UDP socket
@@ -115,6 +149,18 @@ impl Proxy {
                         };
                         socket.send_to(&packet_data.data, dst).await?;
                         debug!("sent {} bytes on socket to {}", packet_data.data.len(), dst);
+                    }
+
+                    tun_result = &mut tun_handle => {
+                        match tun_result {
+                            Ok(_) => {
+                                info!("TUN device handler task exited normally");
+                            }
+                            Err(e) => {
+                                error!("TUN device handler task error: {:?}", e);
+                            }
+                        }
+                        break Err(anyhow!("TUN device handler task exited"));
                     }
                 }
             }
@@ -180,13 +226,25 @@ impl Proxy {
                             }
                         };
                         debug!("received {} bytes on socket from {}", len, src);
-                        self.handle_udp_packet(&mut buf[..len], src_ip_addr, src, local_addr, local_scion_addr, &tx_quic_to_udp).await?;
+                        self.handle_udp_packet(&mut buf[..len], src_ip_addr, src, local_addr, local_scion_addr, &tx_quic_to_udp, &tx_quic_to_tun, &tx_tun_registration, &tx_tun_configuration).await?;
                     }
 
                     // Send QUIC packets over UDP socket
                     Some(packet_data) = rx_quic_to_udp.recv() => {
                         socket.send_to(&packet_data.data, packet_data.dst).await?;
                         debug!("sent {} bytes on socket to {}", packet_data.data.len(), packet_data.dst);
+                    }
+
+                    tun_result = &mut tun_handle => {
+                        match tun_result {
+                            Ok(_) => {
+                                info!("TUN device handler task exited normally");
+                            }
+                            Err(e) => {
+                                error!("TUN device handler task error: {:?}", e);
+                            }
+                        }
+                        break Err(anyhow!("TUN device handler task exited"));
                     }
                 }
             }
@@ -201,6 +259,13 @@ impl Proxy {
         local_ip_socket: std::net::SocketAddr,
         local_scion_socket: scion_proto::address::SocketAddr,
         tx_quic_to_udp: &mpsc::Sender<UdpPacket>,
+        tx_quic_to_tun: &mpsc::Sender<Vec<u8>>,
+        tx_tun_registration: &mpsc::Sender<TunClientRegistration>,
+        tx_tun_configuration: &mpsc::Sender<(
+            quiche::ConnectionId<'static>,
+            Option<String>,
+            RoutingUpdates,
+        )>,
     ) -> Result<()> {
         // Parse the QUIC packet header to identify connection
         let hdr = match quiche::Header::from_slice(buf, quiche::MAX_CONN_ID_LEN) {
@@ -378,7 +443,7 @@ impl Proxy {
             let cancel_token = CancellationToken::new();
 
             // Create channel for this connection
-            let (tx_to_connection, rx_from_main) =
+            let (tx_udp_to_quic, rx_udp_to_quic) =
                 mpsc::channel::<UdpPacket>(CLIENT_CHANNEL_CAPACITY);
 
             // Allocate TUN name for this client
@@ -396,9 +461,13 @@ impl Proxy {
             // Store connection info
             let mut client_conn = Connection::new(
                 config,
+                scid.clone().into_owned(),
                 conn,
-                rx_from_main,
+                rx_udp_to_quic,
                 tx_quic_to_udp.clone(),
+                tx_quic_to_tun.clone(),
+                tx_tun_registration.clone(),
+                tx_tun_configuration.clone(),
                 cancel_token.clone(),
                 self.available_addresses.clone(),
                 self.active_clients.clone(),
@@ -406,7 +475,7 @@ impl Proxy {
             self.connections.lock().await.insert(
                 scid.clone().into_owned(),
                 ConnectionInfo {
-                    sender: tx_to_connection,
+                    sender: tx_udp_to_quic,
                     cancel_token,
                 },
             );
@@ -416,6 +485,8 @@ impl Proxy {
             let connections_clone = self.connections.clone();
             let available_nets = self.available_addresses.clone();
             let active_clients_clone = self.active_clients.clone();
+            let tun_registration_clone = tx_tun_registration.clone();
+            let tun_configuration_clone = tx_tun_configuration.clone();
             tokio::spawn(async move {
                 if let Err(e) = client_conn
                     .handle_client_connection()
@@ -430,6 +501,39 @@ impl Proxy {
                         info!("Releasing address {}", addr);
                         return_subnet(&available_nets, *addr).await;
                     }
+                    for route in connect_ip_endpoint.routing_state.remote_routes.iter() {
+                        tun_configuration_clone
+                            .send((
+                                scid_owned.clone(),
+                                client_conn.client_cert_subject_cn.clone(),
+                                RoutingUpdates::RemoveRoute(*route),
+                            ))
+                            .await
+                            .unwrap_or_else(|e| {
+                                error!("Failed to send route removal for {}: {}", route, e)
+                            });
+                    }
+                    for addr in connect_ip_endpoint.routing_state.local_addresses.iter() {
+                        tun_configuration_clone
+                            .send((
+                                scid_owned.clone(),
+                                client_conn.client_cert_subject_cn.clone(),
+                                RoutingUpdates::RemoveAddress(*addr),
+                            ))
+                            .await
+                            .unwrap_or_else(|e| {
+                                error!("Failed to send address removal for {}: {}", addr, e)
+                            });
+                    }
+                    tun_registration_clone
+                        .send(TunClientRegistration::Remove(scid_owned.clone()))
+                        .await
+                        .unwrap_or_else(|e| {
+                            error!(
+                                "Failed to send TUN client removal for connection {:?}: {}",
+                                scid_owned, e
+                            )
+                        });
                 }
                 if let Some(client_addr) = client_conn.client_cert_subject_cn {
                     info!("Releasing active client entry for {}", client_addr);

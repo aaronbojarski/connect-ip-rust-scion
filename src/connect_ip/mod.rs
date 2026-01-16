@@ -19,7 +19,6 @@ use crate::connect_ip::capsule::{
 };
 use crate::net::icmp::build_icmp_response;
 use crate::net::quic::MAX_DATAGRAM_SIZE;
-use crate::net::tun::MAX_TUN_MTU;
 use crate::net::{
     ForwardingDecision, IpVersion, ZERO_IPV4_ADDRESS, ZERO_IPV6_ADDRESS, check_packet_src_dst,
     get_next_avail_subnet, get_specific_subnet, is_zero_address,
@@ -27,6 +26,7 @@ use crate::net::{
 
 const SEND_BUFFER_SIZE: usize = 65535;
 const RCV_BUFFER_SIZE: usize = 65535;
+const MAX_TUN_MTU: usize = 9000;
 const MAX_TUN_MTU_FOR_DATAGRAMS: usize = MAX_DATAGRAM_SIZE - 50;
 
 /// Configuration commands for the TUN device.

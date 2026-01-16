@@ -39,7 +39,7 @@ impl Tun {
             name: name.to_string(),
             mtu,
             tx_tun_to_quic,
-            rx_quic_to_tun: rx_quic_to_tun,
+            rx_quic_to_tun,
             rx_address_updates,
             cancel_token,
         })
