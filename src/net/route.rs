@@ -77,7 +77,8 @@ pub fn remove_route(destination: &IpNet, dev: &str) -> Result<(), Error> {
 
 #[cfg(target_os = "linux")]
 /// Sets the specified network device/interface down.
-//// Uses the `ip` command to set the interface down.
+///
+/// Uses the `ip` command to set the interface down.
 /// # Arguments
 /// * `dev` - The network device/interface name (e.g., "tun0")
 /// # Returns

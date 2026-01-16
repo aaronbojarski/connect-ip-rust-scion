@@ -16,7 +16,7 @@ use crate::net::quic::{
     DEFAULT_TIMEOUT, HTTP3_STREAM_OVERHEAD, KEEPALIVE_INTERVAL, MAX_DATAGRAM_SIZE,
 };
 use crate::net::{ForwardingDecision, UdpPacket, tun};
-use crate::proxy::CLIENT_CHANNEL_CAPACITY;
+use crate::proxy::{ActiveKnownClient, CLIENT_CHANNEL_CAPACITY};
 
 const RCV_MANY_CAPACITY: usize = 10; // number of packets to receive at once
 
@@ -46,8 +46,7 @@ pub struct Connection {
     tx_routing_updates: mpsc::Sender<connect_ip::RoutingUpdate>,
     cancel_token: CancellationToken,
     available_addresses: Arc<Mutex<Vec<IpNet>>>,
-    active_clients:
-        Arc<Mutex<HashMap<String, (quiche::ConnectionId<'static>, String, CancellationToken)>>>,
+    active_clients: Arc<Mutex<HashMap<String, ActiveKnownClient>>>,
     partial_responses: HashMap<u64, PartialResponse>,
     assign_addresses_and_routes_done: bool,
     client_cert_timer: std::time::Instant,
@@ -64,9 +63,7 @@ impl Connection {
         tx_quic_to_udp: mpsc::Sender<UdpPacket>,
         cancel_token: CancellationToken,
         available_addresses: Arc<Mutex<Vec<IpNet>>>,
-        active_clients: Arc<
-            Mutex<HashMap<String, (quiche::ConnectionId<'static>, String, CancellationToken)>>,
-        >,
+        active_clients: Arc<Mutex<HashMap<String, ActiveKnownClient>>>,
     ) -> Self {
         // Channels between TUN and QUIC tasks. Contents are IP packets.
         let (tx_quic_to_tun, rx_quic_to_tun) = mpsc::channel::<Vec<u8>>(CLIENT_CHANNEL_CAPACITY);
@@ -403,48 +400,49 @@ impl Connection {
                 let mut active_clients_guard = self.active_clients.lock().await;
 
                 let existing_connection = active_clients_guard.get(cn).cloned();
-                if let Some((existing_conn_id, existing_tun, existing_token)) = existing_connection
-                {
+                if let Some(existing_client) = existing_connection {
                     info!(
                         "existing connection found for {}, cancelling connection {:?}",
-                        cn, existing_conn_id
+                        cn, existing_client.conn_id
                     );
 
                     // Remove IP addresses of existing connection from its TUN device
-                    if let Err(e) = crate::net::route::flush_ip_addresses(&existing_tun) {
+                    if let Err(e) = crate::net::route::flush_ip_addresses(&existing_client.tun_name)
+                    {
                         warn!(
                             "failed to flush IP addresses of interface {} for existing connection of {}: {}",
-                            existing_tun, cn, e
+                            existing_client.tun_name, cn, e
                         );
                     } else {
                         info!(
                             "flushed IP addresses of interface {} for existing connection of {}",
-                            existing_tun, cn
+                            existing_client.tun_name, cn
                         );
                     }
 
                     // Remove routes of the existing connection by setting interface down
-                    if let Err(e) = crate::net::route::set_interface_down(&existing_tun) {
+                    if let Err(e) = crate::net::route::set_interface_down(&existing_client.tun_name)
+                    {
                         warn!(
                             "failed to set interface {} down for existing connection of {}: {}",
-                            existing_tun, cn, e
+                            existing_client.tun_name, cn, e
                         );
                     } else {
                         info!(
                             "set interface {} down for existing connection of {}",
-                            existing_tun, cn
+                            existing_client.tun_name, cn
                         );
                     }
-                    existing_token.cancel();
+                    existing_client.cancel_token.cancel();
                 }
 
                 active_clients_guard.insert(
                     cn.clone(),
-                    (
-                        self.scid.clone(),
-                        self.config.tun_name.clone(),
-                        self.cancel_token.clone(),
-                    ),
+                    ActiveKnownClient {
+                        conn_id: self.scid.clone(),
+                        tun_name: self.config.tun_name.clone(),
+                        cancel_token: self.cancel_token.clone(),
+                    },
                 );
             }
 

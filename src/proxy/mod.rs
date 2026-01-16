@@ -32,6 +32,13 @@ struct ConnectionInfo {
     pub cancel_token: CancellationToken,
 }
 
+#[derive(Clone)]
+pub struct ActiveKnownClient {
+    pub conn_id: quiche::ConnectionId<'static>,
+    pub tun_name: String,
+    pub cancel_token: CancellationToken,
+}
+
 pub struct ProxyConfig {
     pub listen: scion_proto::address::SocketAddr,
     pub endhost_api_address: Option<url::Url>,
@@ -51,8 +58,7 @@ pub struct Proxy {
     token_key: ring::hmac::Key,
     conn_id_seed: ring::hmac::Key,
     connections: Arc<Mutex<HashMap<quiche::ConnectionId<'static>, ConnectionInfo>>>,
-    active_clients:
-        Arc<Mutex<HashMap<String, (quiche::ConnectionId<'static>, String, CancellationToken)>>>,
+    active_clients: Arc<Mutex<HashMap<String, ActiveKnownClient>>>,
     available_addresses: Arc<Mutex<Vec<IpNet>>>,
     next_client: u32,
 }
@@ -435,11 +441,11 @@ impl Proxy {
                 }
                 if let Some(client_addr) = client_conn.client_cert_subject_cn {
                     let mut active_clients_lock = active_clients_clone.lock().await;
-                    if let Some((conn_id, _, _)) = active_clients_lock.get(&client_addr) {
-                        if conn_id == &scid_owned {
-                            info!("Releasing active client entry for {}", client_addr);
-                            active_clients_lock.remove(&client_addr);
-                        }
+                    if let Some(active_client) = active_clients_lock.get(&client_addr)
+                        && active_client.conn_id == scid_owned
+                    {
+                        info!("Releasing active client entry for {}", client_addr);
+                        active_clients_lock.remove(&client_addr);
                     }
                 }
             });
