@@ -247,10 +247,10 @@ impl Connection {
                 {
                     match self.conn.dgram_send(&datagram) {
                         Ok(()) => {
-                            debug!("sent {} bytes datagram via QUIC", datagram.len());
+                            trace!("sent {} bytes datagram via QUIC", datagram.len());
                         }
                         Err(quiche::Error::Done) => {
-                            debug!("dgram_send would block, buffering datagram");
+                            trace!("dgram_send would block, buffering datagram");
                             connect_ip_endpoint.return_datagram(&datagram);
                             break;
                         }
@@ -273,14 +273,14 @@ impl Connection {
                             false,
                         ) {
                             Ok(sent_h3) => {
-                                debug!(
+                                trace!(
                                     "send_body sent {} bytes on stream {}",
                                     sent_h3, connect_ip_endpoint.stream_id
                                 );
                                 if sent_h3 < sent {
                                     // This should generally not happen, since we checked stream capacity before.
                                     // However, quiche may handle flow control however it wants to. There we handle it.
-                                    debug!(
+                                    trace!(
                                         "send_body would block, buffering unsent data, sent {}/{} bytes",
                                         sent_h3, sent
                                     );
@@ -289,7 +289,7 @@ impl Connection {
                                 }
                             }
                             Err(quiche::h3::Error::Done) => {
-                                debug!("send_body would block, buffering unsent data");
+                                trace!("send_body would block, buffering unsent data");
                                 connect_ip_endpoint.return_stream_data(&stream_buf[..sent]);
                             }
                             Err(e) => {

@@ -10,7 +10,7 @@ use scion_proto::path::policy::acl::AclPolicy;
 use scion_stack::scionstack::ScionStackBuilder;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, trace};
 
 use crate::client::connection::{Config, Connection};
 use crate::net::UdpPacket;
@@ -224,7 +224,7 @@ impl Client {
                 tokio::select! {
                     // Receive datagram from UDP socket and pass to QUIC
                     Ok((len, src)) = socket.recv_from(&mut buf) => {
-                        debug!("received {} bytes on socket from {}", len, src);
+                        trace!("received {} bytes on socket from {}", len, src);
                         match tx_udp_to_quic.try_send(UdpPacket {
                             data: buf[..len].to_vec(),
                             src,
@@ -243,7 +243,7 @@ impl Client {
                     // Send datagram from QUIC to UDP socket
                     Some(packet_data) = rx_quic_to_udp.recv() => {
                         socket.send_to(&packet_data.data, packet_data.dst).await?;
-                        debug!("sent {} bytes on socket to {}", packet_data.data.len(), packet_data.dst);
+                        trace!("sent {} bytes on socket to {}", packet_data.data.len(), packet_data.dst);
                     }
                     // Connection handler exited
                     quic_result = &mut quic_handle => {

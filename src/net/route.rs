@@ -75,6 +75,37 @@ pub fn remove_route(destination: &IpNet, dev: &str) -> Result<(), Error> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+/// Sets the specified network device/interface down.
+//// Uses the `ip` command to set the interface down.
+/// # Arguments
+/// * `dev` - The network device/interface name (e.g., "tun0")
+/// # Returns
+/// * `Ok(())` - Interface was set down successfully
+/// * `Err(_)` - Failed to execute the ip command or command returned an error
+pub fn set_interface_down(dev: &str) -> Result<(), Error> {
+    let mut cmd = Command::new("ip");
+    cmd.args(["link", "set", "dev", dev, "down"]);
+    run_command(cmd)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+/// Flushes all IP addresses assigned to the specified network device.
+///
+/// Uses the `ip` command to flush the addresses.
+/// # Arguments
+/// * `dev` - The network device/interface name (e.g., "tun0")
+/// # Returns
+/// * `Ok(())` - Addresses were flushed successfully
+/// * `Err(_)` - Failed to execute the ip command or command returned an error
+pub fn flush_ip_addresses(dev: &str) -> Result<(), Error> {
+    let mut cmd = Command::new("ip");
+    cmd.args(["addr", "flush", "dev", dev]);
+    run_command(cmd)?;
+    Ok(())
+}
+
 // ============================================================================
 // Windows implementation using `netsh` command
 // ============================================================================
@@ -142,6 +173,36 @@ pub fn remove_route(destination: &IpNet, dev: &str) -> Result<(), Error> {
     del_cmd.arg(dev);
 
     run_command(del_cmd)?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+/// Sets the specified network device/interface down.
+//// Uses the `netsh` command to set the interface down.
+/// # Arguments
+/// * `dev` - The network device/interface name (e.g., "tun0")
+/// # Returns
+/// * `Ok(())` - Interface was set down successfully
+/// * `Err(_)` - Failed to execute the netsh command or command returned an error
+pub fn set_interface_down(dev: &str) -> Result<(), Error> {
+    let mut cmd = Command::new("netsh");
+    cmd.args(["interface", "set", "interface", dev, "disable"]);
+    run_command(cmd)?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+/// Flushes all IP addresses assigned to the specified network device.
+///
+/// Uses the `netsh` command to flush the addresses.
+/// # Arguments
+/// * `dev` - The network device/interface name (e.g., "tun0")
+/// # Returns
+/// * `Ok(())` - Addresses were flushed successfully
+/// * `Err(_)` - Failed to execute the netsh command or command returned an error
+pub fn flush_ip_addresses(dev: &str) -> Result<(), Error> {
+    // Note: Windows does not have a direct equivalent to `ip addr flush dev`.
+    // However setting the inteface down should effectively remove its IP addresses.
     Ok(())
 }
 

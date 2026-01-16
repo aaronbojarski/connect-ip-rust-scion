@@ -51,7 +51,8 @@ pub struct Proxy {
     token_key: ring::hmac::Key,
     conn_id_seed: ring::hmac::Key,
     connections: Arc<Mutex<HashMap<quiche::ConnectionId<'static>, ConnectionInfo>>>,
-    active_clients: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    active_clients:
+        Arc<Mutex<HashMap<String, (quiche::ConnectionId<'static>, String, CancellationToken)>>>,
     available_addresses: Arc<Mutex<Vec<IpNet>>>,
     next_client: u32,
 }
@@ -101,7 +102,7 @@ impl Proxy {
                             IsdAsn::WILDCARD,
                             src,
                         );
-                        debug!("received {} bytes on socket from {}", len, src);
+                        trace!("received {} bytes on socket from {}", len, src);
                         self.handle_udp_packet(&mut buf[..len], src, src_scion, local_addr, self.config.listen, &tx_quic_to_udp).await?;
                     }
 
@@ -114,7 +115,7 @@ impl Proxy {
                             continue;
                         };
                         socket.send_to(&packet_data.data, dst).await?;
-                        debug!("sent {} bytes on socket to {}", packet_data.data.len(), dst);
+                        trace!("sent {} bytes on socket to {}", packet_data.data.len(), dst);
                     }
                 }
             }
@@ -179,14 +180,14 @@ impl Proxy {
                                 continue;
                             }
                         };
-                        debug!("received {} bytes on socket from {}", len, src);
+                        trace!("received {} bytes on socket from {}", len, src);
                         self.handle_udp_packet(&mut buf[..len], src_ip_addr, src, local_addr, local_scion_addr, &tx_quic_to_udp).await?;
                     }
 
                     // Send QUIC packets over UDP socket
                     Some(packet_data) = rx_quic_to_udp.recv() => {
                         socket.send_to(&packet_data.data, packet_data.dst).await?;
-                        debug!("sent {} bytes on socket to {}", packet_data.data.len(), packet_data.dst);
+                        trace!("sent {} bytes on socket to {}", packet_data.data.len(), packet_data.dst);
                     }
                 }
             }
@@ -250,7 +251,7 @@ impl Proxy {
 
             // New connection - create connection ID
             if !quiche::version_is_supported(hdr.version) {
-                debug!("Doing version negotiation");
+                trace!("Doing version negotiation");
 
                 let len = quiche::negotiate_version(&hdr.scid, &hdr.dcid, &mut out)?;
                 let out = &out[..len];
@@ -286,7 +287,7 @@ impl Proxy {
 
             // Do stateless retry if the client didn't send a token.
             if token.is_empty() {
-                debug!("Doing stateless retry");
+                trace!("Doing stateless retry");
 
                 let new_token = self.mint_token(&hdr, &src_ip_socket);
 
@@ -396,6 +397,7 @@ impl Proxy {
             // Store connection info
             let mut client_conn = Connection::new(
                 config,
+                scid.clone().into_owned(),
                 conn,
                 rx_from_main,
                 tx_quic_to_udp.clone(),
@@ -432,12 +434,17 @@ impl Proxy {
                     }
                 }
                 if let Some(client_addr) = client_conn.client_cert_subject_cn {
-                    info!("Releasing active client entry for {}", client_addr);
-                    active_clients_clone.lock().await.remove(&client_addr);
+                    let mut active_clients_lock = active_clients_clone.lock().await;
+                    if let Some((conn_id, _, _)) = active_clients_lock.get(&client_addr) {
+                        if conn_id == &scid_owned {
+                            info!("Releasing active client entry for {}", client_addr);
+                            active_clients_lock.remove(&client_addr);
+                        }
+                    }
                 }
             });
         } else {
-            debug!("packet for unknown connection with dcid {:?}", hdr.dcid);
+            trace!("packet for unknown connection with dcid {:?}", hdr.dcid);
         }
         Ok(())
     }

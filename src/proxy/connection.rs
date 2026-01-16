@@ -34,6 +34,7 @@ pub struct Config {
 
 pub struct Connection {
     pub config: Config,
+    scid: quiche::ConnectionId<'static>,
     conn: quiche::Connection,
     h3_conn: Option<quiche::h3::Connection>,
     pub connect_ip_endpoint: Option<crate::connect_ip::Endpoint>,
@@ -45,7 +46,8 @@ pub struct Connection {
     tx_routing_updates: mpsc::Sender<connect_ip::RoutingUpdate>,
     cancel_token: CancellationToken,
     available_addresses: Arc<Mutex<Vec<IpNet>>>,
-    active_clients: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    active_clients:
+        Arc<Mutex<HashMap<String, (quiche::ConnectionId<'static>, String, CancellationToken)>>>,
     partial_responses: HashMap<u64, PartialResponse>,
     assign_addresses_and_routes_done: bool,
     client_cert_timer: std::time::Instant,
@@ -56,12 +58,15 @@ pub struct Connection {
 impl Connection {
     pub fn new(
         config: Config,
+        scid: quiche::ConnectionId<'static>,
         conn: quiche::Connection,
         rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
         tx_quic_to_udp: mpsc::Sender<UdpPacket>,
         cancel_token: CancellationToken,
         available_addresses: Arc<Mutex<Vec<IpNet>>>,
-        active_clients: Arc<Mutex<HashMap<String, CancellationToken>>>,
+        active_clients: Arc<
+            Mutex<HashMap<String, (quiche::ConnectionId<'static>, String, CancellationToken)>>,
+        >,
     ) -> Self {
         // Channels between TUN and QUIC tasks. Contents are IP packets.
         let (tx_quic_to_tun, rx_quic_to_tun) = mpsc::channel::<Vec<u8>>(CLIENT_CHANNEL_CAPACITY);
@@ -83,6 +88,7 @@ impl Connection {
 
         Connection {
             config,
+            scid,
             conn,
             h3_conn: None,
             connect_ip_endpoint: None,
@@ -138,14 +144,12 @@ impl Connection {
         );
 
         let mut tun = self.tun.take().unwrap();
+        let tun_name = self.config.tun_name.clone();
         let mut tun_handle = tokio::spawn(async move {
-            if let Err(e) = tun.start().await {
-                error!("TUN device handler exited with error: {}", e);
-            } else {
-                info!("TUN device handler exited normally");
-            }
-        })
-        .instrument(info_span!("tun_handler", tun_name = %self.config.tun_name));
+            tun.start()
+                .instrument(info_span!("tun_handler", tun_name = %tun_name))
+                .await
+        });
 
         let mut udp_packet_buf: Vec<UdpPacket> = Vec::with_capacity(RCV_MANY_CAPACITY); // buffer for incoming UDP packets. Used for processing multiple packets at once.
         let mut tun_packet_buf: Vec<Vec<u8>> = Vec::with_capacity(RCV_MANY_CAPACITY); // buffer for incoming TUN packets. Used for processing multiple packets at once.
@@ -189,20 +193,25 @@ impl Connection {
                 // TUN handler exited
                 tun_result = &mut tun_handle => {
                     match tun_result {
-                        Ok(()) => {
+                        Ok(Ok(())) => {
                             info!("TUN device handler closed normally");
-                            break;
+                            return Ok(());
+                        }
+                        Ok(Err(e)) => {
+                            error!("TUN device handler failed: {}", e);
+                            return Err(anyhow!("TUN device handler failed: {}", e));
                         }
                         Err(e) => {
                             error!("TUN device handler panicked: {}", e);
-                            break;
+                            return Err(anyhow!("TUN device handler panicked: {}", e));
                         }
                     }
                 }
 
                 _ = self.cancel_token.cancelled() => {
                     info!("cancellation requested, shutting down connection handler");
-                    break;
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), tun_handle).await;
+                    return Ok(());
                 }
             }
 
@@ -236,10 +245,10 @@ impl Connection {
                 {
                     match self.conn.dgram_send(&datagram) {
                         Ok(()) => {
-                            debug!("sent {} bytes datagram via QUIC", datagram.len());
+                            trace!("sent {} bytes datagram via QUIC", datagram.len());
                         }
                         Err(quiche::Error::Done) => {
-                            debug!("dgram_send would block, buffering datagram");
+                            trace!("dgram_send would block, buffering datagram");
                             connect_ip_endpoint.return_datagram(&datagram);
                             break;
                         }
@@ -262,14 +271,14 @@ impl Connection {
                             false,
                         ) {
                             Ok(sent_h3) => {
-                                debug!(
+                                trace!(
                                     "send_body sent {} bytes on stream {}",
                                     sent_h3, connect_ip_endpoint.stream_id
                                 );
                                 if sent_h3 < sent {
                                     // This should generally not happen, since we checked stream capacity before.
                                     // However, quiche may handle flow control however it wants to. There we handle it.
-                                    debug!(
+                                    trace!(
                                         "send_body would block, buffering unsent data, sent {}/{} bytes",
                                         sent_h3, sent
                                     );
@@ -277,7 +286,7 @@ impl Connection {
                                 }
                             }
                             Err(quiche::h3::Error::Done) => {
-                                debug!("send_body would block, buffering unsent data");
+                                trace!("send_body would block, buffering unsent data");
                                 connect_ip_endpoint.return_stream_data(&buf[..sent]);
                             }
                             Err(e) => {
@@ -391,22 +400,52 @@ impl Connection {
             }
             if let Some(cn) = &self.client_cert_subject_cn {
                 info!("client certificate CN: {}", cn);
+                let mut active_clients_guard = self.active_clients.lock().await;
 
-                // TODO: Instead of doing this, we could ask the main task to close the existing connection and notify us when done.
-                let existing_token = self.active_clients.lock().await.get(cn).cloned();
-                if let Some(token) = existing_token {
-                    info!("existing connection found for {}, cancelling it", cn);
-                    token.cancel();
+                let existing_connection = active_clients_guard.get(cn).cloned();
+                if let Some((existing_conn_id, existing_tun, existing_token)) = existing_connection
+                {
+                    info!(
+                        "existing connection found for {}, cancelling connection {:?}",
+                        cn, existing_conn_id
+                    );
 
-                    // TODO: This wait time might not be sufficient. We should implement a proper notification from the main task when the connection is closed.
-                    // The main issue is that we want to reuse the addresses and routes. Instead of waiting here, we could just remove them from the tun interface. (Especially once we have just one TUN for all connections.)
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    // Remove IP addresses of existing connection from its TUN device
+                    if let Err(e) = crate::net::route::flush_ip_addresses(&existing_tun) {
+                        warn!(
+                            "failed to flush IP addresses of interface {} for existing connection of {}: {}",
+                            existing_tun, cn, e
+                        );
+                    } else {
+                        info!(
+                            "flushed IP addresses of interface {} for existing connection of {}",
+                            existing_tun, cn
+                        );
+                    }
+
+                    // Remove routes of the existing connection by setting interface down
+                    if let Err(e) = crate::net::route::set_interface_down(&existing_tun) {
+                        warn!(
+                            "failed to set interface {} down for existing connection of {}: {}",
+                            existing_tun, cn, e
+                        );
+                    } else {
+                        info!(
+                            "set interface {} down for existing connection of {}",
+                            existing_tun, cn
+                        );
+                    }
+                    existing_token.cancel();
                 }
 
-                self.active_clients
-                    .lock()
-                    .await
-                    .insert(cn.clone(), self.cancel_token.clone());
+                active_clients_guard.insert(
+                    cn.clone(),
+                    (
+                        self.scid.clone(),
+                        self.config.tun_name.clone(),
+                        self.cancel_token.clone(),
+                    ),
+                );
             }
 
             self.client_cert_processed = true;

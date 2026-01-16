@@ -128,14 +128,6 @@ impl Endpoint {
             packet.len()
         );
 
-        debug!(
-            "remote_addresses: {:?}, remote_routes: {:?}, local_addresses: {:?}, local_routes: {:?}",
-            self.routing_state.remote_addresses,
-            self.routing_state.remote_routes,
-            self.routing_state.local_addresses,
-            self.routing_state.local_routes,
-        );
-
         check_packet_src_dst(
             src,
             dst,
@@ -352,9 +344,8 @@ impl Endpoint {
         let len = octets.off();
         match capsule {
             Capsule::Datagram(datagram_capsule) => {
-                trace!("received Datagram capsule: {:?}", datagram_capsule);
                 // Handle the datagram data as needed
-                debug!(
+                trace!(
                     "received datagram of length {} bytes",
                     datagram_capsule.data.len()
                 );
@@ -395,10 +386,18 @@ impl Endpoint {
             }
 
             Capsule::AddressAssign(assign_capsule) => {
-                debug!("received AddressAssign capsule: {:?}", assign_capsule);
+                trace!("received AddressAssign capsule: {:?}", assign_capsule);
 
-                // Remove old addresses as they are no longer valid
-                for addr in self.routing_state.local_addresses.iter() {
+                let addresses_no_longer_valid = self
+                    .routing_state
+                    .local_addresses
+                    .iter()
+                    .filter(|addr| !assign_capsule.addresses.iter().any(|a| &a.ip_net == *addr))
+                    .cloned()
+                    .collect::<Vec<IpNet>>();
+
+                // Remove old addresses that are no longer valid
+                for addr in addresses_no_longer_valid.iter() {
                     self.routing_updates
                         .push_back(RoutingUpdate::RemoveAddress(*addr));
                 }
@@ -420,19 +419,21 @@ impl Endpoint {
                         .push(assigned_address.ip_net);
                 }
 
-                // Removing addresses can have the effect that routes are removed aswell. Re-add all routes.
-                for route in self
-                    .routing_state
-                    .remote_addresses
-                    .iter()
-                    .chain(self.routing_state.remote_routes.iter())
-                {
-                    self.routing_updates
-                        .push_back(RoutingUpdate::AddRoute(*route));
+                if !addresses_no_longer_valid.is_empty() {
+                    // Removing addresses can have the effect that routes are removed aswell. Re-add all routes.
+                    for route in self
+                        .routing_state
+                        .remote_addresses
+                        .iter()
+                        .chain(self.routing_state.remote_routes.iter())
+                    {
+                        self.routing_updates
+                            .push_back(RoutingUpdate::AddRoute(*route));
+                    }
                 }
             }
             Capsule::AddressRequest(request_capsule) => {
-                debug!("received AddressRequest capsule: {:?}", request_capsule);
+                trace!("received AddressRequest capsule: {:?}", request_capsule);
 
                 // Keep previous assigned addresses
                 let mut assigned_addresses = self
@@ -499,7 +500,7 @@ impl Endpoint {
                 self.send_capsule(&capsule, true)?;
             }
             Capsule::RouteAdvertisement(route_capsule) => {
-                debug!("received RouteAdvertisement capsule: {:?}", route_capsule);
+                trace!("received RouteAdvertisement capsule: {:?}", route_capsule);
 
                 // TODO: add some validation here
 
