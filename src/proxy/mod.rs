@@ -51,6 +51,7 @@ pub struct Proxy {
     token_key: ring::hmac::Key,
     conn_id_seed: ring::hmac::Key,
     connections: Arc<Mutex<HashMap<quiche::ConnectionId<'static>, ConnectionInfo>>>,
+    active_clients: Arc<Mutex<HashMap<String, CancellationToken>>>,
     available_addresses: Arc<Mutex<Vec<IpNet>>>,
     next_client: u32,
 }
@@ -71,6 +72,7 @@ impl Proxy {
             conn_id_seed: ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &SystemRandom::new())
                 .unwrap(),
             connections: Arc::new(Mutex::new(HashMap::new())),
+            active_clients: Arc::new(Mutex::new(HashMap::new())),
             available_addresses,
             next_client: 0,
         })
@@ -399,6 +401,7 @@ impl Proxy {
                 tx_quic_to_udp.clone(),
                 cancel_token.clone(),
                 self.available_addresses.clone(),
+                self.active_clients.clone(),
             );
             self.connections.lock().await.insert(
                 scid.clone().into_owned(),
@@ -412,6 +415,7 @@ impl Proxy {
             let scid_owned = scid.clone().into_owned();
             let connections_clone = self.connections.clone();
             let available_nets = self.available_addresses.clone();
+            let active_clients_clone = self.active_clients.clone();
             tokio::spawn(async move {
                 if let Err(e) = client_conn
                     .handle_client_connection()
@@ -426,6 +430,10 @@ impl Proxy {
                         info!("Releasing address {}", addr);
                         return_subnet(&available_nets, *addr).await;
                     }
+                }
+                if let Some(client_addr) = client_conn.client_cert_subject_cn {
+                    info!("Releasing active client entry for {}", client_addr);
+                    active_clients_clone.lock().await.remove(&client_addr);
                 }
             });
         } else {
