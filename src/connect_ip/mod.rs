@@ -57,6 +57,7 @@ pub struct Endpoint {
     pub stream_id: u64,
     pub routing_state: RoutingState,
     available_addresses: Arc<Mutex<Vec<IpNet>>>,
+    preconfigured_peer_address: Option<IpNet>,
     routing_updates: VecDeque<RoutingUpdate>,
     peer_supports_datagrams: bool,
     stream_data_received: VecDeque<u8>, // data received from the stream, not yet processed
@@ -70,6 +71,7 @@ impl Endpoint {
         stream_id: u64,
         mtu: u16,
         available_addresses: Arc<Mutex<Vec<IpNet>>>,
+        preconfigured_peer_address: Option<IpNet>,
         routes: Vec<IpNet>,
         peer_supports_datagrams: bool,
     ) -> Self {
@@ -83,6 +85,7 @@ impl Endpoint {
                 remote_routes: vec![],
             },
             available_addresses,
+            preconfigured_peer_address,
             routing_updates: VecDeque::new(),
             peer_supports_datagrams,
             stream_data_received: VecDeque::with_capacity(RCV_BUFFER_SIZE),
@@ -528,14 +531,19 @@ impl Endpoint {
     pub async fn handle_initial_routing_setup(&mut self) -> Result<()> {
         // Assign a /128 IPv6 or /32 IPv4 address from the address pool to peer
         let mut assigned_addresses = vec![];
-        if let Some(addr) =
-            get_next_avail_subnet(self.available_addresses.clone(), IpVersion::V6, 128)
-                .await
-                .or(
-                    get_next_avail_subnet(self.available_addresses.clone(), IpVersion::V4, 32)
-                        .await,
-                )
-        {
+        let addr = if let Some(addr) = self.preconfigured_peer_address {
+            Some(addr)
+        } else {
+            let ipv6_addr =
+                get_next_avail_subnet(self.available_addresses.clone(), IpVersion::V6, 128).await;
+            if ipv6_addr.is_some() {
+                ipv6_addr
+            } else {
+                get_next_avail_subnet(self.available_addresses.clone(), IpVersion::V4, 32).await
+            }
+        };
+
+        if let Some(addr) = addr {
             info!("assigning address to peer: {}", addr);
             self.routing_state.remote_addresses.push(addr);
             let assigned_address = AssignedAddress {

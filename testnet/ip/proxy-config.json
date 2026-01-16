@@ -9,5 +9,11 @@
     "routes": [
         "10.248.2.0/24"
     ],
+    "configured_clients": [
+        {
+            "name": "client",
+            "address": "10.248.3.128/32"
+        }
+    ],
     "log_level": "debug"
 }

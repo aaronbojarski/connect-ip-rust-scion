@@ -46,12 +46,14 @@ pub struct Connection {
     tx_routing_updates: mpsc::Sender<connect_ip::RoutingUpdate>,
     cancel_token: CancellationToken,
     available_addresses: Arc<Mutex<Vec<IpNet>>>,
+    configured_clients: Arc<Mutex<HashMap<String, IpNet>>>,
     active_clients: Arc<Mutex<HashMap<String, ActiveKnownClient>>>,
     partial_responses: HashMap<u64, PartialResponse>,
     assign_addresses_and_routes_done: bool,
     client_cert_timer: std::time::Instant,
     client_cert_processed: bool,
     pub client_cert_subject_cn: Option<String>,
+    pub preconfigured_peer_address: Option<IpNet>,
 }
 
 impl Connection {
@@ -63,6 +65,7 @@ impl Connection {
         tx_quic_to_udp: mpsc::Sender<UdpPacket>,
         cancel_token: CancellationToken,
         available_addresses: Arc<Mutex<Vec<IpNet>>>,
+        configured_clients: Arc<Mutex<HashMap<String, IpNet>>>,
         active_clients: Arc<Mutex<HashMap<String, ActiveKnownClient>>>,
     ) -> Self {
         // Channels between TUN and QUIC tasks. Contents are IP packets.
@@ -98,11 +101,13 @@ impl Connection {
             cancel_token,
             available_addresses,
             active_clients,
+            configured_clients,
             partial_responses: HashMap::new(),
             assign_addresses_and_routes_done: false,
             client_cert_timer: std::time::Instant::now(),
             client_cert_processed: false,
             client_cert_subject_cn: None,
+            preconfigured_peer_address: None,
         }
     }
 
@@ -444,6 +449,9 @@ impl Connection {
                         cancel_token: self.cancel_token.clone(),
                     },
                 );
+
+                self.preconfigured_peer_address =
+                    self.configured_clients.lock().await.get(cn).cloned();
             }
 
             self.client_cert_processed = true;
@@ -662,6 +670,7 @@ impl Connection {
                     stream_id,
                     negotiated_mtu,
                     self.available_addresses.clone(),
+                    self.preconfigured_peer_address,
                     self.config.routes.clone(),
                     self.conn.dgram_max_writable_len().is_some(),
                 );

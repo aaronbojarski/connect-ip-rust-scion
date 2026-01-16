@@ -470,6 +470,7 @@ impl Connection {
                                 self.tunnel_status.http_request_stream.unwrap(),
                                 tun_mtu,
                                 self.available_addresses.clone(),
+                                None,
                                 self.config.routes.clone(),
                                 self.conn.dgram_max_writable_len().is_some(),
                             ));

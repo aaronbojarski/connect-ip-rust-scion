@@ -1,10 +1,11 @@
-use std::path::PathBuf;
 use std::str::FromStr;
+use std::{path::PathBuf, sync::Arc};
 
 use clap::{Args, Parser, Subcommand};
 use ipnet::IpNet;
 use scion_proto::path::policy::acl::AclPolicy;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 use url::Url;
 
 pub const DEFAULT_TUN_NAME: &str = "tun0";
@@ -143,6 +144,12 @@ pub struct ClientOpt {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfiguredClient {
+    pub name: String,
+    pub address: IpNet,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfigFile {
     /// Address to listen on
     pub listen: Option<String>,
@@ -176,6 +183,9 @@ pub struct ProxyConfigFile {
 
     /// Routes to advertise to clients
     pub routes: Vec<IpNet>,
+
+    /// Clients with configured static addresses
+    pub configured_clients: Option<Vec<ConfiguredClient>>,
 
     /// Tracing level (trace, debug, info, warn, error)
     pub log_level: Option<String>,
@@ -320,6 +330,28 @@ pub fn combine_proxy_config(
         Vec::new()
     };
 
+    let configured_clients = if let Some(config) = &file_config
+        && let Some(clients) = &config.configured_clients
+    {
+        let mut map = std::collections::HashMap::new();
+        for client in clients {
+            if address_pool
+                .iter()
+                .any(|pool| pool.contains(&client.address.addr()))
+            {
+                return Err(anyhow::anyhow!(
+                    "Configured client address {} for client '{}' must not be part of the address pool.",
+                    client.address,
+                    client.name
+                ));
+            }
+            map.insert(client.name.clone(), client.address);
+        }
+        map
+    } else {
+        std::collections::HashMap::new()
+    };
+
     let mtu = cli_config
         .mtu
         .or_else(|| file_config.as_ref().and_then(|config| config.mtu))
@@ -346,6 +378,7 @@ pub fn combine_proxy_config(
             key_path,
             routes,
             address_pool,
+            configured_clients: Arc::new(Mutex::new(configured_clients)),
             tun_mtu: mtu,
         },
         log_level,

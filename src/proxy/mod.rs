@@ -49,6 +49,7 @@ pub struct ProxyConfig {
     pub key_path: std::path::PathBuf,
     pub routes: Vec<IpNet>,
     pub address_pool: Vec<IpNet>,
+    pub configured_clients: Arc<Mutex<HashMap<String, IpNet>>>,
     pub tun_mtu: u16,
 }
 
@@ -409,6 +410,7 @@ impl Proxy {
                 tx_quic_to_udp.clone(),
                 cancel_token.clone(),
                 self.available_addresses.clone(),
+                self.config.configured_clients.clone(),
                 self.active_clients.clone(),
             );
             self.connections.lock().await.insert(
@@ -435,6 +437,12 @@ impl Proxy {
                 connections_clone.lock().await.remove(&scid_owned);
                 if let Some(connect_ip_endpoint) = client_conn.connect_ip_endpoint {
                     for addr in connect_ip_endpoint.routing_state.remote_addresses.iter() {
+                        if let Some(preconfigured_address) = client_conn.preconfigured_peer_address
+                            && *addr == preconfigured_address
+                        {
+                            info!("Preconfigured address {}, not releasing back to pool", addr);
+                            continue;
+                        }
                         info!("Releasing address {}", addr);
                         return_subnet(&available_nets, *addr).await;
                     }
