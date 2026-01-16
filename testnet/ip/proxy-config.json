@@ -11,7 +11,7 @@
     ],
     "configured_clients": [
         {
-            "name": "client",
+            "name": "CIRS Client",
             "address": "10.248.3.128/32"
         }
     ],

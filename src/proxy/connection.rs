@@ -376,84 +376,9 @@ impl Connection {
             return Ok(());
         }
 
-        // 1. Check if the client certificate has already been processed
-        //    If so, skip re-processing
-        // 2. Parse the certificate and get the subject common name
-        //    If none is set, just continue processing
-        // 3. Check if the client has an open connection
-        //    If so, tear down the existing connection and get the routing info for this client
-
+        // Process client certificate if not already done.
         if !self.client_cert_processed {
-            let res = X509Certificate::from_der(self.conn.peer_cert().unwrap());
-            match res {
-                Ok((_, cert)) => {
-                    let cn = cert
-                        .tbs_certificate
-                        .subject
-                        .iter_common_name()
-                        .next()
-                        .and_then(|cn| cn.as_str().ok())
-                        .map(|s| s.to_string());
-                    self.client_cert_subject_cn = cn.clone();
-                }
-                _ => {
-                    warn!("failed to parse client certificate");
-                }
-            }
-            if let Some(cn) = &self.client_cert_subject_cn {
-                info!("client certificate CN: {}", cn);
-                let mut active_clients_guard = self.active_clients.lock().await;
-
-                let existing_connection = active_clients_guard.get(cn).cloned();
-                if let Some(existing_client) = existing_connection {
-                    info!(
-                        "existing connection found for {}, cancelling connection {:?}",
-                        cn, existing_client.conn_id
-                    );
-
-                    // Remove IP addresses of existing connection from its TUN device
-                    if let Err(e) = crate::net::route::flush_ip_addresses(&existing_client.tun_name)
-                    {
-                        warn!(
-                            "failed to flush IP addresses of interface {} for existing connection of {}: {}",
-                            existing_client.tun_name, cn, e
-                        );
-                    } else {
-                        info!(
-                            "flushed IP addresses of interface {} for existing connection of {}",
-                            existing_client.tun_name, cn
-                        );
-                    }
-
-                    // Remove routes of the existing connection by setting interface down
-                    if let Err(e) = crate::net::route::set_interface_down(&existing_client.tun_name)
-                    {
-                        warn!(
-                            "failed to set interface {} down for existing connection of {}: {}",
-                            existing_client.tun_name, cn, e
-                        );
-                    } else {
-                        info!(
-                            "set interface {} down for existing connection of {}",
-                            existing_client.tun_name, cn
-                        );
-                    }
-                    existing_client.cancel_token.cancel();
-                }
-
-                active_clients_guard.insert(
-                    cn.clone(),
-                    ActiveKnownClient {
-                        conn_id: self.scid.clone(),
-                        tun_name: self.config.tun_name.clone(),
-                        cancel_token: self.cancel_token.clone(),
-                    },
-                );
-
-                self.preconfigured_peer_address =
-                    self.configured_clients.lock().await.get(cn).cloned();
-            }
-
+            self.process_certificate().await?;
             self.client_cert_processed = true;
         }
 
@@ -499,6 +424,92 @@ impl Connection {
             debug!("Connect-IP connection not established yet, dropping packet.");
         }
 
+        Ok(())
+    }
+
+    async fn process_certificate(&mut self) -> Result<()> {
+        // We identify clients by the Common Name (CN) field in their certificate.
+        // The common name is used to see if the client has another active connection. If so it is torn down.
+        // Furthermore, it is used to assign preconfigured addresses to the client.
+        // At the moment, only clients with CN starting with "CIRS" are considered known clients. Others are treated as anonymous clients.
+        // For anonymous clients no checks for existing connections are done and no preconfigured addresses assigned.
+        // This feature does allow a single certificate to be used for multiple anonymous clients.
+        let res = X509Certificate::from_der(self.conn.peer_cert().unwrap());
+        match res {
+            Ok((_, cert)) => {
+                let cn = cert
+                    .tbs_certificate
+                    .subject
+                    .iter_common_name()
+                    .next()
+                    .and_then(|cn| cn.as_str().ok())
+                    .map(|s| s.to_string());
+
+                self.client_cert_subject_cn = if let Some(cn) = cn.clone()
+                    && cn.starts_with("CIRS")
+                {
+                    Some(cn)
+                } else {
+                    None
+                };
+            }
+            _ => {
+                warn!("failed to parse client certificate");
+            }
+        }
+        if let Some(cn) = &self.client_cert_subject_cn {
+            info!("client certificate CN: {}", cn);
+            let mut active_clients_guard = self.active_clients.lock().await;
+
+            // Check for existing connection for this client
+            let existing_connection = active_clients_guard.get(cn).cloned();
+            if let Some(existing_client) = existing_connection {
+                info!(
+                    "existing connection found for {}, cancelling connection {:?}",
+                    cn, existing_client.conn_id
+                );
+
+                // Remove IP addresses of existing connection from its TUN device
+                if let Err(e) = crate::net::route::flush_ip_addresses(&existing_client.tun_name) {
+                    warn!(
+                        "failed to flush IP addresses of interface {} for existing connection of {}: {}",
+                        existing_client.tun_name, cn, e
+                    );
+                } else {
+                    info!(
+                        "flushed IP addresses of interface {} for existing connection of {}",
+                        existing_client.tun_name, cn
+                    );
+                }
+
+                // Remove routes of the existing connection by setting interface down
+                if let Err(e) = crate::net::route::set_interface_down(&existing_client.tun_name) {
+                    warn!(
+                        "failed to set interface {} down for existing connection of {}: {}",
+                        existing_client.tun_name, cn, e
+                    );
+                } else {
+                    info!(
+                        "set interface {} down for existing connection of {}",
+                        existing_client.tun_name, cn
+                    );
+                }
+                existing_client.cancel_token.cancel();
+            }
+
+            // Register this connection as active client
+            active_clients_guard.insert(
+                cn.clone(),
+                ActiveKnownClient {
+                    conn_id: self.scid.clone(),
+                    tun_name: self.config.tun_name.clone(),
+                    cancel_token: self.cancel_token.clone(),
+                },
+            );
+
+            // Check for preconfigured peer address
+            self.preconfigured_peer_address = self.configured_clients.lock().await.get(cn).cloned();
+        }
         Ok(())
     }
 
