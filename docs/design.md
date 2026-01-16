@@ -38,6 +38,18 @@ The proxy consists of one main task that is listening for incoming UDP packets. 
 Public Network (QUIC/UDP/SCION)
 ```
 
+### TUN Interface Handling
+Each client connection handler sets up its own TUN interface and spawns a dedicated task to manage it. This design choice was taken with a lot of consideration. The alternative would have been to have a shared TUN interface for all connections, with a dedicated task reading from the TUN and forwarding packets to the correct connection handler based on the destination address. We compared both designs based on several criteria.
+
+- **State Management**: Separate TUN interfaces allow for simpler state management. This is especially important for handling connection teardowns and reconnections. With separate TUN interfaces, once a connection is closed, its associated TUN interface can be cleanly shut down without affecting other connections. With a shared TUN interface, additional logic is required to keep track of active connections and their addresses and routes.
+- **Simplicity**: A shared TUN interface introduces significant complexity in routing packets to the correct client connection. With separate TUN interfaces the routing is handled by the OS. Each TUN interface only receives packets destined for the addresses assigned to that specific connection, simplifying the packet processing logic.
+- **Performance**: We believe the OS routing logic to be quite performant. Our own routing implementation would likely decrease overall performance. (We actually implemented a prototype of the shared TUN interface design and found that we can achieve decent routing performance. However, the complexity increased significantly.)
+- **Memory Usage**: A shared TUN interface requires less memory, as there would be only one interface and associated buffers. We have not measured the actual memory usage difference.
+- **Connect-IP Compatibility**: A shared TUN interface is not suitable for all Connect-IP modes. The protocol allows clients to assign addresses to the proxy. With a shared TUN interface, all theses addresses are assigned to a single interface. There is then no natural way for applications to use the tun interface directly. While we could handle the routing based on destination address, the source address selection would not be straightforward. An application would select one of the available addresses on the interface. This address might not belong to the intended client connection, leading to packets being dropped by the proxy. By having separate TUN interfaces per connection, each interface only has the addresses assigned to that specific client connection, ensuring correct source address selection.
+- **Administration**: A single TUN interface is simpler to manage from a system administration perspective. Having thousands of TUN interfaces on a system might be unconventional and not liked by system administrators.
+
+Overall we believe that the benefits of having separate TUN interfaces per connection outweigh the drawbacks. The design simplifies state management and packet processing, aligns well with the connect-ip protocol's capabilities, and leverages the OS's routing efficiency. Lets hope system administrators will not mind too much.
+
 
 ## Client Architecture
 The client design is similar to that of the proxy. While the client does not necessarily need the separation of tasks for performance reasons, it was designed this way to keep the code structure consistent between client and proxy. The main client task manages the UDP socket and forwards incoming packets to the connect-ip handler task. The connect-ip handler manages the connect-ip state and the TUN handler task manages the TUN interface. Outgoing (QUIC) packets from the connect-ip handler are sent to the main client task for transmission over the network.
@@ -56,3 +68,6 @@ The client design is similar to that of the proxy. While the client does not nec
          ▼
 Public Network (QUIC/UDP/SCION)
 ```
+
+### Task Separation
+The separation of tasks in the client serves to maintain a clean architecture that mirrors the proxy. This separation would not be strictly necessary for performance, as the client handles only a single connection. However, by maintaining this structure, the code remains consistent and easier to understand. Furthermore, the use of the queues between the tasks allows for a natural way to process multiple packets at once. This can be useful to improve efficency when small IP packets are proccessed that can fit into a single QUIC packet. The tokio and tun implementations do not support batching receives natively, but by using queues we can read multiple packets from the TUN or UDP socket and then process them in a batch in the connect-ip handler.

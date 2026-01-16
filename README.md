@@ -80,19 +80,11 @@ This project took inspiration from the following implementations. We thank the a
 
 
 ## TODO:
-- Usability
-  - Use Client certificate to identify clients
-    - currently client certificates are only used for authentication
-    - we could use the certificate's subject to identify clients and assign routes/addresses based on that
-    - specifically this could solve the issue of a reconnecting client getting a different address
-
 - Code Improvements
   - Documentation (especially public APIs)
   - Better error handling
     - use custom error types when possible
     - handle errors more gracefully when allowed
-  - Remove channels from connect-ip implementation
-  - Potentially simplify client and proxy connection management by moving tun handling into connection module
 
 - SCION Integration
   - Check if path can be selected when connectivity is not working
