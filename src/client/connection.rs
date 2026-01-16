@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::client::{CHANNEL_CAPACITY, MAX_DATAGRAM_SIZE};
+use crate::connect_ip;
 use crate::connect_ip::capsule::{AddressRequestCapsule, Capsule, RequestedAddress};
 use crate::connect_ip::request::{build_request, check_response, headers_to_strings};
 use crate::net::quic::{DEFAULT_TIMEOUT, HTTP3_STREAM_OVERHEAD, KEEPALIVE_INTERVAL};
@@ -40,7 +41,7 @@ pub struct Connection {
     connect_ip_endpoint: Option<crate::connect_ip::Endpoint>,
     rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
     tx_quic_to_udp: mpsc::Sender<UdpPacket>,
-    tx_tun_configuration: Option<mpsc::Sender<tun::TunConfiguration>>,
+    tx_tun_configuration: Option<mpsc::Sender<connect_ip::RoutingUpdate>>,
     tx_quic_to_tun: Option<mpsc::Sender<Vec<u8>>>,
     cancel_token: CancellationToken,
     available_addresses: Arc<Mutex<Vec<IpNet>>>,
@@ -118,7 +119,7 @@ impl Connection {
             self.config.configured_mtu,
         )?;
         let (tx_tun_configuration, rx_tun_configuration) =
-            mpsc::channel::<tun::TunConfiguration>(CHANNEL_CAPACITY);
+            mpsc::channel::<connect_ip::RoutingUpdate>(CHANNEL_CAPACITY);
         tun.start(
             rx_quic_to_tun,
             rx_tun_configuration,
@@ -441,7 +442,7 @@ impl Connection {
                             let tun_mtu = tun_mtu.unwrap_or(self.config.configured_mtu);
                             if let Some(tx_tun_update) = &self.tx_tun_configuration {
                                 tx_tun_update
-                                    .send(tun::TunConfiguration::SetMTU(tun_mtu))
+                                    .send(connect_ip::RoutingUpdate::SetMTU(tun_mtu))
                                     .await?;
                             }
 

@@ -1,7 +1,6 @@
 use std::net::IpAddr;
 
 use anyhow::{Context, Result};
-use ipnet::IpNet;
 use tokio::sync::mpsc::{Permit, Receiver, Sender};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -9,18 +8,10 @@ use tracing::{debug, error, info, info_span, warn};
 use tracing_futures::Instrument as _;
 use tun_rs::DeviceBuilder;
 
+use crate::connect_ip;
 use crate::net::route::{add_route, remove_route};
 
 pub const MAX_TUN_MTU: usize = 9000;
-
-/// Configuration commands for the TUN device.
-pub enum TunConfiguration {
-    AddAddress(IpNet),
-    RemoveAddress(IpNet),
-    AddRoute(IpNet),
-    RemoveRoute(IpNet),
-    SetMTU(u16),
-}
 
 /// A TUN device handler that manages a network (tun) interface.
 ///
@@ -49,7 +40,7 @@ impl Tun {
     pub async fn start(
         &mut self,
         mut rx_in_tun: Receiver<Vec<u8>>,
-        mut rx_address_updates: Receiver<TunConfiguration>,
+        mut rx_address_updates: Receiver<connect_ip::RoutingUpdate>,
         cancel_token: CancellationToken,
     ) -> Result<()> {
         let dev = DeviceBuilder::new()
@@ -76,7 +67,7 @@ impl Tun {
                             // Handle address updates
                             Some(update) = rx_address_updates.recv() => {
                                 match update {
-                                    TunConfiguration::AddAddress(ipnet) => {
+                                    connect_ip::RoutingUpdate::AddAddress(ipnet) => {
                                         match ipnet.addr() {
                                             IpAddr::V4(address) => {
                                                 dev.add_address_v4(address, ipnet.prefix_len())?;
@@ -87,11 +78,11 @@ impl Tun {
                                         }
                                         debug!("Added address {} to TUN device {}", ipnet, name);
                                     }
-                                    TunConfiguration::RemoveAddress(ipnet) => {
+                                    connect_ip::RoutingUpdate::RemoveAddress(ipnet) => {
                                         dev.remove_address(ipnet.addr())?;
                                         debug!("Removed address {} from TUN device {}", ipnet, name);
                                     }
-                                    TunConfiguration::AddRoute(ipnet) => {
+                                    connect_ip::RoutingUpdate::AddRoute(ipnet) => {
                                         match add_route(&ipnet, &name) {
                                             Ok(true) => {
                                                 debug!("Added route {} via TUN device {}", ipnet, name);
@@ -104,14 +95,14 @@ impl Tun {
                                             }
                                         }
                                     }
-                                    TunConfiguration::RemoveRoute(ipnet) => {
+                                    connect_ip::RoutingUpdate::RemoveRoute(ipnet) => {
                                         if let Err(e) = remove_route(&ipnet, &name) {
                                             error!("Failed to remove route {}: {}", ipnet, e);
                                         } else {
                                             debug!("Removed route {} via TUN device {}", ipnet, name);
                                         }
                                     }
-                                    TunConfiguration::SetMTU(mtu) => {
+                                    connect_ip::RoutingUpdate::SetMTU(mtu) => {
                                         if let Err(e) = dev.set_mtu(mtu) {
                                             error!("Failed to set MTU {} on TUN device {}: {}", mtu, name, e);
                                         } else {
