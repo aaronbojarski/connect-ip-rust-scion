@@ -390,8 +390,21 @@ impl Proxy {
                 mpsc::channel::<UdpPacket>(CLIENT_CHANNEL_CAPACITY);
 
             // Allocate TUN name for this client
-            let tun_name = format!("tun{}", self.next_client);
-            self.next_client += 1;
+            let tun_name = format!("cirs{}", self.next_client);
+
+            // Update next client index. On overflow, so after about 4 billion connections,
+            // we abort all active connections and start from 0 again. This is unlikely to happen in practice.
+            // If we have one new connection per second it will take more than 100 years.
+            match self.next_client.checked_add(1) {
+                Some(n) => self.next_client = n,
+                None => {
+                    self.next_client = 0;
+                    let mut connections_lock = self.connections.lock().await;
+                    for (_conn_id, conn_info) in connections_lock.drain() {
+                        conn_info.cancel_token.cancel();
+                    }
+                }
+            }
 
             let config = Config {
                 tun_name,
