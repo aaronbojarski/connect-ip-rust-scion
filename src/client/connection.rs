@@ -425,7 +425,7 @@ impl Connection {
             && self.tunnel_status.http_request_stream.is_none()
         {
             let req = build_request(
-                "localhost".to_string(),
+                self.config.server_name.clone(),
                 "/vpn".to_string(),
                 self.config.configured_mtu,
             );

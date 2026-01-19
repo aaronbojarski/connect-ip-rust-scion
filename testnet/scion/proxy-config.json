@@ -1,5 +1,6 @@
 {
-    "listen": "[0-0,10.248.100.11]:4433",
+    "listen": "[2-3,10.248.200.10]:4433",
+    "endhost_api_address": "http://10.248.200.20:10231",
     "ca_cert_path": "./testnet/ca-cert.pem",
     "cert_path": "./testnet/proxy-cert.pem",
     "key_path": "./testnet/proxy-key.pem",
@@ -8,12 +9,6 @@
     ],
     "routes": [
         "10.248.2.0/24"
-    ],
-    "configured_clients": [
-        {
-            "name": "CIRS Client",
-            "address": "10.248.3.128/32"
-        }
     ],
     "log_level": "info"
 }

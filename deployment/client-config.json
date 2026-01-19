@@ -1,0 +1,17 @@
+{
+    "remote": "PROXY_ADDRESS:4433",
+    "host": "PROXY_CERTIFICATE_CN",
+    "bind": "CLIENT_ADDRESS:4433",
+    "endhost_api_address": "http://LOCAL_ENDHOST_API_ADDRESS:12345",
+    "snap_token_path": "/etc/cirs/snap.token",
+    "ca_cert_path": "/etc/cirs/ca-cert.pem",
+    "cert_path": "/etc/cirs/client-cert.pem",
+    "key_path": "/etc/cirs/client-key.pem",
+    "address_pool": [
+        "10.248.1.128/25"
+    ],
+    "routes": [
+        "10.248.1.0/24"
+    ],
+    "log_level": "info"
+}

@@ -1,0 +1,14 @@
+{
+    "listen": "PROXY_ADDRESS:4433",
+    "endhost_api_address": "http://LOCAL_ENDHOST_API_ADDRESS:12345",
+    "ca_cert_path": "/etc/cirs/ca-cert.pem",
+    "cert_path": "/etc/cirs/proxy-cert.pem",
+    "key_path": "/etc/cirs/proxy-key.pem",
+    "address_pool": [
+        "10.248.2.128/25"
+    ],
+    "routes": [
+        "10.248.2.0/24"
+    ],
+    "log_level": "info"
+}

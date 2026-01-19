@@ -14,12 +14,12 @@ cd ..
 
 Then start the server the corresponding namespace.
 ```bash
-sudo ip netns exec proxy_ns ./target/debug/connect-ip-rust-scion proxy --listen [0-0,10.248.100.11]:4433 --routes 10.248.2.0/24 --address-pool 10.248.2.128/25 --ca-cert ./testnet/ca-cert.pem --cert ./testnet/proxy-cert.pem --key ./testnet/proxy-key.pem
+sudo ip netns exec proxy_ns ./target/debug/connect-ip-rust-scion proxy --config ./testnet/ip/proxy-config.json
 ```
 
 Then start the client in another terminal.
 ```bash
-sudo ip netns exec client_ns ./target/debug/connect-ip-rust-scion client --remote [0-0,10.248.100.11]:4433 --host localhost --routes 10.248.1.0/24 --address-pool 10.248.1.128/25 --ca-cert ./testnet/ca-cert.pem --cert ./testnet/client-cert.pem --key ./testnet/client-key.pem
+sudo ip netns exec client_ns ./target/debug/connect-ip-rust-scion client --config ./testnet/ip/client-config.json
 ```
 
 Enable packet forwading in the server and client namespaces.

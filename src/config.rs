@@ -144,12 +144,14 @@ pub struct ClientOpt {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConfiguredClient {
     pub name: String,
     pub address: IpNet,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProxyConfigFile {
     /// Address to listen on
     pub listen: Option<String>,
@@ -192,6 +194,7 @@ pub struct ProxyConfigFile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientConfigFile {
     /// Address of proxy to connect to.
     pub remote: Option<String>,

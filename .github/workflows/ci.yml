@@ -108,7 +108,7 @@ jobs:
         run: |
           sudo ip netns exec client_ns ./target/debug/connect-ip-rust-scion client \
             --remote [0-0,10.248.100.11]:4433 \
-            --host localhost \
+            --host CIRS-Proxy \
             --ca-cert ./ca-cert.pem \
             --cert ./client-cert.pem \
             --key ./client-key.pem \
@@ -239,7 +239,7 @@ jobs:
         run: |
           sudo ip netns exec client_ns ./target/debug/connect-ip-rust-scion client \
             --remote [2-3,10.248.200.10]:4433 \
-            --host localhost \
+            --host CIRS-Proxy \
             --ca-cert ./ca-cert.pem \
             --cert ./client-cert.pem \
             --key ./client-key.pem \

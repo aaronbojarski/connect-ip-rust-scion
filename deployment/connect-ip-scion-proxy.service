@@ -4,8 +4,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-EnvironmentFile=/etc/cirs/.progconf
-ExecStart=/usr/local/bin/connect-ip-rust-scion proxy --listen ${PROXY_LISTEN} --endhost-api ${PROXY_ENDHOST_API} --ca-cert ${PROXY_CA_CERT} --cert ${PROXY_CERT} --key ${PROXY_KEY} --routes ${PROXY_ROUTES} --address-pool ${PROXY_ADDRESS_POOL}
+ExecStart=/usr/local/bin/connect-ip-rust-scion proxy --config /etc/cirs/proxy-config.json
 Restart=always
 RestartSec=1
 User=root

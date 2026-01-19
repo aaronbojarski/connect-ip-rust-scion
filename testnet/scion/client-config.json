@@ -1,0 +1,17 @@
+{
+    "remote": "[2-3,10.248.200.10]:4433",
+    "host": "CIRS-Proxy",
+    "bind": "[1-4,10.248.100.10]:4433",
+    "endhost_api_address": "http://10.248.100.20:10143",
+    "snap_token_path": "./testnet/scion/snap.token",
+    "ca_cert_path": "./testnet/ca-cert.pem",
+    "cert_path": "./testnet/client-cert.pem",
+    "key_path": "./testnet/client-key.pem",
+    "address_pool": [
+        "10.248.1.128/25"
+    ],
+    "routes": [
+        "10.248.1.0/24"
+    ],
+    "log_level": "info"
+}

@@ -1,0 +1,14 @@
+{
+    "remote": "[0-0,10.248.100.11]:4433",
+    "host": "CIRS-Proxy",
+    "ca_cert_path": "./testnet/ca-cert.pem",
+    "cert_path": "./testnet/client-cert.pem",
+    "key_path": "./testnet/client-key.pem",
+    "address_pool": [
+        "10.248.1.128/25"
+    ],
+    "routes": [
+        "10.248.1.0/24"
+    ],
+    "log_level": "info"
+}

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Create an OpenSSL SAN config for the proxy cert (includes DNS localhost and the proxy IP)
+# Create an OpenSSL SAN config for the proxy cert (includes DNS "CIRS-Proxy" and the proxy IP)
 cat > san.cnf <<EOF
 [ req ]
 distinguished_name = req_distinguished_name
@@ -10,7 +10,7 @@ req_extensions = v3_req
 [ v3_req ]
 subjectAltName = @alt_names
 [ alt_names ]
-DNS.1 = localhost
+DNS.1 = CIRS-Proxy
 IP.1  = 10.248.100.11
 EOF
 
@@ -20,7 +20,7 @@ openssl req -x509 -new -key ca-key.pem -days 3650 -sha256 -subj "/CN=connect-ip-
 
 # Generate proxy key and CSR
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:prime256v1 -out proxy-key.pem
-openssl req -new -key proxy-key.pem -subj "/CN=localhost" -out proxy.csr.pem
+openssl req -new -key proxy-key.pem -subj "/CN=CIRS-Proxy" -out proxy.csr.pem
 
 # Sign proxy CSR with CA and include SANs
 openssl x509 -req -in proxy.csr.pem -CA ca-cert.pem -CAkey ca-key.pem -CAcreateserial \
@@ -28,7 +28,7 @@ openssl x509 -req -in proxy.csr.pem -CA ca-cert.pem -CAkey ca-key.pem -CAcreates
 
 # Generate client key and CSR
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:prime256v1 -out client-key.pem
-openssl req -new -key client-key.pem -subj "/CN=client" -out client.csr.pem
+openssl req -new -key client-key.pem -subj "/CN=CIRS-Client" -out client.csr.pem
 
 # Sign client CSR with CA
 openssl x509 -req -in client.csr.pem -CA ca-cert.pem -CAkey ca-key.pem -CAcreateserial \
