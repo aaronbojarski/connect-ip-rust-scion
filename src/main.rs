@@ -19,14 +19,14 @@ fn main() -> Result<(), anyhow::Error> {
 
 #[tokio::main]
 async fn run_proxy(opt: ProxyOpt) -> Result<(), anyhow::Error> {
-    let config_file = if let Some(config_path) = &opt.config_path {
-        Some(
+    let config_file = opt
+        .config_path
+        .as_ref()
+        .map(|config_path| {
             load_proxy_config_from_file(config_path)
-                .map_err(|e| anyhow!("Failed to load config from {:?}: {}", config_path, e))?,
-        )
-    } else {
-        None
-    };
+                .map_err(|e| anyhow!("Failed to load config from {:?}: {}", config_path, e))
+        })
+        .transpose()?;
 
     let (config, log_level) = combine_proxy_config(opt, config_file)
         .map_err(|e| anyhow!("Invalid Config Parameters: {}", e))?;
@@ -43,14 +43,14 @@ async fn run_proxy(opt: ProxyOpt) -> Result<(), anyhow::Error> {
 
 #[tokio::main]
 async fn run_client(opt: ClientOpt) -> Result<(), anyhow::Error> {
-    let config_file = if let Some(config_path) = &opt.config_path {
-        Some(
+    let config_file = opt
+        .config_path
+        .as_ref()
+        .map(|config_path| {
             load_client_config_from_file(config_path)
-                .map_err(|e| anyhow!("Failed to load config from {:?}: {}", config_path, e))?,
-        )
-    } else {
-        None
-    };
+                .map_err(|e| anyhow!("Failed to load config from {:?}: {}", config_path, e))
+        })
+        .transpose()?;
 
     let (config, log_level) = combine_client_config(opt, config_file)
         .map_err(|e| anyhow!("Invalid Config Parameters: {}", e))?;

@@ -181,10 +181,10 @@ pub struct ProxyConfigFile {
     pub mtu: Option<u16>,
 
     /// Address pool to assign addresses to clients from
-    pub address_pool: Vec<IpNet>,
+    pub address_pool: Option<Vec<IpNet>>,
 
     /// Routes to advertise to clients
-    pub routes: Vec<IpNet>,
+    pub routes: Option<Vec<IpNet>>,
 
     /// Clients with configured static addresses
     pub configured_clients: Option<Vec<ConfiguredClient>>,
@@ -230,10 +230,10 @@ pub struct ClientConfigFile {
     pub mtu: Option<u16>,
 
     /// Address pool to assign addresses to clients from
-    pub address_pool: Vec<IpNet>,
+    pub address_pool: Option<Vec<IpNet>>,
 
     /// Routes to advertise to clients
-    pub routes: Vec<IpNet>,
+    pub routes: Option<Vec<IpNet>>,
 
     /// Tracing level (trace, debug, info, warn, error)
     pub log_level: Option<String>,
@@ -249,10 +249,12 @@ pub fn combine_proxy_config(
     cli_config: ProxyOpt,
     file_config: Option<ProxyConfigFile>,
 ) -> anyhow::Result<(crate::proxy::ProxyConfig, tracing::Level)> {
+    let file_config = file_config.as_ref();
+
     let listen = cli_config
         .listen
         .or_else(|| {
-            file_config.as_ref().and_then(|config| {
+            file_config.and_then(|config| {
                 config.listen.as_ref().and_then(|s| {
                     s.parse()
                         .map_err(|e| anyhow::anyhow!("invalid listen address in config file: {e}"))
@@ -263,7 +265,7 @@ pub fn combine_proxy_config(
         .ok_or_else(|| anyhow::anyhow!("No listen address provided."))?;
 
     let endhost_api_address = cli_config.endhost_api_address.or_else(|| {
-        file_config.as_ref().and_then(|config| {
+        file_config.and_then(|config| {
             config.endhost_api_address.as_ref().and_then(|s| {
                 s.parse()
                     .map_err(|e| anyhow::anyhow!("invalid endhost API address in config file: {e}"))
@@ -272,14 +274,12 @@ pub fn combine_proxy_config(
         })
     });
 
-    let snap_token_path = cli_config.snap_token_path.or_else(|| {
-        file_config
-            .as_ref()
-            .and_then(|config| config.snap_token_path.clone())
-    });
+    let snap_token_path = cli_config
+        .snap_token_path
+        .or_else(|| file_config.and_then(|config| config.snap_token_path.clone()));
 
     let acl_policy = cli_config.acl.or_else(|| {
-        file_config.as_ref().and_then(|config| {
+        file_config.and_then(|config| {
             config
                 .acl_policy
                 .as_ref()
@@ -290,50 +290,32 @@ pub fn combine_proxy_config(
     let ca_cert_path = cli_config
         .ca_cert_path
         .clone()
-        .or_else(|| {
-            file_config
-                .as_ref()
-                .and_then(|config| config.ca_cert_path.clone())
-        })
+        .or_else(|| file_config.and_then(|config| config.ca_cert_path.clone()))
         .ok_or_else(|| anyhow::anyhow!("No CA Certificate path provided."))?;
 
     let cert_path = cli_config
         .cert_path
         .clone()
-        .or_else(|| {
-            file_config
-                .as_ref()
-                .and_then(|config| config.cert_path.clone())
-        })
+        .or_else(|| file_config.and_then(|config| config.cert_path.clone()))
         .ok_or_else(|| anyhow::anyhow!("No Certificate path provided."))?;
 
     let key_path = cli_config
         .key_path
         .clone()
-        .or_else(|| {
-            file_config
-                .as_ref()
-                .and_then(|config| config.key_path.clone())
-        })
+        .or_else(|| file_config.and_then(|config| config.key_path.clone()))
         .ok_or_else(|| anyhow::anyhow!("No Key path provided."))?;
 
-    let routes = if !cli_config.routes.is_empty() {
-        cli_config.routes.clone()
-    } else if let Some(config) = &file_config {
-        config.routes.clone()
-    } else {
-        Vec::new()
-    };
+    let routes = (!cli_config.routes.is_empty())
+        .then(|| cli_config.routes.clone())
+        .or_else(|| file_config.and_then(|config| config.routes.clone()))
+        .unwrap_or_default();
 
-    let address_pool = if !cli_config.address_pool.is_empty() {
-        cli_config.address_pool.clone()
-    } else if let Some(config) = &file_config {
-        config.address_pool.clone()
-    } else {
-        Vec::new()
-    };
+    let address_pool = (!cli_config.address_pool.is_empty())
+        .then(|| cli_config.address_pool.clone())
+        .or_else(|| file_config.and_then(|config| config.address_pool.clone()))
+        .unwrap_or_default();
 
-    let configured_clients = if let Some(config) = &file_config
+    let configured_clients = if let Some(config) = file_config
         && let Some(clients) = &config.configured_clients
     {
         let mut map = std::collections::HashMap::new();
@@ -357,14 +339,13 @@ pub fn combine_proxy_config(
 
     let mtu = cli_config
         .mtu
-        .or_else(|| file_config.as_ref().and_then(|config| config.mtu))
+        .or_else(|| file_config.and_then(|config| config.mtu))
         .unwrap_or(DEFAULT_TUN_MTU);
 
     let log_level = cli_config
         .log_level
         .or_else(|| {
             file_config
-                .as_ref()
                 .and_then(|config| config.log_level.as_ref())
                 .and_then(|s| tracing::Level::from_str(s).ok())
         })
@@ -398,10 +379,12 @@ pub fn combine_client_config(
     cli_config: ClientOpt,
     file_config: Option<ClientConfigFile>,
 ) -> anyhow::Result<(crate::client::ClientConfig, tracing::Level)> {
+    let file_config = file_config.as_ref();
+
     let remote = cli_config
         .remote
         .or_else(|| {
-            file_config.as_ref().and_then(|config| {
+            file_config.and_then(|config| {
                 config.remote.as_ref().and_then(|s| {
                     s.parse()
                         .map_err(|e| anyhow::anyhow!("invalid remote address in config file: {e}"))
@@ -413,10 +396,10 @@ pub fn combine_client_config(
 
     let host = cli_config
         .host
-        .or_else(|| file_config.as_ref().and_then(|config| config.host.clone()));
+        .or_else(|| file_config.and_then(|config| config.host.clone()));
 
     let listen = cli_config.bind.or_else(|| {
-        file_config.as_ref().and_then(|config| {
+        file_config.and_then(|config| {
             config.bind.as_ref().and_then(|s| {
                 s.parse()
                     .map_err(|e| anyhow::anyhow!("invalid listen address in config file: {e}"))
@@ -426,7 +409,7 @@ pub fn combine_client_config(
     });
 
     let endhost_api_address = cli_config.endhost_api_address.or_else(|| {
-        file_config.as_ref().and_then(|config| {
+        file_config.and_then(|config| {
             config.endhost_api_address.as_ref().and_then(|s| {
                 s.parse()
                     .map_err(|e| anyhow::anyhow!("invalid endhost API address in config file: {e}"))
@@ -435,14 +418,12 @@ pub fn combine_client_config(
         })
     });
 
-    let snap_token_path = cli_config.snap_token_path.or_else(|| {
-        file_config
-            .as_ref()
-            .and_then(|config| config.snap_token_path.clone())
-    });
+    let snap_token_path = cli_config
+        .snap_token_path
+        .or_else(|| file_config.and_then(|config| config.snap_token_path.clone()));
 
     let acl_policy = cli_config.acl.or_else(|| {
-        file_config.as_ref().and_then(|config| {
+        file_config.and_then(|config| {
             config
                 .acl_policy
                 .as_ref()
@@ -453,68 +434,45 @@ pub fn combine_client_config(
     let ca_cert_path = cli_config
         .ca_cert_path
         .clone()
-        .or_else(|| {
-            file_config
-                .as_ref()
-                .and_then(|config| config.ca_cert_path.clone())
-        })
+        .or_else(|| file_config.and_then(|config| config.ca_cert_path.clone()))
         .ok_or_else(|| anyhow::anyhow!("No CA Certificate path provided."))?;
 
     let cert_path = cli_config
         .cert_path
         .clone()
-        .or_else(|| {
-            file_config
-                .as_ref()
-                .and_then(|config| config.cert_path.clone())
-        })
+        .or_else(|| file_config.and_then(|config| config.cert_path.clone()))
         .ok_or_else(|| anyhow::anyhow!("No Certificate path provided."))?;
 
     let key_path = cli_config
         .key_path
         .clone()
-        .or_else(|| {
-            file_config
-                .as_ref()
-                .and_then(|config| config.key_path.clone())
-        })
+        .or_else(|| file_config.and_then(|config| config.key_path.clone()))
         .ok_or_else(|| anyhow::anyhow!("No Key path provided."))?;
 
-    let routes = if !cli_config.routes.is_empty() {
-        cli_config.routes.clone()
-    } else if let Some(config) = &file_config {
-        config.routes.clone()
-    } else {
-        Vec::new()
-    };
+    let routes = (!cli_config.routes.is_empty())
+        .then(|| cli_config.routes.clone())
+        .or_else(|| file_config.and_then(|config| config.routes.clone()))
+        .unwrap_or_default();
 
-    let address_pool = if !cli_config.address_pool.is_empty() {
-        cli_config.address_pool.clone()
-    } else if let Some(config) = &file_config {
-        config.address_pool.clone()
-    } else {
-        Vec::new()
-    };
+    let address_pool = (!cli_config.address_pool.is_empty())
+        .then(|| cli_config.address_pool.clone())
+        .or_else(|| file_config.and_then(|config| config.address_pool.clone()))
+        .unwrap_or_default();
 
     let mtu = cli_config
         .mtu
-        .or_else(|| file_config.as_ref().and_then(|config| config.mtu))
+        .or_else(|| file_config.and_then(|config| config.mtu))
         .unwrap_or(DEFAULT_TUN_MTU);
 
     let tun_name = cli_config
         .tun_name
-        .or_else(|| {
-            file_config
-                .as_ref()
-                .and_then(|config| config.tun_name.clone())
-        })
+        .or_else(|| file_config.and_then(|config| config.tun_name.clone()))
         .unwrap_or(DEFAULT_TUN_NAME.to_string());
 
     let log_level = cli_config
         .log_level
         .or_else(|| {
             file_config
-                .as_ref()
                 .and_then(|config| config.log_level.as_ref())
                 .and_then(|s| tracing::Level::from_str(s).ok())
         })
