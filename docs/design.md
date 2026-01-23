@@ -52,7 +52,7 @@ Overall we believe that the benefits of having separate TUN interfaces per conne
 
 
 ## Client Architecture
-The client design is similar to that of the proxy. While the client does not necessarily need the separation of tasks for performance reasons, it was designed this way to keep the code structure consistent between client and proxy. The main client task manages the UDP socket and forwards incoming packets to the connect-ip handler task. The connect-ip handler manages the connect-ip state and the TUN handler task manages the TUN interface. Outgoing (QUIC) packets from the connect-ip handler are sent to the main client task for transmission over the network.
+The client design is similar to that of the proxy. While the client does not necessarily need the separation of tasks for performance reasons (as it handles only a single connection), it was designed this way to keep the code structure consistent between client and proxy, making it easier to understand and maintain. The main client task manages the UDP socket and forwards incoming packets to the connect-ip handler task. The connect-ip handler manages the connect-ip state and the TUN handler task manages the TUN interface. Outgoing (QUIC) packets from the connect-ip handler are sent to the main client task for transmission over the network. Furthermore, the use of queues between the tasks allows for a natural way to process multiple packets at once, which can improve efficiency when small IP packets are processed that can fit into a single QUIC packet. The tokio and tun implementations do not support batching receives natively, but by using queues we can read multiple packets from the TUN or UDP socket and then process them in a batch in the connect-ip handler.
 
 ```
 ┌─────────────────────┐
@@ -68,6 +68,3 @@ The client design is similar to that of the proxy. While the client does not nec
          ▼
 Public Network (QUIC/UDP/SCION)
 ```
-
-### Task Separation
-The separation of tasks in the client serves to maintain a clean architecture that mirrors the proxy. This separation would not be strictly necessary for performance, as the client handles only a single connection. However, by maintaining this structure, the code remains consistent and easier to understand. Furthermore, the use of the queues between the tasks allows for a natural way to process multiple packets at once. This can be useful to improve efficency when small IP packets are proccessed that can fit into a single QUIC packet. The tokio and tun implementations do not support batching receives natively, but by using queues we can read multiple packets from the TUN or UDP socket and then process them in a batch in the connect-ip handler.
