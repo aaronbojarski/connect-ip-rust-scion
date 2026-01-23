@@ -77,14 +77,3 @@ Test network setups for local testing are provided in the `testnet` directory.
 This project took inspiration from the following implementations. We thank the authors for their great work!
 - [connect-ip-go](https://github.com/quic-go/connect-ip-go)
 - [pasque](https://github.com/PasiSa/pasque)
-
-
-## TODO:
-- Code Improvements
-  - Documentation (especially public APIs)
-  - Better error handling
-    - use custom error types when possible
-    - handle errors more gracefully when allowed
-
-- SCION Integration
-  - Check if path can be selected when connectivity is not working
