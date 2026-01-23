@@ -71,10 +71,6 @@ pub struct UdpPacket {
 /// A `Result` containing the IP network or an error if:
 /// - The addresses are of different versions (IPv4 vs IPv6)
 /// - The resulting prefix length is invalid
-///
-/// # Limitations
-/// Currently assumes that start and end define a valid CIDR block.
-/// This should be validated in future versions.
 pub fn ip_range_to_net(start: IpAddr, end: IpAddr) -> Result<IpNet, Error> {
     match (start, end) {
         (IpAddr::V4(start_v4), IpAddr::V4(end_v4)) => {
@@ -84,6 +80,14 @@ pub fn ip_range_to_net(start: IpAddr, end: IpAddr) -> Result<IpNet, Error> {
             let diff = end_u32.wrapping_sub(start_u32);
             let prefix_len = diff.leading_zeros() as u8;
 
+            if start_u32 & ((1 << (32 - prefix_len)) - 1) != 0 {
+                return Err(anyhow::anyhow!(
+                    "Start address {} is not aligned to prefix length {}",
+                    start,
+                    prefix_len
+                ));
+            }
+
             IpNet::new(start, prefix_len).map_err(|e| anyhow::anyhow!("Invalid IP network: {}", e))
         }
         (IpAddr::V6(start_v6), IpAddr::V6(end_v6)) => {
@@ -92,6 +96,14 @@ pub fn ip_range_to_net(start: IpAddr, end: IpAddr) -> Result<IpNet, Error> {
 
             let diff = end_u128.wrapping_sub(start_u128);
             let prefix_len = diff.leading_zeros() as u8;
+
+            if start_u128 & ((1 << (128 - prefix_len)) - 1) != 0 {
+                return Err(anyhow::anyhow!(
+                    "Start address {} is not aligned to prefix length {}",
+                    start,
+                    prefix_len
+                ));
+            }
 
             IpNet::new(start, prefix_len).map_err(|e| anyhow::anyhow!("Invalid IP network: {}", e))
         }
@@ -247,5 +259,108 @@ pub fn check_packet_src_dst(
     } else {
         debug!("destination address {} not allowed", packet_dst);
         ForwardingDecision::RespondWithIcmp(IcmpType::DestinationUnreachable)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn test_ip_range_to_net_ipv4_single_address() {
+        // Test single address range (192.168.1.0 to 192.168.1.0) -> /32
+        let start = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 0));
+        let end = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 0));
+        let result = ip_range_to_net(start, end);
+        assert!(result.is_ok());
+        let net = result.unwrap();
+        assert_eq!(net.addr(), start);
+        assert_eq!(net.prefix_len(), 32);
+    }
+
+    #[test]
+    fn test_ip_range_to_net_ipv4_slash_24() {
+        // Test /24 network (192.168.1.0 to 192.168.1.255)
+        let start = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 0));
+        let end = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 255));
+        let result = ip_range_to_net(start, end);
+        assert!(result.is_ok());
+        let net = result.unwrap();
+        assert_eq!(net.addr(), start);
+        assert_eq!(net.prefix_len(), 24);
+    }
+
+    #[test]
+    fn test_ip_range_to_net_ipv4_misaligned_start() {
+        // Test misaligned start address (192.168.1.1 instead of 192.168.1.0)
+        let start = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+        let end = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 255));
+        let result = ip_range_to_net(start, end);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not aligned to prefix length")
+        );
+    }
+
+    #[test]
+    fn test_ip_range_to_net_ipv6_single_address() {
+        // Test single IPv6 address range (::1 to ::1) -> /128
+        let start = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1));
+        let end = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1));
+        let result = ip_range_to_net(start, end);
+        assert!(result.is_ok());
+        let net = result.unwrap();
+        assert_eq!(net.addr(), start);
+        assert_eq!(net.prefix_len(), 128);
+    }
+
+    #[test]
+    fn test_ip_range_to_net_ipv6_slash_64() {
+        // Test /64 network (2001:db8:: to 2001:db8::ffff:ffff:ffff:ffff)
+        let start = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0));
+        let end = IpAddr::V6(Ipv6Addr::new(
+            0x2001, 0xdb8, 0, 0, 0xffff, 0xffff, 0xffff, 0xffff,
+        ));
+        let result = ip_range_to_net(start, end);
+        assert!(result.is_ok());
+        let net = result.unwrap();
+        assert_eq!(net.addr(), start);
+        assert_eq!(net.prefix_len(), 64);
+    }
+
+    #[test]
+    fn test_ip_range_to_net_ipv6_misaligned_start() {
+        // Test misaligned start address
+        let start = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+        let end = IpAddr::V6(Ipv6Addr::new(
+            0x2001, 0xdb8, 0, 0, 0xffff, 0xffff, 0xffff, 0xffff,
+        ));
+        let result = ip_range_to_net(start, end);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not aligned to prefix length")
+        );
+    }
+
+    #[test]
+    fn test_ip_range_to_net_mixed_ip_versions() {
+        // Test mixed IPv4 and IPv6 addresses
+        let start = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 0));
+        let end = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0));
+        let result = ip_range_to_net(start, end);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("must be of the same version")
+        );
     }
 }
