@@ -29,44 +29,84 @@ const SEND_BUFFER_SIZE: usize = 65535;
 const RCV_BUFFER_SIZE: usize = 65535;
 const MAX_TUN_MTU_FOR_DATAGRAMS: usize = MAX_DATAGRAM_SIZE - 50;
 
-/// Routing configurations the endpoint should apply (on the TUN device / system routes)
+/// Routing configuration updates that should be applied to the system.
+///
+/// These updates are generated during capsule processing and represent changes
+/// that need to be applied to the TUN device or system routing table.
 pub enum RoutingUpdate {
+    /// Add an IP address to the TUN interface
     AddAddress(IpNet),
+    /// Remove an IP address from the TUN interface
     RemoveAddress(IpNet),
+    /// Add a route to the system routing table
     AddRoute(IpNet),
+    /// Remove a route from the system routing table
     RemoveRoute(IpNet),
+    /// Set the MTU of the TUN interface
     SetMTU(u16),
 }
 
-/// Addresses and routes negotiated through capsule protocol.
+/// Current routing state negotiated through the CONNECT-IP capsule protocol.
+///
+/// This structure tracks all addresses and routes that have been exchanged between
+/// the local endpoint and the remote peer. It represents the agreed-upon routing
+/// configuration for the tunnel.
 #[derive(Clone, Debug)]
 pub struct RoutingState {
-    /// mtu of the tunnel
+    /// Maximum transmission unit for the tunnel in bytes
     pub mtu: u16,
-    /// addresses we assign to the peer
+    /// IP addresses assigned to the remote peer (by us)
     pub remote_addresses: Vec<IpNet>,
-    /// addresses the peer assigns to us
+    /// IP addresses assigned to us (by the remote peer)
     pub local_addresses: Vec<IpNet>,
-    /// routes we advertise to the peer
+    /// Routes we advertise to the remote peer
     pub local_routes: Vec<IpNet>,
-    /// routes the peer advertises to us
+    /// Routes advertised to us by the remote peer
     pub remote_routes: Vec<IpNet>,
 }
 
+/// CONNECT-IP endpoint managing a tunnel.
+///
+/// This endpoint is designed to be transport-agnostic - it processes protocol logic
+/// and manages internal state but doesn't perform I/O operations directly. Instead,
+/// it queues data for the caller to send/receive through the actual transport layer
+/// (QUIC connection, TUN interface, etc.).
+///
+/// The endpoint maintains separate queues for different types of data flow
+/// and manages the capsule protocol state machine for address and route negotiation.
 pub struct Endpoint {
+    /// QUIC stream ID associated with this endpoint
     pub stream_id: u64,
+    /// Current routing state negotiated with the peer
     pub routing_state: RoutingState,
+    /// Pool of IP addresses available for assignment to peers
     available_addresses: Arc<Mutex<Vec<IpNet>>>,
+    /// Optional pre-configured address to assign to the peer instead of dynamic allocation
     preconfigured_peer_address: Option<IpNet>,
+    /// Queue of routing updates to be applied to the system
     routing_updates: VecDeque<RoutingUpdate>,
+    /// Whether the peer supports QUIC datagrams
     peer_supports_datagrams: bool,
-    stream_data_received: VecDeque<u8>, // data received from the stream, not yet processed
-    stream_data_to_send: VecDeque<u8>, // needs to be sent on the stream, not yet sent due to flow control
-    datagrams_to_send: VecDeque<Vec<u8>>, // datagrams to send, not yet sent due to flow control
-    tun_packets_to_send: VecDeque<Vec<u8>>, // packets to send to the tun interface
+    /// Buffer for stream data received but not yet processed
+    stream_data_received: VecDeque<u8>,
+    /// Buffer for stream data to send, pending transmission
+    stream_data_to_send: VecDeque<u8>,
+    /// Queue of QUIC datagrams ready to send
+    datagrams_to_send: VecDeque<Vec<u8>>,
+    /// Queue of IP packets to forward via the TUN interface
+    tun_packets_to_send: VecDeque<Vec<u8>>,
 }
 
 impl Endpoint {
+    /// Creates a new endpoint for managing a CONNECT-IP tunnel.
+    ///
+    /// # Arguments
+    /// * `stream_id` - The QUIC stream ID for this endpoint
+    /// * `mtu` - Maximum transmission unit for the tunnel
+    /// * `available_addresses` - Pool of addresses available for assignment to peers
+    /// * `preconfigured_peer_address` - Optional pre-configured address to assign to the peer
+    /// * `routes` - Local routes to advertise to the peer
+    /// * `peer_supports_datagrams` - Whether the peer supports QUIC datagrams
     pub fn new(
         stream_id: u64,
         mtu: u16,
@@ -95,6 +135,17 @@ impl Endpoint {
         }
     }
 
+    /// Validates an ingress packet.
+    ///
+    /// Checks if the packet should be forwarded to the TUN interface, dropped,
+    /// or if an ICMP error response should be sent. Validates packet size against
+    /// MTU and checks source/destination addresses against negotiated addresses and routes.
+    ///
+    /// # Arguments
+    /// * `packet` - The IP packet received (from the QUIC connection)
+    ///
+    /// # Returns
+    /// A `ForwardingDecision` indicating how to handle the packet
     pub fn check_ingress_packet(&mut self, packet: &[u8]) -> ForwardingDecision {
         if packet.len() > self.routing_state.mtu as usize {
             debug!(
@@ -141,6 +192,17 @@ impl Endpoint {
         )
     }
 
+    /// Validates an egress packet.
+    ///
+    /// Checks if the packet should be forwarded over the QUIC connection, dropped,
+    /// or if an ICMP error response should be sent. Validates packet size against
+    /// MTU and checks source/destination addresses against negotiated addresses and routes.
+    ///
+    /// # Arguments
+    /// * `packet` - The IP packet received (from the TUN interface)
+    ///
+    /// # Returns
+    /// A `ForwardingDecision` indicating how to handle the packet
     pub fn check_egress_packet(&mut self, packet: &[u8]) -> ForwardingDecision {
         if packet.len() > self.routing_state.mtu as usize {
             debug!(
@@ -189,11 +251,27 @@ impl Endpoint {
         )
     }
 
-    pub async fn forward_ingress_packet(&mut self, packet: &[u8]) -> Result<()> {
+    /// Queues a packet to be forwarded locally.
+    ///
+    /// This method is called for packets received from the QUIC connection that
+    /// should be forwarded to the local network.
+    ///
+    /// # Arguments
+    /// * `packet` - The IP packet to forward (to the TUN interface)
+    pub fn forward_ingress_packet(&mut self, packet: &[u8]) -> Result<()> {
         self.tun_packets_to_send.push_back(packet.to_vec());
         Ok(())
     }
 
+    /// Queues a packet to be sent over the QUIC connection.
+    ///
+    /// Encapsulates the packet appropriately based on whether the peer supports
+    /// QUIC datagrams. If datagrams are supported and the MTU allows, the packet
+    /// is sent as a datagram. Otherwise, it's wrapped in a datagram capsule and
+    /// sent over the stream.
+    ///
+    /// # Arguments
+    /// * `packet` - The IP packet to forward over the QUIC connection
     pub fn forward_egress_packet(&mut self, packet: &[u8]) -> Result<()> {
         let mut buf = [0; MAX_TUN_MTU + 32];
         if self.peer_supports_datagrams
@@ -221,6 +299,17 @@ impl Endpoint {
         Ok(())
     }
 
+    /// Writes pending stream data into the provided buffer.
+    ///
+    /// Retrieves data from the send queue that should be transmitted on the QUIC stream.
+    /// The data is removed from the queue after being copied to the output buffer.
+    ///
+    /// # Arguments
+    /// * `out` - Buffer to write the stream data into
+    /// * `len` - Maximum number of bytes to write
+    ///
+    /// # Returns
+    /// The number of bytes actually written to the buffer
     pub fn send_stream_data(&mut self, out: &mut [u8], len: usize) -> usize {
         self.stream_data_to_send.make_contiguous();
         let to_send = self.stream_data_to_send.as_slices().0;
@@ -236,6 +325,14 @@ impl Endpoint {
         send_len
     }
 
+    /// Returns stream data to the front of the send queue.
+    ///
+    /// Used when data was retrieved for sending but couldn't be sent due to
+    /// flow control or other issues. The data is added back to the front of
+    /// the queue to preserve ordering.
+    ///
+    /// # Arguments
+    /// * `data` - The data to return to the send queue
     pub fn return_stream_data(&mut self, data: &[u8]) {
         // Add data to the front of the send buffer
         for &byte in data.iter().rev() {
@@ -243,6 +340,14 @@ impl Endpoint {
         }
     }
 
+    /// Processes incoming data from the QUIC stream.
+    ///
+    /// Buffers the received data and attempts to parse and process complete capsules.
+    /// Handles partial capsules by keeping incomplete data in the buffer for later
+    /// processing when more data arrives.
+    ///
+    /// # Arguments
+    /// * `data` - The data received from the QUIC stream
     pub async fn recv_stream_data(&mut self, data: &[u8]) -> Result<()> {
         self.stream_data_received.extend(data);
         let mut consumed = 0;
@@ -267,23 +372,63 @@ impl Endpoint {
         Ok(())
     }
 
+    /// Retrieves and removes the next routing update from the queue.
+    ///
+    /// This method should be called repeatedly after processing capsules to retrieve
+    /// all pending routing updates that need to be applied to the system. Updates are
+    /// returned in the order they were generated during capsule processing.
+    ///
+    /// The routing updates must be applied to the systems routing table (or TUN interface)
+    /// for proper packet forwarding. Before applying updates, they should be validated
+    /// against local policy and checked for conflicts with existing routes.
+    ///
+    /// # Returns
+    /// - `Some(RoutingUpdate)` if there are pending updates in the queue
+    /// - `None` if all updates have been processed
     pub fn next_routing_update(&mut self) -> Option<RoutingUpdate> {
         self.routing_updates.pop_front()
     }
 
+    /// Retrieves the next packet to forward locally.
+    /// Since we imagine this to be a TUN interface, the method is named accordingly.
+    ///
+    /// # Returns
+    /// - `Some(Vec<u8>)` containing the next packet if available
+    /// - `None` if no packets are queued
     pub fn send_tun_packet(&mut self) -> Option<Vec<u8>> {
         self.tun_packets_to_send.pop_front()
     }
 
+    /// Retrieves the next datagram to send over the QUIC connection.
+    ///
+    /// # Returns
+    /// - `Some(Vec<u8>)` containing the next datagram if available
+    /// - `None` if no datagrams are queued
     pub fn send_datagram(&mut self) -> Option<Vec<u8>> {
         self.datagrams_to_send.pop_front()
     }
 
+    /// Returns a datagram to the front of the send queue.
+    ///
+    /// Used when a datagram was retrieved for sending but couldn't be sent due to
+    /// flow control or other issues. The datagram is added back to the front of
+    /// the queue to preserve ordering.
+    ///
+    /// # Arguments
+    /// * `data` - The datagram to return to the send queue
     pub fn return_datagram(&mut self, data: &[u8]) {
         self.datagrams_to_send.push_front(data.to_vec());
     }
 
-    pub async fn recv_datagram(&mut self, data: &[u8]) -> Result<()> {
+    /// Processes an incoming QUIC datagram.
+    ///
+    /// Parses the datagram format (stream ID, context ID, and IP packet),
+    /// validates the packet, and queues it for forwarding to the TUN interface
+    /// if valid. May generate ICMP error responses for invalid packets.
+    ///
+    /// # Arguments
+    /// * `data` - The datagram data received from the QUIC connection
+    pub fn recv_datagram(&mut self, data: &[u8]) -> Result<()> {
         let mut octets = Octets::with_slice(data);
 
         // The datagram format is:
@@ -311,7 +456,7 @@ impl Endpoint {
                 return Ok(());
             }
             ForwardingDecision::Forward => {
-                self.forward_ingress_packet(ip_packet).await?;
+                self.forward_ingress_packet(ip_packet)?;
             }
             ForwardingDecision::RespondWithIcmp(icmp_type) => {
                 if let Some(icmp_response) = build_icmp_response(ip_packet, icmp_type) {
@@ -324,6 +469,12 @@ impl Endpoint {
         Ok(())
     }
 
+    /// Serializes and queues a capsule for transmission on the QUIC stream.
+    ///
+    /// # Arguments
+    /// * `capsule` - The capsule to send
+    /// * `must_succeed` - If true, the capsule is always queued even if the send buffer
+    ///   is full. If false, the capsule may be dropped if the buffer is full.
     pub fn send_capsule(&mut self, capsule: &Capsule, must_succeed: bool) -> Result<()> {
         let mut buf = [0; MAX_TUN_MTU + 32];
         let mut octets = OctetsMut::with_slice(&mut buf);
@@ -340,7 +491,18 @@ impl Endpoint {
         Ok(())
     }
 
-    pub async fn process_capsule_data(&mut self, start: usize) -> Result<usize> {
+    /// Parses and processes a single capsule from the receive buffer.
+    ///
+    /// Handles different capsule types including address assignments, address requests,
+    /// route advertisements, and datagrams. Updates routing state and generates routing
+    /// updates as appropriate.
+    ///
+    /// # Arguments
+    /// * `start` - Offset in the receive buffer where capsule parsing should begin
+    ///
+    /// # Returns
+    /// The number of bytes consumed from the buffer
+    async fn process_capsule_data(&mut self, start: usize) -> Result<usize> {
         self.stream_data_received.make_contiguous();
         let mut octets = Octets::with_slice(&self.stream_data_received.as_slices().0[start..]);
         let capsule = Capsule::parse(&mut octets)?;
@@ -382,8 +544,7 @@ impl Endpoint {
                         return Ok(len);
                     }
                     ForwardingDecision::Forward => {
-                        self.forward_ingress_packet(&datagram_capsule.data[packet_start..])
-                            .await?;
+                        self.forward_ingress_packet(&datagram_capsule.data[packet_start..])?;
                     }
                 }
             }
@@ -424,6 +585,7 @@ impl Endpoint {
 
                 if !addresses_no_longer_valid.is_empty() {
                     // Removing addresses can have the effect that routes are removed aswell. Re-add all routes.
+                    // TODO: this could be moved to the caller since it is specific to system routing table management
                     for route in self
                         .routing_state
                         .remote_addresses
@@ -505,8 +667,6 @@ impl Endpoint {
             Capsule::RouteAdvertisement(route_capsule) => {
                 trace!("received RouteAdvertisement capsule: {:?}", route_capsule);
 
-                // TODO: add some validation here
-
                 // remove old routes
                 for route in self.routing_state.remote_routes.iter() {
                     self.routing_updates
@@ -528,6 +688,12 @@ impl Endpoint {
         Ok(len)
     }
 
+    /// Performs initial routing setup when establishing a new connection.
+    ///
+    /// Assigns an address to the peer (either from the preconfigured address or from
+    /// the address pool) and advertises local routes. This should be called once when
+    /// a new CONNECT-IP tunnel is established. Can be omitted if address assignment
+    /// and route advertisement capsules are exchanged through other means.
     pub async fn handle_initial_routing_setup(&mut self) -> Result<()> {
         // Assign a /128 IPv6 or /32 IPv4 address from the address pool to peer
         let mut assigned_addresses = vec![];

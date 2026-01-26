@@ -379,7 +379,7 @@ impl Connection {
             // Receive datagrams from QUIC and forward to TUN
             while let Ok(len) = self.conn.dgram_recv(&mut buf) {
                 if let Some(connect_ip_endpoint) = &mut self.connect_ip_endpoint {
-                    connect_ip_endpoint.recv_datagram(&buf[..len]).await?;
+                    connect_ip_endpoint.recv_datagram(&buf[..len])?;
                 } else {
                     debug!("Connect-IP connection not established yet, dropping datagram.");
                 }
