@@ -1,5 +1,6 @@
+use std::path::PathBuf;
 use std::str::FromStr;
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
 use ipnet::IpNet;

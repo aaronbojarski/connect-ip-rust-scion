@@ -264,8 +264,9 @@ pub fn check_packet_src_dst(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    use super::*;
 
     #[test]
     fn test_ip_range_to_net_ipv4_single_address() {
