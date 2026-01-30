@@ -6,7 +6,6 @@ use clap::{Args, Parser, Subcommand};
 use ipnet::IpNet;
 use scion_proto::path::policy::acl::AclPolicy;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
 use url::Url;
 
 pub const DEFAULT_TUN_NAME: &str = "tun0";
@@ -363,7 +362,7 @@ pub fn combine_proxy_config(
             key_path,
             routes,
             address_pool,
-            configured_clients: Arc::new(Mutex::new(configured_clients)),
+            configured_clients: Arc::new(configured_clients),
             tun_mtu: mtu,
         },
         log_level,

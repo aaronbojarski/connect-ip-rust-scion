@@ -49,7 +49,7 @@ pub struct ProxyConfig {
     pub key_path: std::path::PathBuf,
     pub routes: Vec<IpNet>,
     pub address_pool: Vec<IpNet>,
-    pub configured_clients: Arc<Mutex<HashMap<String, IpNet>>>,
+    pub configured_clients: Arc<HashMap<String, IpNet>>,
     pub tun_mtu: u16,
 }
 
@@ -58,6 +58,8 @@ pub struct Proxy {
     quic_config: quiche::Config,
     token_key: ring::hmac::Key,
     conn_id_seed: ring::hmac::Key,
+    tx_quic_to_udp: mpsc::Sender<UdpPacket>,
+    rx_quic_to_udp: mpsc::Receiver<UdpPacket>,
     connections: Arc<Mutex<HashMap<quiche::ConnectionId<'static>, ConnectionInfo>>>,
     active_clients: Arc<Mutex<HashMap<String, ActiveKnownClient>>>,
     available_addresses: Arc<Mutex<Vec<IpNet>>>,
@@ -72,6 +74,9 @@ impl Proxy {
             &config.cert_path,
             &config.key_path,
         )?;
+        // Channel for sending UDP packets
+        let (tx_quic_to_udp, rx_quic_to_udp) = mpsc::channel::<UdpPacket>(MAIN_CHANNEL_CAPACITY);
+
         Ok(Proxy {
             config,
             quic_config,
@@ -79,6 +84,8 @@ impl Proxy {
                 .unwrap(),
             conn_id_seed: ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &SystemRandom::new())
                 .unwrap(),
+            tx_quic_to_udp,
+            rx_quic_to_udp,
             connections: Arc::new(Mutex::new(HashMap::new())),
             active_clients: Arc::new(Mutex::new(HashMap::new())),
             available_addresses,
@@ -87,10 +94,6 @@ impl Proxy {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        // Channel for sending UDP packets
-        let (tx_quic_to_udp, mut rx_quic_to_udp) =
-            mpsc::channel::<UdpPacket>(MAIN_CHANNEL_CAPACITY);
-
         let mut buf = vec![0; UDP_PACKET_BUFFER_SIZE];
 
         if self.config.listen.isd_asn() == IsdAsn::WILDCARD {
@@ -104,17 +107,22 @@ impl Proxy {
             loop {
                 tokio::select! {
                     // Receive datagram from UDP socket
-                    Ok((len, src)) = socket.recv_from(&mut buf) => {
-                        let src_scion = scion_proto::address::SocketAddr::from_std(
-                            IsdAsn::WILDCARD,
-                            src,
-                        );
-                        trace!("received {} bytes on socket from {}", len, src);
-                        self.handle_udp_packet(&mut buf[..len], src, src_scion, local_addr, self.config.listen, &tx_quic_to_udp).await?;
+                    result = socket.recv_from(&mut buf) => {
+                        if let Ok((len, src)) = result {
+                            let src_scion = scion_proto::address::SocketAddr::from_std(
+                                IsdAsn::WILDCARD,
+                                src,
+                            );
+                            trace!("received {} bytes on socket from {}", len, src);
+                            self.handle_udp_packet(&mut buf[..len], src, src_scion, local_addr, self.config.listen).await?;
+                        } else {
+                            error!("Error receiving from UDP socket: {:?}", result);
+                            return Err(anyhow!("Error receiving from UDP socket"));
+                        }
                     }
 
                     // Send QUIC packets over UDP socket
-                    Some(packet_data) = rx_quic_to_udp.recv() => {
+                    Some(packet_data) = self.rx_quic_to_udp.recv() => {
                         let dst = if let Some(addr) = packet_data.dst.local_address() {
                             addr
                         } else {
@@ -179,20 +187,25 @@ impl Proxy {
             loop {
                 tokio::select! {
                     // Receive datagram from UDP socket
-                    Ok((len, src)) = socket.recv_from(&mut buf) => {
-                        let src_ip_addr = match src.local_address() {
-                            Some(addr) => addr,
-                            None => {
-                                warn!("Could not get source IP address from SCION SocketAddr.");
-                                continue;
-                            }
-                        };
-                        trace!("received {} bytes on socket from {}", len, src);
-                        self.handle_udp_packet(&mut buf[..len], src_ip_addr, src, local_addr, local_scion_addr, &tx_quic_to_udp).await?;
+                    result = socket.recv_from(&mut buf) => {
+                        if let Ok((len, src)) = result {
+                            let src_ip_addr = match src.local_address() {
+                                Some(addr) => addr,
+                                None => {
+                                    warn!("Could not get source IP address from SCION SocketAddr.");
+                                    continue;
+                                }
+                            };
+                            trace!("received {} bytes on socket from {}", len, src);
+                            self.handle_udp_packet(&mut buf[..len], src_ip_addr, src, local_addr, local_scion_addr).await?;
+                        } else {
+                            error!("Error receiving from SCION socket: {:?}", result);
+                            return Err(anyhow!("Error receiving from SCION socket"));
+                        }
                     }
 
                     // Send QUIC packets over UDP socket
-                    Some(packet_data) = rx_quic_to_udp.recv() => {
+                    Some(packet_data) = self.rx_quic_to_udp.recv() => {
                         socket.send_to(&packet_data.data, packet_data.dst).await?;
                         trace!("sent {} bytes on socket to {}", packet_data.data.len(), packet_data.dst);
                     }
@@ -208,7 +221,6 @@ impl Proxy {
         src_scion_socket: scion_proto::address::SocketAddr,
         local_ip_socket: std::net::SocketAddr,
         local_scion_socket: scion_proto::address::SocketAddr,
-        tx_quic_to_udp: &mpsc::Sender<UdpPacket>,
     ) -> Result<()> {
         // Parse the QUIC packet header to identify connection
         let hdr = match quiche::Header::from_slice(buf, quiche::MAX_CONN_ID_LEN) {
@@ -270,7 +282,7 @@ impl Proxy {
                 };
 
                 // We use try_send here to avoid a deadlock
-                match tx_quic_to_udp.try_send(packet) {
+                match self.tx_quic_to_udp.try_send(packet) {
                     Ok(_) => {}
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                         trace!("QUIC to UDP channel full, dropping version negotiation packet");
@@ -316,7 +328,7 @@ impl Proxy {
                 };
 
                 // We use try_send here to avoid a deadlock
-                match tx_quic_to_udp.try_send(packet) {
+                match self.tx_quic_to_udp.try_send(packet) {
                     Ok(_) => {}
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                         trace!("QUIC to UDP channel full, dropping retry packet");
@@ -393,38 +405,30 @@ impl Proxy {
             let tun_name = format!("cirs{}", self.next_client);
 
             // Update next client index. On overflow, so after about 4 billion connections,
-            // we abort all active connections and start from 0 again. This is unlikely to happen in practice.
+            // we start from 0 again and therefore start reusing tun names. It is unlikely that the
+            // connection that was previously assigned this tun name is still active.
             // If we have one new connection per second it will take more than 100 years.
-            match self.next_client.checked_add(1) {
-                Some(n) => self.next_client = n,
-                None => {
-                    self.next_client = 0;
-                    let mut connections_lock = self.connections.lock().await;
-                    for (_conn_id, conn_info) in connections_lock.drain() {
-                        conn_info.cancel_token.cancel();
-                    }
-                }
-            }
+            self.next_client = self.next_client.wrapping_add(1);
 
             let config = Config {
+                scid: scid.clone().into_owned(),
                 tun_name,
                 local_isd_as: local_scion_socket.isd_asn(),
                 remote_isd_as: src_scion_socket.isd_asn(),
                 mtu: self.config.tun_mtu,
                 routes: self.config.routes.clone(),
+                available_addresses: self.available_addresses.clone(),
+                configured_clients: self.config.configured_clients.clone(),
+                active_clients: self.active_clients.clone(),
             };
 
             // Store connection info
             let mut client_conn = Connection::new(
                 config,
-                scid.clone().into_owned(),
                 conn,
                 rx_from_main,
-                tx_quic_to_udp.clone(),
+                self.tx_quic_to_udp.clone(),
                 cancel_token.clone(),
-                self.available_addresses.clone(),
-                self.config.configured_clients.clone(),
-                self.active_clients.clone(),
             );
             self.connections.lock().await.insert(
                 scid.clone().into_owned(),

@@ -25,16 +25,19 @@ struct PartialResponse {
 }
 
 pub struct Config {
+    pub scid: quiche::ConnectionId<'static>,
     pub tun_name: String,
     pub local_isd_as: IsdAsn,
     pub remote_isd_as: IsdAsn,
     pub mtu: u16,
     pub routes: Vec<IpNet>,
+    pub available_addresses: Arc<Mutex<Vec<IpNet>>>,
+    pub configured_clients: Arc<HashMap<String, IpNet>>,
+    pub active_clients: Arc<Mutex<HashMap<String, ActiveKnownClient>>>,
 }
 
 pub struct Connection {
     pub config: Config,
-    scid: quiche::ConnectionId<'static>,
     conn: quiche::Connection,
     h3_conn: Option<quiche::h3::Connection>,
     pub connect_ip_endpoint: Option<crate::connect_ip::Endpoint>,
@@ -45,9 +48,6 @@ pub struct Connection {
     tx_quic_to_tun: mpsc::Sender<Vec<u8>>,
     tx_routing_updates: mpsc::Sender<connect_ip::RoutingUpdate>,
     cancel_token: CancellationToken,
-    available_addresses: Arc<Mutex<Vec<IpNet>>>,
-    configured_clients: Arc<Mutex<HashMap<String, IpNet>>>,
-    active_clients: Arc<Mutex<HashMap<String, ActiveKnownClient>>>,
     partial_responses: HashMap<u64, PartialResponse>,
     assign_addresses_and_routes_done: bool,
     client_cert_timer: std::time::Instant,
@@ -59,14 +59,10 @@ pub struct Connection {
 impl Connection {
     pub fn new(
         config: Config,
-        scid: quiche::ConnectionId<'static>,
         conn: quiche::Connection,
         rx_udp_to_quic: mpsc::Receiver<UdpPacket>,
         tx_quic_to_udp: mpsc::Sender<UdpPacket>,
         cancel_token: CancellationToken,
-        available_addresses: Arc<Mutex<Vec<IpNet>>>,
-        configured_clients: Arc<Mutex<HashMap<String, IpNet>>>,
-        active_clients: Arc<Mutex<HashMap<String, ActiveKnownClient>>>,
     ) -> Self {
         // Channels between TUN and QUIC tasks. Contents are IP packets.
         let (tx_quic_to_tun, rx_quic_to_tun) = mpsc::channel::<Vec<u8>>(CLIENT_CHANNEL_CAPACITY);
@@ -88,7 +84,6 @@ impl Connection {
 
         Connection {
             config,
-            scid,
             conn,
             h3_conn: None,
             connect_ip_endpoint: None,
@@ -99,9 +94,6 @@ impl Connection {
             tx_quic_to_tun,
             tx_routing_updates,
             cancel_token,
-            available_addresses,
-            active_clients,
-            configured_clients,
             partial_responses: HashMap::new(),
             assign_addresses_and_routes_done: false,
             client_cert_timer: std::time::Instant::now(),
@@ -459,7 +451,7 @@ impl Connection {
         }
         if let Some(cn) = &self.client_cert_subject_cn {
             info!("client certificate CN: {}", cn);
-            let mut active_clients_guard = self.active_clients.lock().await;
+            let mut active_clients_guard = self.config.active_clients.lock().await;
 
             // Check for existing connection for this client
             let existing_connection = active_clients_guard.get(cn).cloned();
@@ -501,14 +493,14 @@ impl Connection {
             active_clients_guard.insert(
                 cn.clone(),
                 ActiveKnownClient {
-                    conn_id: self.scid.clone(),
+                    conn_id: self.config.scid.clone(),
                     tun_name: self.config.tun_name.clone(),
                     cancel_token: self.cancel_token.clone(),
                 },
             );
 
             // Check for preconfigured peer address
-            self.preconfigured_peer_address = self.configured_clients.lock().await.get(cn).cloned();
+            self.preconfigured_peer_address = self.config.configured_clients.get(cn).cloned();
         }
         Ok(())
     }
@@ -680,7 +672,7 @@ impl Connection {
                 let connect_ip_endpoint = Endpoint::new(
                     stream_id,
                     negotiated_mtu,
-                    self.available_addresses.clone(),
+                    self.config.available_addresses.clone(),
                     self.preconfigured_peer_address,
                     self.config.routes.clone(),
                     self.conn.dgram_max_writable_len().is_some(),
