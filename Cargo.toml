@@ -7,6 +7,9 @@ edition = "2024"
 anyhow = "1.0.100"
 clap = { version = "4", features = ["derive"] }
 ipnet = { version = "2.11.0", features = ["serde"] }
+metrics = "0.24.3"
+metrics-exporter-prometheus = "0.18.1"
+metrics-util = "0.20.1"
 octets = "0.3.3"
 pnet = "0.35.0"
 quiche = "0.24.6"
