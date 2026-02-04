@@ -6,6 +6,7 @@ use connect_ip_rust_scion::config::{
 };
 
 fn main() -> Result<(), anyhow::Error> {
+    install_rustls_crypto_provider()?;
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Proxy(opt) => run_proxy(opt),
@@ -63,4 +64,9 @@ async fn run_client(opt: ClientOpt) -> Result<(), anyhow::Error> {
     let client = connect_ip_rust_scion::client::Client::new(config);
     client.run().await?;
     Ok(())
+}
+
+fn install_rustls_crypto_provider() -> Result<(), anyhow::Error> {
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider())
+        .map_err(|err| anyhow!("failed to install rustls ring CryptoProvider: {err:?}"))
 }

@@ -13,6 +13,7 @@ octets = "0.3.3"
 pnet = "0.35.0"
 quiche = "0.24.6"
 ring = "0.17.14"
+rustls = { version = "0.23.36", default-features = false, features = ["std", "ring"] }
 scion-proto = { git = "https://github.com/Anapaya/scion-sdk.git", rev = "4ff09c1b1621570d1f25af149f390addf15a2de6" }
 scion-stack = { git = "https://github.com/Anapaya/scion-sdk.git", rev = "4ff09c1b1621570d1f25af149f390addf15a2de6" }
 serde = "1.0.228"
