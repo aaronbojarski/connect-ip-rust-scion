@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use ipnet::IpNet;
+use quiche::ConnectionId;
 use ring::rand::SystemRandom;
 use scion_proto::address::IsdAsn;
 use scion_proto::path::policy::acl::AclPolicy;
@@ -231,16 +232,16 @@ impl Proxy {
             }
         };
 
-        let conn_id = ring::hmac::sign(&self.conn_id_seed, &hdr.dcid);
-        let conn_id = &conn_id.as_ref()[..quiche::MAX_CONN_ID_LEN];
-        let conn_id = conn_id.to_vec().into();
-
         // Check if this is an existing connection (by dcid or derived conn_id)
         let client_conn_sender = {
             let connections_lock = self.connections.lock().await;
             connections_lock
                 .get(&hdr.dcid)
-                .or_else(|| connections_lock.get(&conn_id))
+                .or_else(|| {
+                    let conn_id = ring::hmac::sign(&self.conn_id_seed, &hdr.dcid);
+                    let conn_id = &conn_id.as_ref()[..quiche::MAX_CONN_ID_LEN].to_vec().into();
+                    connections_lock.get(&conn_id)
+                })
                 .cloned()
         };
         if let Some(client_conn) = client_conn_sender {
@@ -293,6 +294,11 @@ impl Proxy {
                 }
                 return Ok(());
             }
+
+            let conn_id = ring::hmac::sign(&self.conn_id_seed, &hdr.dcid);
+            let conn_id: ConnectionId = (&conn_id.as_ref()[..quiche::MAX_CONN_ID_LEN])
+                .to_vec()
+                .into();
 
             let mut scid = [0; quiche::MAX_CONN_ID_LEN];
             scid.copy_from_slice(&conn_id);
