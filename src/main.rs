@@ -1,14 +1,9 @@
-use std::time::Duration;
-
 use anyhow::anyhow;
 use clap::Parser;
 use connect_ip_rust_scion::config::{
     Cli, ClientOpt, Command, ProxyOpt, combine_client_config, combine_proxy_config,
     load_client_config_from_file, load_proxy_config_from_file,
 };
-use metrics::{counter, describe_counter, describe_histogram, gauge, histogram};
-use metrics_exporter_prometheus::PrometheusBuilder;
-use metrics_util::MetricKindMask;
 
 fn main() -> Result<(), anyhow::Error> {
     let cli = Cli::parse();
@@ -40,16 +35,6 @@ async fn run_proxy(opt: ProxyOpt) -> Result<(), anyhow::Error> {
         .with_max_level(log_level)
         .try_init()
         .map_err(|err| anyhow!("failed to init tracing: {err}"))?;
-
-    let builder = PrometheusBuilder::new();
-    builder
-        .idle_timeout(
-            MetricKindMask::COUNTER | MetricKindMask::HISTOGRAM,
-            Some(Duration::from_secs(10)),
-        )
-        .install()
-        .expect("failed to install Prometheus recorder");
-    counter!("idle_metric").increment(1);
 
     let mut proxy = connect_ip_rust_scion::proxy::Proxy::new(config)?;
     proxy.run().await?;

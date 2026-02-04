@@ -7,6 +7,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use ipnet::IpNet;
+use metrics::{counter, describe_counter, describe_gauge, gauge};
+use metrics_exporter_prometheus::PrometheusBuilder;
+
 use quiche::ConnectionId;
 use ring::rand::SystemRandom;
 use scion_proto::address::IsdAsn;
@@ -97,6 +100,20 @@ impl Proxy {
     pub async fn run(&mut self) -> Result<()> {
         let mut buf = vec![0; UDP_PACKET_BUFFER_SIZE];
 
+        let builder = PrometheusBuilder::new();
+        builder
+            .with_http_listener(
+                "127.0.0.1:9000"
+                    .parse::<std::net::SocketAddr>()
+                    .expect("invalid socket address"),
+            )
+            .install()
+            .expect("failed to install Prometheus recorder");
+        describe_gauge!("active_connections", "Number of active connections");
+        describe_counter!("total_connections", "Total number of connections handled");
+        describe_counter!("total_packets_received", "Total number of packets received");
+        describe_counter!("total_packets_sent", "Total number of packets sent");
+
         if self.config.listen.isd_asn() == IsdAsn::WILDCARD {
             let local_addr = self
                 .config
@@ -116,6 +133,7 @@ impl Proxy {
                             );
                             trace!("received {} bytes on socket from {}", len, src);
                             self.handle_udp_packet(&mut buf[..len], src, src_scion, local_addr, self.config.listen).await?;
+                            counter!("total_packets_received").increment(1);
                         } else {
                             error!("Error receiving from UDP socket: {:?}", result);
                             return Err(anyhow!("Error receiving from UDP socket"));
@@ -132,6 +150,7 @@ impl Proxy {
                         };
                         socket.send_to(&packet_data.data, dst).await?;
                         trace!("sent {} bytes on socket to {}", packet_data.data.len(), dst);
+                        counter!("total_packets_sent").increment(1);
                     }
                 }
             }
@@ -199,6 +218,7 @@ impl Proxy {
                             };
                             trace!("received {} bytes on socket from {}", len, src);
                             self.handle_udp_packet(&mut buf[..len], src_ip_addr, src, local_addr, local_scion_addr).await?;
+                            counter!("total_packets_received").increment(1);
                         } else {
                             error!("Error receiving from SCION socket: {:?}", result);
                             return Err(anyhow!("Error receiving from SCION socket"));
@@ -209,6 +229,7 @@ impl Proxy {
                     Some(packet_data) = self.rx_quic_to_udp.recv() => {
                         socket.send_to(&packet_data.data, packet_data.dst).await?;
                         trace!("sent {} bytes on socket to {}", packet_data.data.len(), packet_data.dst);
+                        counter!("total_packets_sent").increment(1);
                     }
                 }
             }
@@ -444,12 +465,15 @@ impl Proxy {
                 },
             );
 
+            counter!("total_connections").increment(1);
+
             // Spawn task for this connection
             let scid_owned = scid.clone().into_owned();
             let connections_clone = self.connections.clone();
             let available_nets = self.available_addresses.clone();
             let active_clients_clone = self.active_clients.clone();
             tokio::spawn(async move {
+                gauge!("active_connections").increment(1);
                 if let Err(e) = client_conn
                     .handle_client_connection()
                     .instrument(tracing::info_span!("connection", scid = ?scid_owned))
@@ -479,6 +503,7 @@ impl Proxy {
                         active_clients_lock.remove(&client_addr);
                     }
                 }
+                gauge!("active_connections").decrement(1);
             });
         } else {
             trace!("packet for unknown connection with dcid {:?}", hdr.dcid);
