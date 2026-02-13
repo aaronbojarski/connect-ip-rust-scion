@@ -70,20 +70,14 @@
             "listening_addr": "10.248.200.20:10243",
             "data_plane": {
                 "isd_as": "2-4",
-                "listening_addr": "10.248.200.20:10244",
-                "address_range": [
-                    "10.1.0.0/24"
-                ]
+                "listening_addr": "10.248.200.20:10244"
             }
         },
         {
             "listening_addr": "10.248.100.20:10143",
             "data_plane": {
                 "isd_as": "1-4",
-                "listening_addr": "10.248.100.20:10144",
-                "address_range": [
-                    "10.2.0.0/24"
-                ]
+                "listening_addr": "10.248.100.20:10144"
             }
         }
     ],
