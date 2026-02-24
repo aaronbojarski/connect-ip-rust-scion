@@ -11,7 +11,6 @@ req_extensions = v3_req
 subjectAltName = @alt_names
 [ alt_names ]
 DNS.1 = CIRS-Proxy
-IP.1  = 10.248.100.11
 EOF
 
 # Generate CA (EC P-256)
