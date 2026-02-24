@@ -22,7 +22,7 @@ To build connect-ip-rust-scion from source, clone the repository and use Cargo t
 ```bash
 cargo build --release
 ```
-The compiled binaries will be located in the `target/release` directory.
+The compiled binary with the name `connect-ip-rust-scion` will be located in the `target/release` directory.
 
 For building on Windows, additional steps are required. They are outlined in [windows.md](windows.md).
 
@@ -83,6 +83,7 @@ This config file also assumes that all certificates, the key, and the SNAP token
 
 
 ## Usage
+Both proxy and client use the same binary and can be started with the appropriate subcommand and config file.
 ### Proxy
 ```
 ./connect-ip-rust-scion proxy --config proxy-config.json
