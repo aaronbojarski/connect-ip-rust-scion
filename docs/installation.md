@@ -108,7 +108,7 @@ sudo systemctl start connect-ip-scion-client.service
 
 
 ## Example Application: SSH
-Once a tunnel is established, you can use SSH over the tunnel. For example, if the client assigned the IP address `10.248.1.1` to the proxy, you can SSH into the proxy machine with.
+Once a tunnel is established, you can use SSH through it. For example, if the client assigned the IP address `10.248.1.1` to the proxy, you can SSH into the proxy machine with.
 ```bash
 ssh user@10.248.1.1
 ```
