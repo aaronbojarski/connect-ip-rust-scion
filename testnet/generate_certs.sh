@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Create an OpenSSL SAN config for the proxy cert (includes DNS "CIRS-Proxy" and the proxy IP)
+# Create an OpenSSL SAN config for the proxy cert (includes DNS "CIRS-Proxy")
 cat > san.cnf <<EOF
 [ req ]
 distinguished_name = req_distinguished_name
