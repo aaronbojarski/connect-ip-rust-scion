@@ -1,17 +1,5 @@
 # Deployment
-This document provides some guidance on deploying the connect-ip-rust-scion implementation in different network scenarios. It outlines the necessary configurations for both the client and proxy components to establish a Connect-IP tunnel over SCION.
-
-## Prerequisites
-Before deploying connect-ip-rust-scion, ensure that the following prerequisites are met:
-- SCION
-    - Endhost API reachable in the AS where the client/proxy is deployed
-    - Each endpoint that is connected via SNAP must have a valid token. This usually conserns client endpoints, but can also be relevant for proxies in some scenarios.
-- Linux OS on the deployment machines (for TUN interface support)
-    - Necessary permissions to create and manage TUN interfaces on the deployment machines.
-- Certificates
-    - Valid TLS certificates for secure QUIC connections between clients and proxies.
-    - Can be from self-signed CA, if CA key can be kept secret. CA certificate must be available to proxies and clients.
-
+This document provides some guidance on deploying the connect-ip-rust-scion implementation in different network scenarios. Installation and configuration instructions can be found in [installation.md](installation.md).
 
 ## Remote Client
 ### Network Configuration
@@ -33,22 +21,12 @@ In this deployment scenario, the client is located in a remote network (e.g., ho
 │  Remote Client   │◄────────────────────────────────────►│  Proxy   │
 │                  │                                      │          │
 │  Assigned IP:    │                                      └──────────┘
-│  10.0.0.130      │          Routes announced: 10.0.0.0/24
-│                  │          Address pool: 10.0.0.128/25
+│  10.0.0.130      │                              Routes announced: 10.0.0.0/24
+│                  │                              Address pool:     10.0.0.128/25
 └──────────────────┘
 ```
 
 The client can then reach resources in the local network behind the proxy using the assigned IP address.
-
-#### Client
-```
-./connect-ip-client-scion PROXY_SCION_ADDRESS
-```
-
-#### Proxy
-```
-./connect-ip-proxy-scion --listen PROXY_SCION_ADDRESS --routes 10.0.0.0/24 --address_pool 10.0.0.128/25
-```
 
 ## Site to Site
 ### Network Configuration

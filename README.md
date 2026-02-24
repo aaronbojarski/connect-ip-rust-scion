@@ -32,10 +32,10 @@ cargo test
 
 
 ## Usage
-The `connect-ip-rust-scion` binary provides two subcommands: `proxy` and `client`. Both require sudo privileges for the configuration of the tun interface.
+The `connect-ip-rust-scion` binary provides two subcommands: `proxy` and `client`. Both require sudo privileges for the configuration of the tun interface. They can be configured using command line arguments or a config file. For more details on the installation and configuration options, please refer to [docs/installation.md](docs/installation.md).
 
 ### Proxy
-The proxy subcommand starts the Connect-IP proxy server. It listens for incoming client connections and forwards traffic between the SCION network and the tun interface.
+The proxy subcommand starts the Connect-IP proxy server. It listens for incoming client connections and forwards traffic from the client to the tun interface and vice versa.
 ```console
 sudo ./connect-ip-rust-scion proxy --listen [SCION_ADDRESS]:PORT --endhost-api ENDHOST_API_ADDRESS --routes ROUTES --address-pool ADDRESS_POOL
 ```
@@ -48,14 +48,14 @@ The proxy requires the following parameters:
 All other options can be viewed by running with the `--help` flag.
 
 ### Client
-The client subcommand starts the Connect-IP client. It connects to the proxy server and forwards traffic between the tun interface and the SCION network.
+The client subcommand starts the Connect-IP client. It connects to the proxy server and forwards traffic between the tun interface and the remote proxy.
 ```console
 sudo ./connect-ip-rust-scion client --remote [SCION_PROXY_ADDRESS]:PORT --endhost-api ENDHOST_API_ADDRESS --routes ROUTES --address-pool ADDRESS_POOL
 ```
 The client requires the following parameters:
 - `--remote [SCION_PROXY_ADDRESS]:PORT`: The SCION address and port of the proxy server.
 - `--endhost-api ENDHOST_API_ADDRESS`: The address of the endhost API to discover SCION underlays, addresses and routes.
-- `--snap-token SNAP_TOKEN`: (optional) The SNAP token to use for authentication with the endhost API service.
+- `--snap-token SNAP_TOKEN_FILE`: (optional) The SNAP token to use for authentication with the SNAP service.
 
 For site-to-site connections, the client also requires:
 - `--routes ROUTES`: A CIDR notation of the routes to be announced to the proxy. Multiple routes can be specified by repeating the option.
