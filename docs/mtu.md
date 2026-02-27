@@ -33,13 +33,14 @@ The UDP underlay adds an additional overhead of (at most) 48 bytes.
 - UDP Header: 8 bytes
 
 ### Type 2: SNAP Underlay
-The SNAP underlay adds an additional overhead of (at most) 78 bytes.
+The SNAP underlay adds an additional overhead of (at most) 80 bytes.
 - IP Header: 20 bytes (IPv4) or 40 bytes (IPv6)
-- QUIC adds an overhead of 38 bytes.
-    - UDP Header: 8 bytes
-    - QUIC Header: 12 bytes
+- UDP Header: 8 bytes
+- Wireguard adds an overhead of 32 bytes.
+    - Type: 4 bytes
+    - Key Index: 4 bytes
+    - Nonce: 8 bytes
     - AEAD: 16 bytes
-    - Datagram: 2 bytes
 
 
 ## MTU Calculation
@@ -48,7 +49,7 @@ In theory this results in the following MTU calculations:
 | Underlay Type | Calculation                   | Resulting MTU  |
 |---------------|-------------------------------|----------------|
 | UDP           | 1500 - 180 - 36 - 4 - 48      | 1232 bytes     |
-| SNAP          | 1500 - 180 - 36 - 4 - 78      | 1202 bytes     |
+| SNAP          | 1500 - 180 - 36 - 4 - 80      | 1200 bytes     |
 
 In practice, the QUIC datagram size is often chosen to be smaller than the theoretical maximum to avoid fragmentation.
 
