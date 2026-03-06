@@ -66,7 +66,7 @@ pub fn configure_quic(
     config.set_initial_max_streams_uni(1);
     config.set_disable_active_migration(true);
     config.enable_early_data();
-    config.enable_dgram(true, 1000, 200);
+    config.enable_dgram(true, 100, 100);
 
     Ok(config)
 }

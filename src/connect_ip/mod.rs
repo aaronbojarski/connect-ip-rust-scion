@@ -27,6 +27,7 @@ use crate::net::{
 
 const SEND_BUFFER_SIZE: usize = 65535;
 const RCV_BUFFER_SIZE: usize = 65535;
+const DATAGRAM_SEND_BUFFER_SIZE: usize = 1000;
 const MAX_TUN_MTU_FOR_DATAGRAMS: usize = MAX_DATAGRAM_SIZE - 50;
 
 /// Routing configuration updates that should be applied to the system.
@@ -130,7 +131,7 @@ impl Endpoint {
             peer_supports_datagrams,
             stream_data_received: VecDeque::with_capacity(RCV_BUFFER_SIZE),
             stream_data_to_send: VecDeque::with_capacity(SEND_BUFFER_SIZE),
-            datagrams_to_send: VecDeque::new(),
+            datagrams_to_send: VecDeque::with_capacity(DATAGRAM_SEND_BUFFER_SIZE),
             tun_packets_to_send: VecDeque::new(),
         }
     }
@@ -277,6 +278,13 @@ impl Endpoint {
         if self.peer_supports_datagrams
             && self.routing_state.mtu as usize <= MAX_TUN_MTU_FOR_DATAGRAMS
         {
+            if self.datagrams_to_send.len() >= DATAGRAM_SEND_BUFFER_SIZE {
+                debug!(
+                    "too many pending datagrams to send ({}), dropping packet",
+                    self.datagrams_to_send.len()
+                );
+                return Ok(());
+            }
             let mut octets = OctetsMut::with_slice(&mut buf);
             octets.put_varint(self.stream_id / 4)?;
             octets.put_varint(0)?;
